@@ -1,50 +1,40 @@
 # Hunger Games da Live - Render separado
 
-Este projeto é separado do Render antigo do comando `!add`. Não mexe no comando de adicionar filme.
+Este é o Render NOVO do jogo. Ele não mexe no Render antigo do `!add filme`.
 
-## Criar Render novo
-
-Crie um serviço novo no Render usando estes arquivos.
-
-Build Command:
+## Link do seu Render novo
 
 ```txt
-npm install
-```
-
-Start Command:
-
-```txt
-npm start
+https://site-jogo-o9d1.onrender.com
 ```
 
 ## Environment no Render novo
 
+Coloque/ajuste assim, um por um:
+
 ```txt
 COMMAND_SECRET=carolina-hg
-DEFAULT_CHANNEL=carolinaporto
-ALLOWED_CHANNELS=carolinaporto
-ALLOWED_USERS=carolinaporto,mod1,mod2
+DEFAULT_CHANNEL=icarolinaporto
+ALLOWED_CHANNELS=icarolinaporto
+ALLOWED_USERS=icarolinaporto,mod1,mod2
 HG_MAX_PLAYERS=24
 HG_ADULT_DEFAULT=0
-DATABASE_URL=sua_database_url
+DATABASE_URL=sua_database_url_real
 ```
 
-Para pegar imagem do perfil da Twitch, coloque também:
+Para pegar foto do perfil da Twitch, coloque também:
 
 ```txt
 TWITCH_CLIENT_ID=seu_client_id
 TWITCH_CLIENT_SECRET=seu_client_secret
 ```
 
-Sem essas duas variáveis, o jogo pega nick, mas não pega avatar da Twitch.
-
 ## Comando StreamElements
 
-Crie um comando novo `!hg`:
+Crie um comando novo `!hg` com esta resposta:
 
 ```txt
-$(customapi https://site-ca-hunger-games-live.onrender.com/hg?token=carolina-hg&channel=$(channel)&user=$(sender)&q=$(queryescape ${1:}))
+$(customapi https://site-jogo-o9d1.onrender.com/hg?token=carolina-hg&channel=$(channel)&user=$(sender)&q=$(queryescape ${1:}))
 ```
 
 ## Uso no chat
@@ -66,11 +56,17 @@ $(customapi https://site-ca-hunger-games-live.onrender.com/hg?token=carolina-hg&
 ## Página pública
 
 ```txt
-https://site-ca-hunger-games-live.onrender.com/hungergames?channel=carolinaporto
+https://site-jogo-o9d1.onrender.com/hungergames?channel=icarolinaporto
 ```
 
-## Admin
+## Admin do jogo
 
 ```txt
-https://site-ca-hunger-games-live.onrender.com/admin/hungergames?channel=carolinaporto&token=carolina-hg
+https://site-jogo-o9d1.onrender.com/admin/hungergames?channel=icarolinaporto&token=carolina-hg
 ```
+
+## Correção feita nesta versão
+
+- O canal correto agora é `icarolinaporto`.
+- Se algum link antigo mandar `channel=carolinaporto`, o servidor joga para `icarolinaporto` para não separar os participantes.
+- Corrigido para não dar "Canal não autorizado" nesse caso.

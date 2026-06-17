@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: site-ca-hunger-games-live
+    name: site-jogo
     env: node
     plan: free
     buildCommand: npm install
@@ -9,11 +9,11 @@ services:
       - key: COMMAND_SECRET
         value: carolina-hg
       - key: DEFAULT_CHANNEL
-        value: carolinaporto
+        value: icarolinaporto
       - key: ALLOWED_CHANNELS
-        value: carolinaporto
+        value: icarolinaporto
       - key: ALLOWED_USERS
-        value: carolinaporto,mod1,mod2
+        value: icarolinaporto,mod1,mod2
       - key: HG_MAX_PLAYERS
         value: "24"
       - key: HG_ADULT_DEFAULT

@@ -47,7 +47,9 @@ function tokenValue() {
   return String(process.env.COMMAND_SECRET || process.env.ADD_TOKEN || "carolina-hg");
 }
 function channelFrom(req) {
-  return nick(req.query.channel || req.body?.channel || process.env.DEFAULT_CHANNEL || "carolinaporto");
+  const ch = nick(req.query.channel || req.body?.channel || process.env.DEFAULT_CHANNEL || "icarolinaporto");
+  if (ch === "carolinaporto") return "icarolinaporto";
+  return ch || "icarolinaporto";
 }
 function userFrom(req) {
   return nick(req.query.user || req.body?.user || req.query.sender || req.body?.sender || "");
@@ -69,7 +71,8 @@ function checkToken(req, res) {
 function checkChannel(req, res) {
   const allowed = envList("ALLOWED_CHANNELS");
   const ch = channelFrom(req);
-  if (allowed.length && !allowed.includes(ch)) {
+  const fixedAllowed = new Set(["icarolinaporto", "carolinaporto"]);
+  if (allowed.length && !allowed.includes(ch) && !fixedAllowed.has(ch)) {
     send(res, "Canal não autorizado.");
     return false;
   }
@@ -638,8 +641,8 @@ app.get("/permissions", (req, res) => {
     allowedChannels: envList("ALLOWED_CHANNELS"),
     allowedUsers: envList("ALLOWED_USERS"),
     command: "$(customapi https://site-jogo-o9d1.onrender.com/hg?token=carolina-hg&channel=$(channel)&user=$(sender)&q=$(queryescape ${1:}))",
-    publicPage: "https://site-jogo-o9d1.onrender.com/hungergames?channel=carolinaporto",
-    adminPage: "https://site-jogo-o9d1.onrender.com/admin/hungergames?channel=carolinaporto&token=carolina-hg"
+    publicPage: "https://site-jogo-o9d1.onrender.com/hungergames?channel=icarolinaporto",
+    adminPage: "https://site-jogo-o9d1.onrender.com/admin/hungergames?channel=icarolinaporto&token=carolina-hg"
   });
 });
 app.listen(PORT, () => console.log("HG Live separado rodando na porta " + PORT));
