@@ -110,3 +110,19 @@ Nesta versão:
 - O admin do Render agora lista eventos existentes.
 - Dá para editar, desativar/ativar e excluir eventos existentes.
 - Não altera menu do admin do site principal.
+
+
+## Forçar remoção de nome embaixo da imagem
+
+Esta versão remove na marra qualquer `.event-name` dentro dos eventos.
+Também zera fonte do bloco de imagem para impedir texto/caption embaixo da foto.
+
+
+## Correção admin/configuração e +18
+
+Nesta versão:
+- O modo "só eventos" vale só para a página pública.
+- No /admin/hungergames o painel de configuração continua aparecendo mesmo com a partida iniciada.
+- Adicionado botão "Adicionar +18 pesado" no admin do Render.
+- O pacote adiciona novos eventos adultos mais fortes ao banco.
+- Mantém editor de eventos existentes.

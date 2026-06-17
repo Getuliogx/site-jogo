@@ -168,6 +168,41 @@ const DEFAULT_EVENTS = [
   ["day","adult",2,"{p1} flerta tanto com {p2} que os patrocinadores ficam confusos se isso é guerra ou date.","",1]
 ];
 
+
+
+const HEAVY_ADULT_EVENTS = [
+  ["day","adult",2,"{p1} e {p2} somem da câmera por alguns minutos e voltam com cara de quem aprontou.","",1],
+  ["day","adult",2,"{p1} provoca {p2} até os dois esquecerem que isso era para ser uma arena.","",1],
+  ["day","adult",2,"{p1} faz uma proposta indecente para {p2} em troca de proteção.","",1],
+  ["day","adult",2,"{p1} usa charme, safadeza e zero vergonha para distrair {p2}.","",1],
+  ["day","adult",2,"{p1} e {p2} transformam a aliança em algo muito menos inocente.","",1],
+  ["day","adult",3,"{p1}, {p2} e {p3} criam uma panelinha tão safada que até os patrocinadores ficam sem reação.","",1],
+  ["day","adult",2,"{p1} tenta seduzir {p2} e quase esquece que ainda precisa sobreviver.","",1],
+  ["day","adult",2,"{p1} chama {p2} para conversar em particular. Ninguém acredita que foi só conversa.","",1],
+  ["day","adult",2,"{p1} flerta pesado com {p2} e consegue escapar de uma briga só no papo.","",1],
+  ["day","adult",2,"{p1} troca olhares com {p2} e a tensão fica mais perigosa que a arena.","",1],
+  ["night","adult",2,"{p1} e {p2} dividem o abrigo e a noite fica quente demais para narrar direito.","",1],
+  ["night","adult",2,"{p1} e {p2} passam a madrugada ocupados demais para vigiar a arena.","",1],
+  ["night","adult",2,"{p1} convida {p2} para se aquecer no abrigo. A desculpa cola por uns cinco segundos.","",1],
+  ["night","adult",2,"{p1} e {p2} fazem barulho demais no escuro e entregam o esconderijo.","",1],
+  ["night","adult",2,"{p1} provoca {p2} no abrigo e a estratégia vira bagunça.","",1],
+  ["night","adult",3,"{p1}, {p2} e {p3} fazem uma festa adulta escondida da transmissão oficial.","",1],
+  ["night","adult",2,"{p1} tenta dormir, mas {p2} aparece com uma ideia muito errada e muito tentadora.","",1],
+  ["night","adult",2,"{p1} e {p2} esquecem a fogueira acesa enquanto a noite esquenta por outro motivo.","",1],
+  ["feast","adult",2,"{p1} distrai {p2} com safadeza e rouba os melhores suprimentos.","",1],
+  ["feast","adult",2,"{p1} usa provocação pesada para fazer {p2} baixar a guarda no banquete.","",1],
+  ["feast","adult",3,"{p1} cria um clima indecente entre {p2} e {p3} só para fugir com a mochila.","",1],
+  ["arena","adult",2,"A arena fica em silêncio enquanto {p1} e {p2} fazem uma aliança adulta demais para o horário.","",1],
+  ["arena","adult",2,"Os patrocinadores mandam censura preventiva depois que {p1} e {p2} ficam sozinhos.","",1],
+  ["day","adult",2,"{p1} fala uma besteira tão safada para {p2} que até os inimigos param para ouvir.","",1],
+  ["night","adult",1,"{p1} passa a noite tendo pensamentos nada santos e perde o foco da arena.","",1],
+  ["day","adult",2,"{p1} chama {p2} de gostoso(a) no meio da arena e cria um silêncio constrangedor.","",1],
+  ["night","adult",2,"{p1} e {p2} fazem um acordo: proteção de dia, safadeza de noite.","",1],
+  ["day","adult",3,"{p1} joga charme para {p2} enquanto {p3} fica segurando vela sem pedir.","",1],
+  ["night","adult",2,"{p1} e {p2} ficam tão grudados que ninguém sabe onde termina a estratégia e começa a safadeza.","",1],
+  ["day","adult",2,"{p1} promete recompensa adulta para {p2} se os dois chegarem vivos até a noite.","",1]
+];
+
 async function ensureTables() {
   if (ready) return;
   const db = await getPool();
@@ -240,6 +275,14 @@ async function ensureTables() {
   }
 
   ready = true;
+}
+
+
+async function seedHeavyAdultEvents() {
+  await ensureTables();
+  const db = await getPool();
+  await db.query("INSERT INTO hg_events (phase,type,players,text,kills,adult) VALUES ?", [HEAVY_ADULT_EVENTS.map(e => [e[0], e[1], e[2], e[3], e[4], e[5]])]);
+  return `✅ Pacote +18 pesado adicionado: ${HEAVY_ADULT_EVENTS.length} eventos.`;
 }
 
 async function getTwitchAppToken() {
@@ -601,6 +644,7 @@ async function adminAction(req, res) {
     if (action === "adult_on") return send(res, await adult(ch, true));
     if (action === "adult_off") return send(res, await adult(ch, false));
     if (action === "add_player") return send(res, await addManual(ch, req.query.name || req.body?.name, req.query.district || req.body?.district));
+    if (action === "seed_adult_heavy") return send(res, await seedHeavyAdultEvents());
 
     if (action === "add_event") {
       await ensureTables();
@@ -707,8 +751,15 @@ body.hg-running .event-text{text-align:center;font-size:18px;line-height:1.45}
 body.hg-running h2.events-title{text-align:center;font-size:28px}
 body.hg-running .top-main-info{display:none!important}
 
+
+body .event-person .event-name,
+body.hg-running .event-person .event-name,
+.event-avatars .event-name{display:none!important;font-size:0!important;width:0!important;height:0!important;overflow:hidden!important}
+.event-person{font-size:0!important;line-height:0!important}
+.event-person img,.event-person .avatar,.event-person .fake{font-size:16px!important;line-height:normal!important}
+
 </style></head><body><div class="wrap"><div class="top"><div><h1>Hunger Games da Live</h1><div class="sub">Participantes do chat, distritos, eventos, mortes e vencedor final.</div></div><div class="pill" id="statusPill">Carregando...</div></div>
-<div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div></div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar auto</button><button class="danger" onclick="act('reset')">Resetar</button><button class="secondary" onclick="act('adult_on')">+18 ON</button><button class="secondary" onclick="act('adult_off')">+18 OFF</button></div>` : ``}</div>
+<div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div></div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar auto</button><button class="danger" onclick="act('reset')">Resetar</button><button class="secondary" onclick="act('adult_on')">+18 ON</button><button class="secondary" onclick="act('adult_off')">+18 OFF</button><button class="secondary" onclick="seedAdultHeavy()">Adicionar +18 pesado</button></div>` : ``}</div>
 ${admin ? `<div class="two" style="margin:16px 0"><input id="manualName" placeholder="Adicionar participante manual"/><input id="manualDistrict" placeholder="Distrito" type="number" min="1" max="12"/><button style="grid-column:1/-1" onclick="addPlayer()">Adicionar participante</button></div>` : ``}
 <div id="participantsBox" class="lobby-only"><h2>Participantes</h2><div class="players" id="players"></div></div></section><aside class="card events-card"><h2 class="events-title">Eventos</h2><div class="logs" id="logs"></div></aside></div>
 ${admin ? `<section class="card" style="margin-top:18px"><h2>Adicionar evento próprio</h2><div class="small">Use {p1}, {p2}, {p3}, {p4}. Para matar alguém coloque kills: p2 ou p1,p3.</div><div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px"><select id="evPhase"><option>bloodbath</option><option>day</option><option>night</option><option>feast</option><option>arena</option></select><select id="evType"><option>neutral</option><option>death</option><option>item</option><option>alliance</option><option>adult</option></select><input id="evPlayers" type="number" min="1" max="4" value="1"/><input id="evKills" placeholder="kills: p2"/><select id="evAdult"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="evText" placeholder="{p1} faz alguma coisa com {p2}."></textarea><button onclick="addEvent()">Salvar evento</button><hr style="border-color:var(--b);margin:24px 0"><div class="top"><div><h2>Editar eventos existentes</h2><div class="small">Aqui edita, desativa ou exclui os eventos que já estão cadastrados.</div></div><button class="secondary" onclick="loadEvents()">Recarregar eventos</button></div><div id="eventsEditor" style="display:flex;flex-direction:column;gap:12px;margin-top:14px"></div></section>` : ``}</div>
@@ -718,11 +769,12 @@ function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&l
 async function api(path,opt={}){const sep=path.includes("?")?"&":"?";const url=path+sep+"channel="+encodeURIComponent(channel)+(token?"&token="+encodeURIComponent(token):"");const r=await fetch(url,opt),ct=r.headers.get("content-type")||"";return ct.includes("json")?r.json():r.text()}
 function avatarHtml(p,cls="avatar"){return p&&p.avatar_url?'<img class="'+cls+'" src="'+esc(p.avatar_url)+'">':'<div class="'+cls+' fake">'+esc(((p&&p.display_name)||"?").slice(0,1).toUpperCase())+'</div>'}
 function mentionedPlayers(text,players){const found=[];const lower=String(text||"").toLowerCase();players.forEach(p=>{const nm=String(p.display_name||p.username||"").toLowerCase();if(nm&&lower.includes(nm)&&!found.some(x=>x.id===p.id))found.push(p)});return found.slice(0,4)}
-async function load(){const st=await api("/hg/state"),g=st.game||{};document.body.classList.toggle("hg-running",g.status==="running"||g.status==="ended");document.getElementById("statusPill").textContent=(g.status||"lobby").toUpperCase()+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=(g.phase||"bloodbath")+" • dia "+(g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida rolando":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Lobby aberto";const alive=st.players.filter(p=>p.alive).length;document.getElementById("counts").textContent=st.players.length+" participantes • "+alive+" vivos • "+st.eventCount+" eventos"+(st.autoRunning?" • automático ligado":"");
+async function load(){const st=await api("/hg/state"),g=st.game||{};document.body.classList.toggle("hg-running",!admin&&(g.status==="running"||g.status==="ended"));document.getElementById("statusPill").textContent=(g.status||"lobby").toUpperCase()+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=(g.phase||"bloodbath")+" • dia "+(g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida rolando":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Lobby aberto";const alive=st.players.filter(p=>p.alive).length;document.getElementById("counts").textContent=st.players.length+" participantes • "+alive+" vivos • "+st.eventCount+" eventos"+(st.autoRunning?" • automático ligado":"");
 const box=document.getElementById("participantsBox");if(box)box.classList.toggle("hidden",g.status==="running");
 document.getElementById("players").innerHTML=st.players.map(p=>{const av=avatarHtml(p);return '<div class="player '+(p.alive?'':'dead')+'">'+av+'<div><div class="district">Distrito '+p.district+'</div><div class="name">'+esc(p.display_name)+'</div><div class="kills">'+(p.kills||0)+' kill(s) '+(p.alive?'🟢':'💀')+'</div></div></div>'}).join("")||"<div class='small'>Ninguém entrou ainda.</div>";
-document.getElementById("logs").innerHTML=st.logs.map(l=>{const ps=mentionedPlayers(l.text,st.players);const avs=ps.length?'<div class="event-avatars">'+ps.map(p=>'<div class="event-person">'+avatarHtml(p,"avatar")+'</div>').join("")+'</div>':'';return '<div class="log '+(l.deaths?'death':'')+'"><div class="phase">'+esc(l.phase)+' '+(l.day_number?'• '+l.day_number:'')+'</div>'+avs+'<div class="event-text">'+esc(l.text)+'</div>'+(l.deaths?'<div class="small">Mortes: '+esc(l.deaths)+'</div>':'')+'</div>'}).join("")||"<div class='small'>Sem eventos ainda.</div>"}
+document.getElementById("logs").innerHTML=st.logs.map(l=>{const ps=mentionedPlayers(l.text,st.players);const avs=ps.length?'<div class="event-avatars">'+ps.map(p=>'<div class="event-person">'+avatarHtml(p,"avatar")+'</div>').join("")+'</div>':'';return '<div class="log '+(l.deaths?'death':'')+'"><div class="phase">'+esc(l.phase)+' '+(l.day_number?'• '+l.day_number:'')+'</div>'+avs+'<div class="event-text">'+esc(l.text)+'</div>'+(l.deaths?'<div class="small">Mortes: '+esc(l.deaths)+'</div>':'')+'</div>'}).join("")||"<div class='small'>Sem eventos ainda.</div>";document.querySelectorAll(".event-name").forEach(e=>e.remove())}
 async function act(a){if(!token)return alert("Abra com ?token=SEU_TOKEN");const t=await api("/hg/admin?action="+encodeURIComponent(a));alert(t);load()}
+async function seedAdultHeavy(){if(!confirm("Adicionar pacote de eventos +18 pesado ao banco?"))return;const t=await api("/hg/admin?action=seed_adult_heavy");alert(t);load();if(admin)loadEvents()}
 async function addPlayer(){const name=document.getElementById("manualName").value.trim(),d=document.getElementById("manualDistrict").value.trim();if(!name)return alert("Nome vazio");const t=await api("/hg/admin?action=add_player&name="+encodeURIComponent(name)+"&district="+encodeURIComponent(d));alert(t);load()}
 async function addEvent(){const body={action:"add_event",phase:evPhase.value,type:evType.value,players:evPlayers.value,kills:evKills.value,adult:evAdult.value,text:evText.value};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);evText.value="";load();if(admin)loadEvents()}
 function eventRow(e){return '<div class="log" style="max-width:none;margin:0"><div class="phase">ID '+e.id+' • '+esc(e.phase)+' • '+(e.adult?" +18":"Normal")+' • '+(e.active?"Ativo":"Desativado")+'</div><div style="display:grid;grid-template-columns:120px 120px 80px 1fr 100px 100px;gap:8px;margin:8px 0"><select id="phase_'+e.id+'"><option '+(e.phase==="bloodbath"?"selected":"")+'>bloodbath</option><option '+(e.phase==="day"?"selected":"")+'>day</option><option '+(e.phase==="night"?"selected":"")+'>night</option><option '+(e.phase==="feast"?"selected":"")+'>feast</option><option '+(e.phase==="arena"?"selected":"")+'>arena</option></select><select id="type_'+e.id+'"><option '+(e.type==="neutral"?"selected":"")+'>neutral</option><option '+(e.type==="death"?"selected":"")+'>death</option><option '+(e.type==="item"?"selected":"")+'>item</option><option '+(e.type==="alliance"?"selected":"")+'>alliance</option><option '+(e.type==="adult"?"selected":"")+'>adult</option></select><input id="players_'+e.id+'" type="number" min="1" max="4" value="'+esc(e.players)+'"><input id="kills_'+e.id+'" placeholder="kills" value="'+esc(e.kills||"")+'"><select id="adult_'+e.id+'"><option value="0" '+(!e.adult?"selected":"")+'>Normal</option><option value="1" '+(e.adult?"selected":"")+'>+18</option></select><select id="active_'+e.id+'"><option value="1" '+(e.active?"selected":"")+'>Ativo</option><option value="0" '+(!e.active?"selected":"")+'>Desativado</option></select></div><textarea id="text_'+e.id+'">'+esc(e.text)+'</textarea><div class="controls" style="margin-top:8px"><button onclick="saveEvent('+e.id+')">Salvar edição</button><button class="danger" onclick="deleteEvent('+e.id+')">Excluir</button></div></div>'}
