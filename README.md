@@ -91,3 +91,12 @@ Nesta versão:
 - A lista de participantes some quando a partida está rodando.
 - Cada evento tenta mostrar as imagens dos participantes citados no texto.
 - Imagem em cima, texto do evento embaixo, parecido com simulador.
+
+
+## Tela só eventos
+
+Nesta versão:
+- Ao iniciar a partida, o painel da esquerda some inteiro.
+- A tela fica só com Eventos em coluna única.
+- Os eventos não ficam mais do lado.
+- Foto e nick aparecem dentro de cada evento.
