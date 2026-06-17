@@ -616,6 +616,42 @@ async function adminAction(req, res) {
       return send(res, "✅ Evento adicionado.");
     }
 
+    if (action === "update_event") {
+      await ensureTables();
+      const db = await getPool();
+      const id = Number(req.body?.id || req.query.id || 0);
+      const phase = String(req.body?.phase || req.query.phase || "day").trim();
+      const type = String(req.body?.type || req.query.type || "neutral").trim();
+      const players = Math.max(1, Math.min(4, Number(req.body?.players || req.query.players || 1)));
+      const text = String(req.body?.text || req.query.text || "").trim();
+      const kills = String(req.body?.kills || req.query.kills || "").trim();
+      const adultFlag = String(req.body?.adult ?? req.query.adult ?? "0") === "1" ? 1 : 0;
+      const activeFlag = String(req.body?.active ?? req.query.active ?? "1") === "1" ? 1 : 0;
+      if (!id) return send(res, "ID inválido.");
+      if (!text) return send(res, "Faltou o texto do evento.");
+      await db.query("UPDATE hg_events SET phase=?, type=?, players=?, text=?, kills=?, adult=?, active=? WHERE id=?", [phase,type,players,text,kills,adultFlag,activeFlag,id]);
+      return send(res, "✅ Evento atualizado.");
+    }
+
+    if (action === "delete_event") {
+      await ensureTables();
+      const db = await getPool();
+      const id = Number(req.body?.id || req.query.id || 0);
+      if (!id) return send(res, "ID inválido.");
+      await db.query("DELETE FROM hg_events WHERE id=?", [id]);
+      return send(res, "🗑️ Evento excluído.");
+    }
+
+    if (action === "toggle_event") {
+      await ensureTables();
+      const db = await getPool();
+      const id = Number(req.body?.id || req.query.id || 0);
+      const activeFlag = String(req.body?.active ?? req.query.active ?? "1") === "1" ? 1 : 0;
+      if (!id) return send(res, "ID inválido.");
+      await db.query("UPDATE hg_events SET active=? WHERE id=?", [activeFlag,id]);
+      return send(res, activeFlag ? "✅ Evento ativado." : "⛔ Evento desativado.");
+    }
+
     return send(res, "Ação inválida.");
   } catch (e) {
     console.error(e);
@@ -657,7 +693,7 @@ function page(admin = false) {
 button,.btn{border:0;border-radius:14px;padding:11px 14px;font-weight:950;color:white;background:var(--p);cursor:pointer}.danger{background:var(--d)}.ok{background:var(--ok);color:#061208}.secondary{background:#303044}
 input,select,textarea{width:100%;background:#0d0d16;color:var(--text);border:1px solid var(--b);border-radius:14px;padding:11px;font:inherit}textarea{min-height:90px}.players{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
 .player{border:1px solid var(--b);background:var(--card2);border-radius:18px;padding:12px;display:flex;gap:12px;align-items:center}.dead{opacity:.45;filter:grayscale(1)}.avatar{width:46px;height:46px;border-radius:14px;object-fit:cover;background:#333}.fake{display:flex;align-items:center;justify-content:center;background:#402060;font-weight:950}
-.district{color:#d8b4fe;font-weight:950;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.name{font-weight:950}.kills{font-size:12px;color:var(--muted)}.logs{display:flex;flex-direction:column;gap:14px;max-height:760px;overflow:auto}.log{border:1px solid var(--b);background:#11111c;border-radius:22px;padding:14px;line-height:1.45}.death{border-color:#7f1d1d;background:#1c1014}.phase{color:#f0abfc;font-weight:950;font-size:12px;text-transform:uppercase;letter-spacing:.12em}.event-avatars{display:flex;gap:12px;flex-wrap:wrap;margin:8px 0 12px}.event-person{min-width:86px;text-align:center}.event-person .avatar,.event-person .fake{width:72px;height:72px;border-radius:18px;margin:0 auto 6px;object-fit:cover;border:1px solid var(--b)}.event-name{font-size:11px;font-weight:950;max-width:95px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.event-text{font-size:15px;font-weight:800}.lobby-only.hidden{display:none}.two{display:grid;grid-template-columns:1fr 100px;gap:8px}
+.district{color:#d8b4fe;font-weight:950;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.name{font-weight:950}.kills{font-size:12px;color:var(--muted)}.logs{display:flex;flex-direction:column;gap:14px;max-height:760px;overflow:auto}.log{border:1px solid var(--b);background:#11111c;border-radius:22px;padding:14px;line-height:1.45}.death{border-color:#7f1d1d;background:#1c1014}.phase{color:#f0abfc;font-weight:950;font-size:12px;text-transform:uppercase;letter-spacing:.12em}.event-avatars{display:flex;gap:12px;flex-wrap:wrap;margin:8px 0 12px}.event-person{min-width:86px;text-align:center}.event-person .avatar,.event-person .fake{width:72px;height:72px;border-radius:18px;margin:0 auto 6px;object-fit:cover;border:1px solid var(--b)}.event-name{display:none!important}.event-text{font-size:15px;font-weight:800}.lobby-only.hidden{display:none}.two{display:grid;grid-template-columns:1fr 100px;gap:8px}
 
 body.hg-running .grid{display:block!important}
 body.hg-running .arena-card{display:none!important}
@@ -666,7 +702,7 @@ body.hg-running .logs{max-height:none!important;overflow:visible!important}
 body.hg-running .log{max-width:820px;margin:0 auto 18px auto;padding:20px;border-radius:26px}
 body.hg-running .event-avatars{justify-content:center;margin:10px 0 14px}
 body.hg-running .event-person .avatar,body.hg-running .event-person .fake{width:96px;height:96px;border-radius:22px}
-body.hg-running .event-name{text-align:center;max-width:120px}
+body.hg-running .event-name{display:none!important}
 body.hg-running .event-text{text-align:center;font-size:18px;line-height:1.45}
 body.hg-running h2.events-title{text-align:center;font-size:28px}
 body.hg-running .top-main-info{display:none!important}
@@ -675,7 +711,7 @@ body.hg-running .top-main-info{display:none!important}
 <div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div></div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar auto</button><button class="danger" onclick="act('reset')">Resetar</button><button class="secondary" onclick="act('adult_on')">+18 ON</button><button class="secondary" onclick="act('adult_off')">+18 OFF</button></div>` : ``}</div>
 ${admin ? `<div class="two" style="margin:16px 0"><input id="manualName" placeholder="Adicionar participante manual"/><input id="manualDistrict" placeholder="Distrito" type="number" min="1" max="12"/><button style="grid-column:1/-1" onclick="addPlayer()">Adicionar participante</button></div>` : ``}
 <div id="participantsBox" class="lobby-only"><h2>Participantes</h2><div class="players" id="players"></div></div></section><aside class="card events-card"><h2 class="events-title">Eventos</h2><div class="logs" id="logs"></div></aside></div>
-${admin ? `<section class="card" style="margin-top:18px"><h2>Adicionar evento próprio</h2><div class="small">Use {p1}, {p2}, {p3}, {p4}. Para matar alguém coloque kills: p2 ou p1,p3.</div><div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px"><select id="evPhase"><option>bloodbath</option><option>day</option><option>night</option><option>feast</option><option>arena</option></select><select id="evType"><option>neutral</option><option>death</option><option>item</option><option>alliance</option><option>adult</option></select><input id="evPlayers" type="number" min="1" max="4" value="1"/><input id="evKills" placeholder="kills: p2"/><select id="evAdult"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="evText" placeholder="{p1} faz alguma coisa com {p2}."></textarea><button onclick="addEvent()">Salvar evento</button></section>` : ``}</div>
+${admin ? `<section class="card" style="margin-top:18px"><h2>Adicionar evento próprio</h2><div class="small">Use {p1}, {p2}, {p3}, {p4}. Para matar alguém coloque kills: p2 ou p1,p3.</div><div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px"><select id="evPhase"><option>bloodbath</option><option>day</option><option>night</option><option>feast</option><option>arena</option></select><select id="evType"><option>neutral</option><option>death</option><option>item</option><option>alliance</option><option>adult</option></select><input id="evPlayers" type="number" min="1" max="4" value="1"/><input id="evKills" placeholder="kills: p2"/><select id="evAdult"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="evText" placeholder="{p1} faz alguma coisa com {p2}."></textarea><button onclick="addEvent()">Salvar evento</button><hr style="border-color:var(--b);margin:24px 0"><div class="top"><div><h2>Editar eventos existentes</h2><div class="small">Aqui edita, desativa ou exclui os eventos que já estão cadastrados.</div></div><button class="secondary" onclick="loadEvents()">Recarregar eventos</button></div><div id="eventsEditor" style="display:flex;flex-direction:column;gap:12px;margin-top:14px"></div></section>` : ``}</div>
 <script>
 const params=new URLSearchParams(location.search),channel=params.get("channel")||"icarolinaporto",token=params.get("token")||"",admin=${admin?"true":"false"};
 function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}[m]))}
@@ -685,11 +721,15 @@ function mentionedPlayers(text,players){const found=[];const lower=String(text||
 async function load(){const st=await api("/hg/state"),g=st.game||{};document.body.classList.toggle("hg-running",g.status==="running"||g.status==="ended");document.getElementById("statusPill").textContent=(g.status||"lobby").toUpperCase()+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=(g.phase||"bloodbath")+" • dia "+(g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida rolando":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Lobby aberto";const alive=st.players.filter(p=>p.alive).length;document.getElementById("counts").textContent=st.players.length+" participantes • "+alive+" vivos • "+st.eventCount+" eventos"+(st.autoRunning?" • automático ligado":"");
 const box=document.getElementById("participantsBox");if(box)box.classList.toggle("hidden",g.status==="running");
 document.getElementById("players").innerHTML=st.players.map(p=>{const av=avatarHtml(p);return '<div class="player '+(p.alive?'':'dead')+'">'+av+'<div><div class="district">Distrito '+p.district+'</div><div class="name">'+esc(p.display_name)+'</div><div class="kills">'+(p.kills||0)+' kill(s) '+(p.alive?'🟢':'💀')+'</div></div></div>'}).join("")||"<div class='small'>Ninguém entrou ainda.</div>";
-document.getElementById("logs").innerHTML=st.logs.map(l=>{const ps=mentionedPlayers(l.text,st.players);const avs=ps.length?'<div class="event-avatars">'+ps.map(p=>'<div class="event-person">'+avatarHtml(p,"avatar")+'<div class="event-name">'+esc(p.display_name)+'</div></div>').join("")+'</div>':'';return '<div class="log '+(l.deaths?'death':'')+'"><div class="phase">'+esc(l.phase)+' '+(l.day_number?'• '+l.day_number:'')+'</div>'+avs+'<div class="event-text">'+esc(l.text)+'</div>'+(l.deaths?'<div class="small">Mortes: '+esc(l.deaths)+'</div>':'')+'</div>'}).join("")||"<div class='small'>Sem eventos ainda.</div>"}
+document.getElementById("logs").innerHTML=st.logs.map(l=>{const ps=mentionedPlayers(l.text,st.players);const avs=ps.length?'<div class="event-avatars">'+ps.map(p=>'<div class="event-person">'+avatarHtml(p,"avatar")+'</div>').join("")+'</div>':'';return '<div class="log '+(l.deaths?'death':'')+'"><div class="phase">'+esc(l.phase)+' '+(l.day_number?'• '+l.day_number:'')+'</div>'+avs+'<div class="event-text">'+esc(l.text)+'</div>'+(l.deaths?'<div class="small">Mortes: '+esc(l.deaths)+'</div>':'')+'</div>'}).join("")||"<div class='small'>Sem eventos ainda.</div>"}
 async function act(a){if(!token)return alert("Abra com ?token=SEU_TOKEN");const t=await api("/hg/admin?action="+encodeURIComponent(a));alert(t);load()}
 async function addPlayer(){const name=document.getElementById("manualName").value.trim(),d=document.getElementById("manualDistrict").value.trim();if(!name)return alert("Nome vazio");const t=await api("/hg/admin?action=add_player&name="+encodeURIComponent(name)+"&district="+encodeURIComponent(d));alert(t);load()}
-async function addEvent(){const body={action:"add_event",phase:evPhase.value,type:evType.value,players:evPlayers.value,kills:evKills.value,adult:evAdult.value,text:evText.value};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);evText.value="";load()}
-load();setInterval(load,2500);
+async function addEvent(){const body={action:"add_event",phase:evPhase.value,type:evType.value,players:evPlayers.value,kills:evKills.value,adult:evAdult.value,text:evText.value};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);evText.value="";load();if(admin)loadEvents()}
+function eventRow(e){return '<div class="log" style="max-width:none;margin:0"><div class="phase">ID '+e.id+' • '+esc(e.phase)+' • '+(e.adult?" +18":"Normal")+' • '+(e.active?"Ativo":"Desativado")+'</div><div style="display:grid;grid-template-columns:120px 120px 80px 1fr 100px 100px;gap:8px;margin:8px 0"><select id="phase_'+e.id+'"><option '+(e.phase==="bloodbath"?"selected":"")+'>bloodbath</option><option '+(e.phase==="day"?"selected":"")+'>day</option><option '+(e.phase==="night"?"selected":"")+'>night</option><option '+(e.phase==="feast"?"selected":"")+'>feast</option><option '+(e.phase==="arena"?"selected":"")+'>arena</option></select><select id="type_'+e.id+'"><option '+(e.type==="neutral"?"selected":"")+'>neutral</option><option '+(e.type==="death"?"selected":"")+'>death</option><option '+(e.type==="item"?"selected":"")+'>item</option><option '+(e.type==="alliance"?"selected":"")+'>alliance</option><option '+(e.type==="adult"?"selected":"")+'>adult</option></select><input id="players_'+e.id+'" type="number" min="1" max="4" value="'+esc(e.players)+'"><input id="kills_'+e.id+'" placeholder="kills" value="'+esc(e.kills||"")+'"><select id="adult_'+e.id+'"><option value="0" '+(!e.adult?"selected":"")+'>Normal</option><option value="1" '+(e.adult?"selected":"")+'>+18</option></select><select id="active_'+e.id+'"><option value="1" '+(e.active?"selected":"")+'>Ativo</option><option value="0" '+(!e.active?"selected":"")+'>Desativado</option></select></div><textarea id="text_'+e.id+'">'+esc(e.text)+'</textarea><div class="controls" style="margin-top:8px"><button onclick="saveEvent('+e.id+')">Salvar edição</button><button class="danger" onclick="deleteEvent('+e.id+')">Excluir</button></div></div>'}
+async function loadEvents(){if(!admin)return;const box=document.getElementById("eventsEditor");if(!box)return;box.innerHTML="<div class='small'>Carregando eventos...</div>";const evs=await api("/hg/events");if(!Array.isArray(evs)){box.innerHTML="<div class='small'>Erro ao carregar eventos.</div>";return}box.innerHTML=evs.map(eventRow).join("")||"<div class='small'>Sem eventos cadastrados.</div>"}
+async function saveEvent(id){const body={action:"update_event",id,phase:document.getElementById("phase_"+id).value,type:document.getElementById("type_"+id).value,players:document.getElementById("players_"+id).value,kills:document.getElementById("kills_"+id).value,adult:document.getElementById("adult_"+id).value,active:document.getElementById("active_"+id).value,text:document.getElementById("text_"+id).value};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);loadEvents();load()}
+async function deleteEvent(id){if(!confirm("Excluir este evento?"))return;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"delete_event",id})});alert(t);loadEvents();load()}
+load();if(admin)loadEvents();setInterval(load,2500);
 </script></body></html>`;
 }
 
@@ -700,6 +740,20 @@ app.post("/hg", command);
 app.get("/hg/admin", adminAction);
 app.post("/hg/admin", adminAction);
 app.get("/hg/state", state);
+
+app.get("/hg/events", async (req, res) => {
+  try {
+    if (!checkBase(req, res)) return;
+    await ensureTables();
+    const db = await getPool();
+    const [rows] = await db.query("SELECT * FROM hg_events ORDER BY phase ASC, adult ASC, id ASC");
+    res.json(rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/hungergames", (_req, res) => res.type("html").send(page(false)));
 app.get("/jogos/hunger", (_req, res) => res.type("html").send(page(false)));
 app.get("/admin/hungergames", (_req, res) => res.type("html").send(page(true)));

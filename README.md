@@ -100,3 +100,13 @@ Nesta versão:
 - A tela fica só com Eventos em coluna única.
 - Os eventos não ficam mais do lado.
 - Foto e nick aparecem dentro de cada evento.
+
+
+## Correção nick nos eventos e edição
+
+Nesta versão:
+- Remove o nome/nick que ficava embaixo da imagem do evento.
+- O nick continua apenas no texto do evento.
+- O admin do Render agora lista eventos existentes.
+- Dá para editar, desativar/ativar e excluir eventos existentes.
+- Não altera menu do admin do site principal.
