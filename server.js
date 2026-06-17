@@ -637,9 +637,9 @@ app.get("/permissions", (req, res) => {
     ok: true,
     allowedChannels: envList("ALLOWED_CHANNELS"),
     allowedUsers: envList("ALLOWED_USERS"),
-    command: "$(customapi https://site-ca-hunger-games-live.onrender.com/hg?token=carolina-hg&channel=$(channel)&user=$(sender)&q=$(queryescape ${1:}))",
-    publicPage: "https://site-ca-hunger-games-live.onrender.com/hungergames?channel=carolinaporto",
-    adminPage: "https://site-ca-hunger-games-live.onrender.com/admin/hungergames?channel=carolinaporto&token=carolina-hg"
+    command: "$(customapi https://site-jogo-o9d1.onrender.com/hg?token=carolina-hg&channel=$(channel)&user=$(sender)&q=$(queryescape ${1:}))",
+    publicPage: "https://site-jogo-o9d1.onrender.com/hungergames?channel=carolinaporto",
+    adminPage: "https://site-jogo-o9d1.onrender.com/admin/hungergames?channel=carolinaporto&token=carolina-hg"
   });
 });
 app.listen(PORT, () => console.log("HG Live separado rodando na porta " + PORT));
