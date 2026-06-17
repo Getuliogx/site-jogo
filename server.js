@@ -10,6 +10,25 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
+const autoTimers = new Map();
+
+function getAutoIntervalMs() {
+  const ms = Number(process.env.HG_AUTO_INTERVAL_MS || 12000);
+  return Math.max(4000, Math.min(120000, Number.isFinite(ms) ? ms : 12000));
+}
+
+function stopAuto(channel) {
+  const key = nick(channel || "");
+  const timer = autoTimers.get(key);
+  if (timer) clearInterval(timer);
+  autoTimers.delete(key);
+}
+
+function isAutoRunning(channel) {
+  return autoTimers.has(nick(channel || ""));
+}
+
+
 let pool = null;
 let ready = false;
 let twitchTokenCache = { token: null, expiresAt: 0 };
@@ -353,6 +372,7 @@ async function start(channel) {
 }
 
 async function reset(channel) {
+  stopAuto(channel);
   const old = await currentGame(channel, false);
   await newLobby(channel, old?.adult_mode || (process.env.HG_ADULT_DEFAULT === "1" ? 1 : 0));
   return "✅ Arena resetada. Use !hg entrar.";
@@ -481,6 +501,33 @@ async function nextRound(channel) {
   return `✅ ${title} gerado. Restam ${alive.length} vivos.`;
 }
 
+
+async function startAuto(channel) {
+  const ch = nick(channel || "icarolinaporto");
+  stopAuto(ch);
+  const game = await currentGame(ch, false);
+  if (!game || game.status !== "running") return "A partida precisa estar rodando. Clique em Iniciar primeiro.";
+  const intervalMs = getAutoIntervalMs();
+
+  const timer = setInterval(async () => {
+    try {
+      const g = await currentGame(ch, false);
+      if (!g || g.status !== "running") {
+        stopAuto(ch);
+        return;
+      }
+      const result = await nextRound(ch);
+      if (/venceu|acabou|já acabou/i.test(String(result))) stopAuto(ch);
+    } catch (e) {
+      console.error("Erro no auto HG:", e);
+      stopAuto(ch);
+    }
+  }, intervalMs);
+
+  autoTimers.set(ch, timer);
+  return `▶️ Automático ligado. Rodada a cada ${Math.round(intervalMs / 1000)}s.`;
+}
+
 function parseCommand(raw) {
   const original = String(raw || "").trim().replace(/^!hg\s+/i, "").trim();
   const q = normalize(original);
@@ -492,6 +539,8 @@ function parseCommand(raw) {
   if (m) return { action: "district", district: m[2] };
   if (/^(iniciar|start|comecar|começar)$/i.test(q)) return { action: "start" };
   if (/^(proximo|próximo|next|prosseguir|rodada|proceed)$/i.test(q)) return { action: "next" };
+  if (/^(auto|automatico|automático|rodar|rodarsozinho|rodar sozinho|play)$/i.test(q)) return { action: "auto_start" };
+  if (/^(parar|stop|pausar|auto off|automatico off|automático off)$/i.test(q)) return { action: "auto_stop" };
   if (/^(resetar|reset|limpar)$/i.test(q)) return { action: "reset" };
   if (/^(\+18|18\+|adulto|adult)\s*(on|ligar|liga)?$/i.test(q)) return { action: "adult_on" };
   if (/^(\+18|18\+|adulto|adult)\s*(off|desligar|desliga)$/i.test(q)) return { action: "adult_off" };
@@ -522,6 +571,8 @@ async function command(req, res) {
 
     if (cmd.action === "start") return send(res, await start(ch));
     if (cmd.action === "next") return send(res, await nextRound(ch));
+    if (cmd.action === "auto_start") return send(res, await startAuto(ch));
+    if (cmd.action === "auto_stop") { stopAuto(ch); return send(res, "⏸️ Automático desligado."); }
     if (cmd.action === "reset") return send(res, await reset(ch));
     if (cmd.action === "adult_on") return send(res, await adult(ch, true));
     if (cmd.action === "adult_off") return send(res, await adult(ch, false));
@@ -540,12 +591,12 @@ async function adminAction(req, res) {
     const ch = channelFrom(req);
     const action = String(req.query.action || req.body?.action || "");
 
-    if (["start","next","reset","adult_on","adult_off","add_player","add_event"].includes(action) && !isAdmin(req)) {
-      return send(res, "Usuário não autorizado.");
-    }
-
+    // Admin web usa token secreto na URL; não precisa de user=$(sender).
+    // A proteção por usuário continua valendo no comando do chat.
     if (action === "start") return send(res, await start(ch));
     if (action === "next") return send(res, await nextRound(ch));
+    if (action === "auto_start") return send(res, await startAuto(ch));
+    if (action === "auto_stop") { stopAuto(ch); return send(res, "⏸️ Automático desligado."); }
     if (action === "reset") return send(res, await reset(ch));
     if (action === "adult_on") return send(res, await adult(ch, true));
     if (action === "adult_off") return send(res, await adult(ch, false));
@@ -585,7 +636,9 @@ async function state(req, res) {
       players,
       logs: logs.reverse(),
       eventCount: Number(events?.[0]?.total || 0),
-      adultEventCount: Number(events?.[0]?.adultTotal || 0)
+      adultEventCount: Number(events?.[0]?.adultTotal || 0),
+      autoRunning: isAutoRunning(ch),
+      autoIntervalMs: getAutoIntervalMs()
     });
   } catch (e) {
     console.error(e);
@@ -604,19 +657,22 @@ function page(admin = false) {
 button,.btn{border:0;border-radius:14px;padding:11px 14px;font-weight:950;color:white;background:var(--p);cursor:pointer}.danger{background:var(--d)}.ok{background:var(--ok);color:#061208}.secondary{background:#303044}
 input,select,textarea{width:100%;background:#0d0d16;color:var(--text);border:1px solid var(--b);border-radius:14px;padding:11px;font:inherit}textarea{min-height:90px}.players{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
 .player{border:1px solid var(--b);background:var(--card2);border-radius:18px;padding:12px;display:flex;gap:12px;align-items:center}.dead{opacity:.45;filter:grayscale(1)}.avatar{width:46px;height:46px;border-radius:14px;object-fit:cover;background:#333}.fake{display:flex;align-items:center;justify-content:center;background:#402060;font-weight:950}
-.district{color:#d8b4fe;font-weight:950;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.name{font-weight:950}.kills{font-size:12px;color:var(--muted)}.logs{display:flex;flex-direction:column;gap:10px;max-height:680px;overflow:auto}.log{border:1px solid var(--b);background:#11111c;border-radius:18px;padding:12px;line-height:1.45}.death{border-color:#7f1d1d;background:#1c1014}.phase{color:#f0abfc;font-weight:950;font-size:12px;text-transform:uppercase;letter-spacing:.12em}.two{display:grid;grid-template-columns:1fr 100px;gap:8px}
+.district{color:#d8b4fe;font-weight:950;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.name{font-weight:950}.kills{font-size:12px;color:var(--muted)}.logs{display:flex;flex-direction:column;gap:14px;max-height:760px;overflow:auto}.log{border:1px solid var(--b);background:#11111c;border-radius:22px;padding:14px;line-height:1.45}.death{border-color:#7f1d1d;background:#1c1014}.phase{color:#f0abfc;font-weight:950;font-size:12px;text-transform:uppercase;letter-spacing:.12em}.event-avatars{display:flex;gap:12px;flex-wrap:wrap;margin:8px 0 12px}.event-person{min-width:86px;text-align:center}.event-person .avatar,.event-person .fake{width:72px;height:72px;border-radius:18px;margin:0 auto 6px;object-fit:cover;border:1px solid var(--b)}.event-name{font-size:11px;font-weight:950;max-width:95px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.event-text{font-size:15px;font-weight:800}.lobby-only.hidden{display:none}.two{display:grid;grid-template-columns:1fr 100px;gap:8px}
 </style></head><body><div class="wrap"><div class="top"><div><h1>Hunger Games da Live</h1><div class="sub">Participantes do chat, distritos, eventos, mortes e vencedor final.</div></div><div class="pill" id="statusPill">Carregando...</div></div>
-<div class="grid"><section class="card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div></div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar</button><button class="secondary" onclick="act('next')">Próximo</button><button class="danger" onclick="act('reset')">Resetar</button><button class="secondary" onclick="act('adult_on')">+18 ON</button><button class="secondary" onclick="act('adult_off')">+18 OFF</button></div>` : ``}</div>
+<div class="grid"><section class="card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div></div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar auto</button><button class="danger" onclick="act('reset')">Resetar</button><button class="secondary" onclick="act('adult_on')">+18 ON</button><button class="secondary" onclick="act('adult_off')">+18 OFF</button></div>` : ``}</div>
 ${admin ? `<div class="two" style="margin:16px 0"><input id="manualName" placeholder="Adicionar participante manual"/><input id="manualDistrict" placeholder="Distrito" type="number" min="1" max="12"/><button style="grid-column:1/-1" onclick="addPlayer()">Adicionar participante</button></div>` : ``}
-<h2>Participantes</h2><div class="players" id="players"></div></section><aside class="card"><h2>Eventos</h2><div class="logs" id="logs"></div></aside></div>
+<div id="participantsBox" class="lobby-only"><h2>Participantes</h2><div class="players" id="players"></div></div></section><aside class="card"><h2>Eventos</h2><div class="logs" id="logs"></div></aside></div>
 ${admin ? `<section class="card" style="margin-top:18px"><h2>Adicionar evento próprio</h2><div class="small">Use {p1}, {p2}, {p3}, {p4}. Para matar alguém coloque kills: p2 ou p1,p3.</div><div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px"><select id="evPhase"><option>bloodbath</option><option>day</option><option>night</option><option>feast</option><option>arena</option></select><select id="evType"><option>neutral</option><option>death</option><option>item</option><option>alliance</option><option>adult</option></select><input id="evPlayers" type="number" min="1" max="4" value="1"/><input id="evKills" placeholder="kills: p2"/><select id="evAdult"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="evText" placeholder="{p1} faz alguma coisa com {p2}."></textarea><button onclick="addEvent()">Salvar evento</button></section>` : ``}</div>
 <script>
-const params=new URLSearchParams(location.search),channel=params.get("channel")||"carolinaporto",token=params.get("token")||"",admin=${admin?"true":"false"};
+const params=new URLSearchParams(location.search),channel=params.get("channel")||"icarolinaporto",token=params.get("token")||"",admin=${admin?"true":"false"};
 function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}[m]))}
 async function api(path,opt={}){const sep=path.includes("?")?"&":"?";const url=path+sep+"channel="+encodeURIComponent(channel)+(token?"&token="+encodeURIComponent(token):"");const r=await fetch(url,opt),ct=r.headers.get("content-type")||"";return ct.includes("json")?r.json():r.text()}
-async function load(){const st=await api("/hg/state"),g=st.game||{};document.getElementById("statusPill").textContent=(g.status||"lobby").toUpperCase()+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=(g.phase||"bloodbath")+" • dia "+(g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida rolando":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Lobby aberto";const alive=st.players.filter(p=>p.alive).length;document.getElementById("counts").textContent=st.players.length+" participantes • "+alive+" vivos • "+st.eventCount+" eventos";
-document.getElementById("players").innerHTML=st.players.map(p=>{const av=p.avatar_url?'<img class="avatar" src="'+esc(p.avatar_url)+'">':'<div class="avatar fake">'+esc((p.display_name||"?").slice(0,1).toUpperCase())+'</div>';return '<div class="player '+(p.alive?'':'dead')+'">'+av+'<div><div class="district">Distrito '+p.district+'</div><div class="name">'+esc(p.display_name)+'</div><div class="kills">'+(p.kills||0)+' kill(s) '+(p.alive?'🟢':'💀')+'</div></div></div>'}).join("")||"<div class='small'>Ninguém entrou ainda.</div>";
-document.getElementById("logs").innerHTML=st.logs.map(l=>'<div class="log '+(l.deaths?'death':'')+'"><div class="phase">'+esc(l.phase)+' '+(l.day_number?'• '+l.day_number:'')+'</div><div>'+esc(l.text)+'</div>'+(l.deaths?'<div class="small">Mortes: '+esc(l.deaths)+'</div>':'')+'</div>').join("")||"<div class='small'>Sem eventos ainda.</div>"}
+function avatarHtml(p,cls="avatar"){return p&&p.avatar_url?'<img class="'+cls+'" src="'+esc(p.avatar_url)+'">':'<div class="'+cls+' fake">'+esc(((p&&p.display_name)||"?").slice(0,1).toUpperCase())+'</div>'}
+function mentionedPlayers(text,players){const found=[];const lower=String(text||"").toLowerCase();players.forEach(p=>{const nm=String(p.display_name||p.username||"").toLowerCase();if(nm&&lower.includes(nm)&&!found.some(x=>x.id===p.id))found.push(p)});return found.slice(0,4)}
+async function load(){const st=await api("/hg/state"),g=st.game||{};document.getElementById("statusPill").textContent=(g.status||"lobby").toUpperCase()+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=(g.phase||"bloodbath")+" • dia "+(g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida rolando":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Lobby aberto";const alive=st.players.filter(p=>p.alive).length;document.getElementById("counts").textContent=st.players.length+" participantes • "+alive+" vivos • "+st.eventCount+" eventos"+(st.autoRunning?" • automático ligado":"");
+const box=document.getElementById("participantsBox");if(box)box.classList.toggle("hidden",g.status==="running");
+document.getElementById("players").innerHTML=st.players.map(p=>{const av=avatarHtml(p);return '<div class="player '+(p.alive?'':'dead')+'">'+av+'<div><div class="district">Distrito '+p.district+'</div><div class="name">'+esc(p.display_name)+'</div><div class="kills">'+(p.kills||0)+' kill(s) '+(p.alive?'🟢':'💀')+'</div></div></div>'}).join("")||"<div class='small'>Ninguém entrou ainda.</div>";
+document.getElementById("logs").innerHTML=st.logs.map(l=>{const ps=mentionedPlayers(l.text,st.players);const avs=ps.length?'<div class="event-avatars">'+ps.map(p=>'<div class="event-person">'+avatarHtml(p,"avatar")+'<div class="event-name">'+esc(p.display_name)+'</div></div>').join("")+'</div>':'';return '<div class="log '+(l.deaths?'death':'')+'"><div class="phase">'+esc(l.phase)+' '+(l.day_number?'• '+l.day_number:'')+'</div>'+avs+'<div class="event-text">'+esc(l.text)+'</div>'+(l.deaths?'<div class="small">Mortes: '+esc(l.deaths)+'</div>':'')+'</div>'}).join("")||"<div class='small'>Sem eventos ainda.</div>"}
 async function act(a){if(!token)return alert("Abra com ?token=SEU_TOKEN");const t=await api("/hg/admin?action="+encodeURIComponent(a));alert(t);load()}
 async function addPlayer(){const name=document.getElementById("manualName").value.trim(),d=document.getElementById("manualDistrict").value.trim();if(!name)return alert("Nome vazio");const t=await api("/hg/admin?action=add_player&name="+encodeURIComponent(name)+"&district="+encodeURIComponent(d));alert(t);load()}
 async function addEvent(){const body={action:"add_event",phase:evPhase.value,type:evType.value,players:evPlayers.value,kills:evKills.value,adult:evAdult.value,text:evText.value};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);evText.value="";load()}

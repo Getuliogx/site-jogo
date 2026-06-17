@@ -24,3 +24,5 @@ services:
         sync: false
       - key: TWITCH_CLIENT_SECRET
         sync: false
+      - key: HG_AUTO_INTERVAL_MS
+        value: "12000"

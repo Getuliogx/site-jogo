@@ -70,3 +70,24 @@ https://site-jogo-o9d1.onrender.com/admin/hungergames?channel=icarolinaporto&tok
 - O canal correto agora é `icarolinaporto`.
 - Se algum link antigo mandar `channel=carolinaporto`, o servidor joga para `icarolinaporto` para não separar os participantes.
 - Corrigido para não dar "Canal não autorizado" nesse caso.
+
+
+## Correção AUTO / admin
+
+Nesta versão:
+- O admin com `?token=carolina-hg` não dá mais "Usuário não autorizado".
+- Botão `Rodar sozinho` adicionado no admin.
+- Comando de chat também funciona:
+  `!hg auto`
+  `!hg parar`
+- Intervalo automático padrão: 12 segundos.
+- Pode mudar no Render:
+  `HG_AUTO_INTERVAL_MS=12000`
+
+
+## Layout eventos com imagens
+
+Nesta versão:
+- A lista de participantes some quando a partida está rodando.
+- Cada evento tenta mostrar as imagens dos participantes citados no texto.
+- Imagem em cima, texto do evento embaixo, parecido com simulador.
