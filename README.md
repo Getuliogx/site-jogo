@@ -44,6 +44,7 @@ $(customapi https://site-jogo-o9d1.onrender.com/hg?token=carolina-hg&channel=$(c
 !hg entrar 5
 !hg distrito 3
 !hg sair
+!hg todos
 !hg iniciar
 !hg proximo
 !hg resetar
@@ -193,3 +194,11 @@ A correção agora:
 - bloqueia evento do tipo **Morte** sem preencher corretamente o campo **Mortes**.
 
 Essas mudanças não apagam nem recriam a tabela `hg_events` e mantêm os eventos já cadastrados.
+
+
+## Versão 3.0.0 — pacote pronto para substituir a raiz
+
+- Arquivos do ZIP ficam diretamente na raiz para evitar criar `site-jogo-main/site-jogo-main`.
+- HTML e API usam `Cache-Control: no-store` para o navegador não continuar exibindo a interface antiga.
+- Rota de conferência: `/version`, que deve responder `{"version":"3.0.0"}`.
+- Mantém as correções de dias repetidos, mortos reaparecendo, tradução e `!hg todos`.

@@ -6,10 +6,23 @@ import tls from "node:tls";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+const APP_VERSION = "3.0.0";
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+// Evita que o navegador ou um proxy continue mostrando o painel antigo após o deploy.
+app.use((req, res, next) => {
+  if (req.path.startsWith("/hg") || req.path.includes("hungergames") || req.path === "/version") {
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    res.set("Surrogate-Control", "no-store");
+    res.set("X-HG-Version", APP_VERSION);
+  }
+  next();
+});
 
 const autoTimers = new Map();
 const chatTrackers = new Map();
@@ -1259,6 +1272,8 @@ async function state(req, res) {
 function page(admin = false) {
   return `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Hunger Games da Live</title>
+<meta name="hg-version" content="${APP_VERSION}"/>
+<!-- HG_VERSION ${APP_VERSION} -->
 <style>
 :root{--bg:#07070c;--card:#141421;--card2:#1c1c2d;--text:#f8f7ff;--muted:#aaa6c8;--p:#a855f7;--d:#ef4444;--ok:#22c55e;--b:#303044}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#2a1247,#080810 46%,#050509);color:var(--text);font-family:Inter,system-ui,Arial,sans-serif}.wrap{max-width:1280px;margin:auto;padding:22px}
@@ -1330,8 +1345,9 @@ load();if(admin)loadEvents();setInterval(load,2500);
 </script></body></html>`;
 }
 
-app.get("/", (_req, res) => res.type("text/plain").send("OK - Hunger Games da Live separado"));
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/", (_req, res) => res.type("text/plain").send(`OK - Hunger Games da Live v${APP_VERSION}`));
+app.get("/health", (_req, res) => res.json({ ok: true, version: APP_VERSION }));
+app.get("/version", (_req, res) => res.json({ version: APP_VERSION }));
 app.get("/hg", command);
 app.post("/hg", command);
 app.get("/hg/admin", adminAction);
