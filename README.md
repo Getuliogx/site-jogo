@@ -17,9 +17,10 @@ COMMAND_SECRET=carolina-hg
 DEFAULT_CHANNEL=icarolinaporto
 ALLOWED_CHANNELS=icarolinaporto
 ALLOWED_USERS=icarolinaporto,mod1,mod2
-HG_MAX_PLAYERS=24
 HG_ADULT_DEFAULT=0
 DATABASE_URL=sua_database_url_real
+
+Não existe mais limite máximo de participantes no código.
 ```
 
 Para pegar foto do perfil da Twitch, coloque também:
@@ -155,7 +156,6 @@ O servidor tenta obter a lista oficial da Twitch quando existe um token configur
 O comando adiciona até o valor configurado em:
 
 ```txt
-HG_MAX_PLAYERS=24
 ```
 
 Aumente esse valor no Render caso queira colocar mais de 24 pessoas.
@@ -200,5 +200,5 @@ Essas mudanças não apagam nem recriam a tabela `hg_events` e mantêm os evento
 
 - Arquivos do ZIP ficam diretamente na raiz para evitar criar `site-jogo-main/site-jogo-main`.
 - HTML e API usam `Cache-Control: no-store` para o navegador não continuar exibindo a interface antiga.
-- Rota de conferência: `/version`, que deve responder `{"version":"3.0.0"}`.
+- Rota de conferência: `/version`, que deve responder `{"version":"3.2.0"}`.
 - Mantém as correções de dias repetidos, mortos reaparecendo, tradução e `!hg todos`.

@@ -6,7 +6,7 @@ import tls from "node:tls";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = "3.0.0";
+const APP_VERSION = "3.2.0";
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
@@ -620,7 +620,7 @@ async function officialChatters(channel) {
       users.push({ username: nick(u.user_login), display_name: u.user_name || u.user_login });
     }
     cursor = j?.pagination?.cursor || "";
-  } while (cursor && users.length < 10000);
+  } while (cursor);
   return users;
 }
 
@@ -674,10 +674,7 @@ async function join(channel, username, display, distRaw) {
     const game = await currentGame(channel, true);
     if (game.status !== "lobby") return "A partida já começou. Espere resetar.";
     const db = await getPool();
-    const max = Number(process.env.HG_MAX_PLAYERS || 24);
-    const [cnt] = await db.query("SELECT COUNT(*) total FROM hg_players WHERE game_id=?", [game.id]);
     const [ex] = await db.query("SELECT * FROM hg_players WHERE game_id=? AND username=? LIMIT 1", [game.id, username]);
-    if (!ex.length && Number(cnt?.[0]?.total || 0) >= max) return `A arena já está cheia (${max}).`;
 
     const dist = distRaw ? district(distRaw) : (ex.length ? ex[0].district : await autoDistrict(game.id));
     const avatar = ex.length ? (ex[0].avatar_url || "") : await getTwitchAvatar(username);
@@ -745,13 +742,8 @@ async function addAllChatters(channel) {
     const db = await getPool();
     const [existing] = await db.query("SELECT username,district FROM hg_players WHERE game_id=?", [game.id]);
     const existingNames = new Set(existing.map(p => nick(p.username)));
-    const max = Math.max(2, Number(process.env.HG_MAX_PLAYERS || 24));
-    const room = Math.max(0, max - existing.length);
-    const candidates = [...unique.values()].filter(p => !existingNames.has(p.username));
-    if (!room) return `A arena já está cheia (${max}).`;
-
-    const selected = candidates.slice(0, room);
-    if (!selected.length) return `✅ Todos que estavam no chat já foram adicionados. Total: ${existing.length}/${max}.`;
+    const selected = [...unique.values()].filter(p => !existingNames.has(p.username));
+    if (!selected.length) return `✅ Todos que estavam no chat já foram adicionados. Total: ${existing.length}.`;
 
     const profiles = await getTwitchProfiles(selected.map(p => p.username));
     const counts = new Map();
@@ -785,9 +777,7 @@ async function addAllChatters(channel) {
       VALUES ?
     `, [values]);
 
-    const skipped = Math.max(0, candidates.length - selected.length);
-    return `✅ ${selected.length} participante(s) do chat adicionado(s). Total: ${existing.length + selected.length}/${max}` +
-      (skipped ? ` • ${skipped} não couberam porque a arena atingiu o limite.` : ".");
+    return `✅ ${selected.length} participante(s) do chat adicionado(s). Total: ${existing.length + selected.length}.`;
   });
 }
 

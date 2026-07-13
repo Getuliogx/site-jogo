@@ -14,8 +14,6 @@ services:
         value: icarolinaporto
       - key: ALLOWED_USERS
         value: icarolinaporto,mod1,mod2
-      - key: HG_MAX_PLAYERS
-        value: "24"
       - key: HG_ADULT_DEFAULT
         value: "0"
       - key: DATABASE_URL
