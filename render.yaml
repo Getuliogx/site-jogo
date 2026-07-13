@@ -3,7 +3,7 @@ services:
     name: site-jogo
     env: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm install --no-audit --no-fund
     startCommand: npm start
     envVars:
       - key: COMMAND_SECRET
