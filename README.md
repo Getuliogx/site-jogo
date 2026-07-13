@@ -126,3 +126,70 @@ Nesta versão:
 - Adicionado botão "Adicionar +18 pesado" no admin do Render.
 - O pacote adiciona novos eventos adultos mais fortes ao banco.
 - Mantém editor de eventos existentes.
+
+
+## Versão corrigida — dias, mortos e participantes do chat
+
+Esta versão mantém o mesmo banco e não apaga os eventos cadastrados.
+
+Correções e novidades:
+
+- Rodadas protegidas contra execução simultânea. Isso evita repetir a mesma fase ou o mesmo dia quando o automático e o botão/comando são usados quase juntos.
+- O modo automático espera uma rodada terminar antes de agendar a próxima.
+- Uma pessoa morta não pode voltar a ficar viva por `!hg entrar` nem ao clicar novamente em **Iniciar**.
+- Uma partida encerrada só pode começar de novo depois de **Resetar**.
+- Atualizações de morte só valem quando a pessoa ainda está viva, evitando mortes duplicadas.
+- Botões, fases, tipos, estados e contagem de abates foram traduzidos para português na tela.
+- Novo botão **Adicionar todos do chat** no painel administrativo.
+- Novo comando de streamer/mod:
+
+```txt
+!hg todos
+```
+
+O servidor tenta obter a lista oficial da Twitch quando existe um token configurado. Sem esse token, ele usa a conexão automática ao chat da Twitch. Depois de um deploy ou de o Render acordar, pode levar alguns segundos para a lista do chat ficar pronta.
+
+### Limite de participantes
+
+O comando adiciona até o valor configurado em:
+
+```txt
+HG_MAX_PLAYERS=24
+```
+
+Aumente esse valor no Render caso queira colocar mais de 24 pessoas.
+
+### Bots ignorados
+
+Os bots mais comuns já são ignorados. Para acrescentar outros, use no Render:
+
+```txt
+HG_IGNORE_CHATTERS=bot1,bot2,bot3
+```
+
+### Lista oficial da Twitch — opcional
+
+Para uma lista mais precisa, pode ser configurado um token de usuário da Twitch com a permissão de leitura de participantes do chat:
+
+```txt
+TWITCH_CHAT_TOKEN=seu_token_de_usuario
+TWITCH_CHAT_MODERATOR=icarolinaporto
+```
+
+Isso é opcional; a conexão automática ao chat continua funcionando como alternativa.
+
+## Correção específica — participante morto aparecendo vivo novamente
+
+O erro corrigido aqui era durante a mesma partida: a pessoa aparecia em um evento de morte e depois voltava a aparecer em eventos seguintes como se estivesse viva.
+
+A correção agora:
+
+- grava a rodada inteira em uma única transação no banco;
+- atualiza a morte (`alive=0`) e o texto do evento juntos;
+- impede duas rodadas de usarem ao mesmo tempo uma lista antiga de participantes vivos;
+- confirma novamente quem está vivo antes de montar cada evento;
+- impede respostas antigas do painel de sobrescreverem uma atualização mais nova;
+- faz o painel ler jogadores e eventos do mesmo instante do banco;
+- bloqueia evento do tipo **Morte** sem preencher corretamente o campo **Mortes**.
+
+Essas mudanças não apagam nem recriam a tabela `hg_events` e mantêm os eventos já cadastrados.

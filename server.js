@@ -2,6 +2,7 @@
 import express from "express";
 import cors from "cors";
 import mysql from "mysql2/promise";
+import tls from "node:tls";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -11,6 +12,13 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 const autoTimers = new Map();
+const chatTrackers = new Map();
+const channelQueues = new Map();
+
+const DEFAULT_IGNORED_CHATTERS = new Set([
+  "streamelements", "nightbot", "moobot", "streamlabs", "soundalerts",
+  "sery_bot", "commanderroot", "wizebot", "fossabot"
+]);
 
 function getAutoIntervalMs() {
   const ms = Number(process.env.HG_AUTO_INTERVAL_MS || 12000);
@@ -20,7 +28,10 @@ function getAutoIntervalMs() {
 function stopAuto(channel) {
   const key = nick(channel || "");
   const timer = autoTimers.get(key);
-  if (timer) clearInterval(timer);
+  if (timer) {
+    clearTimeout(timer);
+    clearInterval(timer);
+  }
   autoTimers.delete(key);
 }
 
@@ -28,9 +39,210 @@ function isAutoRunning(channel) {
   return autoTimers.has(nick(channel || ""));
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function ignoredChatters() {
+  return new Set([...DEFAULT_IGNORED_CHATTERS, ...envList("HG_IGNORE_CHATTERS")]);
+}
+
+function decodeIrcTag(value = "") {
+  return String(value)
+    .replace(/\\s/g, " ")
+    .replace(/\\:/g, ";")
+    .replace(/\\r/g, "\r")
+    .replace(/\\n/g, "\n")
+    .replace(/\\\\/g, "\\");
+}
+
+function parseIrcTags(line) {
+  if (!line.startsWith("@")) return {};
+  const raw = line.slice(1, line.indexOf(" "));
+  const tags = {};
+  for (const part of raw.split(";")) {
+    const i = part.indexOf("=");
+    const key = i >= 0 ? part.slice(0, i) : part;
+    const value = i >= 0 ? part.slice(i + 1) : "";
+    tags[key] = decodeIrcTag(value);
+  }
+  return tags;
+}
+
+function trackerAddUser(state, username, displayName = "") {
+  const login = nick(username);
+  if (!login || login.startsWith("justinfan") || ignoredChatters().has(login)) return;
+  const previous = state.users.get(login);
+  state.users.set(login, {
+    username: login,
+    display_name: String(displayName || previous?.display_name || login).trim() || login
+  });
+  if (state.pendingNames) state.pendingNames.add(login);
+}
+
+function requestTrackerNames(state) {
+  if (!state?.socket || state.socket.destroyed || !state.connected) return false;
+  state.pendingNames = new Set();
+  state.socket.write(`NAMES #${state.channel}\r\n`);
+  return true;
+}
+
+function handleIrcLine(state, line) {
+  if (!line) return;
+  if (line.startsWith("PING")) {
+    state.socket?.write(line.replace(/^PING/, "PONG") + "\r\n");
+    return;
+  }
+
+  const names = line.match(/ 353 [^ ]+ [=@*] #([^ ]+) :(.+)$/);
+  if (names) {
+    for (const rawName of names[2].split(/\s+/)) {
+      const login = nick(rawName.replace(/^[~&@%+]+/, ""));
+      if (!login) continue;
+      if (state.pendingNames) state.pendingNames.add(login);
+      else trackerAddUser(state, login, login);
+    }
+    return;
+  }
+
+  if (/ 366 [^ ]+ #[^ ]+ :/.test(line)) {
+    if (state.pendingNames) {
+      const fresh = new Map();
+      for (const login of state.pendingNames) {
+        if (ignoredChatters().has(login) || login.startsWith("justinfan")) continue;
+        const old = state.users.get(login);
+        fresh.set(login, old || { username: login, display_name: login });
+      }
+      state.users = fresh;
+      state.pendingNames = null;
+      state.lastNamesAt = Date.now();
+    }
+    return;
+  }
+
+  const prefixUser = line.match(/^(?:@[^ ]+ )?:([^! ]+)!/);
+  const login = nick(prefixUser?.[1] || "");
+  if (!login) return;
+
+  if (line.includes(" JOIN #")) {
+    const tags = parseIrcTags(line);
+    trackerAddUser(state, login, tags["display-name"] || login);
+    return;
+  }
+  if (line.includes(" PART #")) {
+    state.users.delete(login);
+    state.pendingNames?.delete(login);
+    return;
+  }
+  if (line.includes(" PRIVMSG #")) {
+    const tags = parseIrcTags(line);
+    trackerAddUser(state, login, tags["display-name"] || login);
+  }
+}
+
+function startChatTracker(channel) {
+  const ch = nick(channel);
+  if (!ch) return null;
+  const current = chatTrackers.get(ch);
+  if (current?.socket && !current.socket.destroyed) return current;
+
+  const state = current || {
+    channel: ch,
+    users: new Map(),
+    pendingNames: null,
+    connected: false,
+    reconnectTimer: null,
+    socket: null,
+    buffer: "",
+    lastNamesAt: 0
+  };
+  chatTrackers.set(ch, state);
+
+  if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+  const socket = tls.connect({ host: "irc.chat.twitch.tv", port: 6697, servername: "irc.chat.twitch.tv" });
+  state.socket = socket;
+  state.buffer = "";
+  state.connected = false;
+  socket.setEncoding("utf8");
+
+  socket.on("secureConnect", () => {
+    state.connected = true;
+    const guest = `justinfan${Math.floor(10000 + Math.random() * 89999)}`;
+    socket.write("PASS SCHMOOPIIE\r\n");
+    socket.write(`NICK ${guest}\r\n`);
+    socket.write("CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands\r\n");
+    socket.write(`JOIN #${ch}\r\n`);
+    setTimeout(() => requestTrackerNames(state), 700).unref?.();
+  });
+
+  socket.on("data", chunk => {
+    state.buffer += chunk;
+    const lines = state.buffer.split("\r\n");
+    state.buffer = lines.pop() || "";
+    for (const line of lines) handleIrcLine(state, line);
+  });
+
+  const reconnect = () => {
+    state.connected = false;
+    if (state.socket === socket) state.socket = null;
+    if (state.reconnectTimer) return;
+    state.reconnectTimer = setTimeout(() => {
+      state.reconnectTimer = null;
+      startChatTracker(ch);
+    }, 5000);
+    state.reconnectTimer.unref?.();
+  };
+  socket.on("error", err => console.error(`Twitch IRC ${ch}:`, err.message));
+  socket.on("close", reconnect);
+  socket.on("end", reconnect);
+  return state;
+}
+
+async function trackedChatters(channel) {
+  const state = startChatTracker(channel);
+  if (!state) return [];
+  requestTrackerNames(state);
+  const until = Date.now() + 3500;
+  while (Date.now() < until) {
+    if (!state.pendingNames && state.users.size) break;
+    await sleep(150);
+  }
+  return [...state.users.values()];
+}
+
+async function withChannelLock(channel, task) {
+  const key = nick(channel) || "default";
+  const previous = channelQueues.get(key) || Promise.resolve();
+  let releaseLocal;
+  const localGate = new Promise(resolve => { releaseLocal = resolve; });
+  const tail = previous.then(() => localGate);
+  channelQueues.set(key, tail);
+  await previous;
+
+  let conn = null;
+  try {
+    await ensureTables();
+    const db = await getPool();
+    conn = await db.getConnection();
+    const lockName = `hg:${key}`.slice(0, 64);
+    const [rows] = await conn.query("SELECT GET_LOCK(?, 30) AS ok", [lockName]);
+    if (Number(rows?.[0]?.ok) !== 1) return "Aguarde: outra ação da arena ainda está sendo processada.";
+    try {
+      return await task(conn);
+    } finally {
+      try { await conn.query("SELECT RELEASE_LOCK(?)", [lockName]); } catch {}
+    }
+  } finally {
+    if (conn) conn.release();
+    releaseLocal();
+    if (channelQueues.get(key) === tail) channelQueues.delete(key);
+  }
+}
+
 
 let pool = null;
 let ready = false;
+let readyPromise = null;
 let twitchTokenCache = { token: null, expiresAt: 0 };
 
 function dbUrl() {
@@ -205,76 +417,85 @@ const HEAVY_ADULT_EVENTS = [
 
 async function ensureTables() {
   if (ready) return;
-  const db = await getPool();
+  if (readyPromise) return readyPromise;
+  readyPromise = (async () => {
+      const db = await getPool();
 
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS hg_games (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      channel VARCHAR(80) NOT NULL,
-      status VARCHAR(20) NOT NULL DEFAULT 'lobby',
-      phase VARCHAR(30) NOT NULL DEFAULT 'bloodbath',
-      day_number INT NOT NULL DEFAULT 1,
-      adult_mode TINYINT(1) NOT NULL DEFAULT 0,
-      winner VARCHAR(120) NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      INDEX idx_channel_status (channel,status)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-  `);
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS hg_games (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          channel VARCHAR(80) NOT NULL,
+          status VARCHAR(20) NOT NULL DEFAULT 'lobby',
+          phase VARCHAR(30) NOT NULL DEFAULT 'bloodbath',
+          day_number INT NOT NULL DEFAULT 1,
+          adult_mode TINYINT(1) NOT NULL DEFAULT 0,
+          winner VARCHAR(120) NULL,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          INDEX idx_channel_status (channel,status)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
 
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS hg_players (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      game_id INT NOT NULL,
-      channel VARCHAR(80) NOT NULL,
-      username VARCHAR(120) NOT NULL,
-      display_name VARCHAR(120) NOT NULL,
-      district INT NOT NULL DEFAULT 1,
-      avatar_url TEXT NULL,
-      alive TINYINT(1) NOT NULL DEFAULT 1,
-      kills INT NOT NULL DEFAULT 0,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_game_user (game_id,username),
-      INDEX idx_game_alive (game_id,alive)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-  `);
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS hg_players (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          game_id INT NOT NULL,
+          channel VARCHAR(80) NOT NULL,
+          username VARCHAR(120) NOT NULL,
+          display_name VARCHAR(120) NOT NULL,
+          district INT NOT NULL DEFAULT 1,
+          avatar_url TEXT NULL,
+          alive TINYINT(1) NOT NULL DEFAULT 1,
+          kills INT NOT NULL DEFAULT 0,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          UNIQUE KEY uniq_game_user (game_id,username),
+          INDEX idx_game_alive (game_id,alive)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
 
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS hg_logs (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      game_id INT NOT NULL,
-      channel VARCHAR(80) NOT NULL,
-      phase VARCHAR(30) NOT NULL,
-      day_number INT NOT NULL DEFAULT 1,
-      text TEXT NOT NULL,
-      deaths TEXT NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      INDEX idx_game_log (game_id,id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-  `);
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS hg_logs (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          game_id INT NOT NULL,
+          channel VARCHAR(80) NOT NULL,
+          phase VARCHAR(30) NOT NULL,
+          day_number INT NOT NULL DEFAULT 1,
+          text TEXT NOT NULL,
+          deaths TEXT NULL,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_game_log (game_id,id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
 
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS hg_events (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      phase VARCHAR(30) NOT NULL,
-      type VARCHAR(30) NOT NULL DEFAULT 'neutral',
-      players INT NOT NULL DEFAULT 1,
-      text TEXT NOT NULL,
-      kills VARCHAR(50) NULL,
-      adult TINYINT(1) NOT NULL DEFAULT 0,
-      active TINYINT(1) NOT NULL DEFAULT 1,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      INDEX idx_event_phase (phase, active, adult)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-  `);
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS hg_events (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          phase VARCHAR(30) NOT NULL,
+          type VARCHAR(30) NOT NULL DEFAULT 'neutral',
+          players INT NOT NULL DEFAULT 1,
+          text TEXT NOT NULL,
+          kills VARCHAR(50) NULL,
+          adult TINYINT(1) NOT NULL DEFAULT 0,
+          active TINYINT(1) NOT NULL DEFAULT 1,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_event_phase (phase, active, adult)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
 
-  const [count] = await db.query("SELECT COUNT(*) AS total FROM hg_events");
-  if (Number(count?.[0]?.total || 0) === 0) {
-    await db.query("INSERT INTO hg_events (phase,type,players,text,kills,adult) VALUES ?", [DEFAULT_EVENTS.map(e => [e[0],e[1],e[2],e[3],e[4],e[5]])]);
+      const [count] = await db.query("SELECT COUNT(*) AS total FROM hg_events");
+      if (Number(count?.[0]?.total || 0) === 0) {
+        await db.query("INSERT INTO hg_events (phase,type,players,text,kills,adult) VALUES ?", [DEFAULT_EVENTS.map(e => [e[0],e[1],e[2],e[3],e[4],e[5]])]);
+      }
+
+      ready = true;
+  })();
+  try {
+    await readyPromise;
+  } catch (e) {
+    readyPromise = null;
+    throw e;
   }
-
-  ready = true;
 }
 
 
@@ -323,6 +544,83 @@ async function getTwitchAvatar(username) {
   }
 }
 
+async function getTwitchProfiles(usernames) {
+  const logins = [...new Set((usernames || []).map(nick).filter(Boolean))];
+  const result = new Map();
+  try {
+    const clientId = process.env.TWITCH_CLIENT_ID;
+    const token = await getTwitchAppToken();
+    if (!clientId || !token || !logins.length) return result;
+    for (let i = 0; i < logins.length; i += 100) {
+      const params = new URLSearchParams();
+      for (const login of logins.slice(i, i + 100)) params.append("login", login);
+      const r = await fetch(`https://api.twitch.tv/helix/users?${params}`, {
+        headers: { "Client-ID": clientId, Authorization: `Bearer ${token}` }
+      });
+      if (!r.ok) continue;
+      const j = await r.json();
+      for (const u of j?.data || []) {
+        result.set(nick(u.login), {
+          username: nick(u.login),
+          display_name: u.display_name || u.login,
+          avatar_url: u.profile_image_url || ""
+        });
+      }
+    }
+  } catch (e) {
+    console.error("Erro ao buscar perfis da Twitch:", e.message);
+  }
+  return result;
+}
+
+async function officialChatters(channel) {
+  const clientId = String(process.env.TWITCH_CLIENT_ID || "");
+  const userToken = String(process.env.TWITCH_CHAT_TOKEN || process.env.TWITCH_USER_TOKEN || "").replace(/^oauth:/i, "");
+  if (!clientId || !userToken) return null;
+  const headers = { "Client-ID": clientId, Authorization: `Bearer ${userToken}` };
+
+  async function twitchUser(login) {
+    const r = await fetch(`https://api.twitch.tv/helix/users?login=${encodeURIComponent(login)}`, { headers });
+    if (!r.ok) throw new Error(`Twitch Users HTTP ${r.status}`);
+    const j = await r.json();
+    return j?.data?.[0] || null;
+  }
+
+  const broadcaster = await twitchUser(channel);
+  const moderatorLogin = nick(process.env.TWITCH_CHAT_MODERATOR || channel);
+  const moderator = moderatorLogin === nick(channel) ? broadcaster : await twitchUser(moderatorLogin);
+  if (!broadcaster || !moderator) throw new Error("Canal ou moderador não encontrado na Twitch.");
+
+  const users = [];
+  let cursor = "";
+  do {
+    const params = new URLSearchParams({
+      broadcaster_id: broadcaster.id,
+      moderator_id: moderator.id,
+      first: "100"
+    });
+    if (cursor) params.set("after", cursor);
+    const r = await fetch(`https://api.twitch.tv/helix/chat/chatters?${params}`, { headers });
+    if (!r.ok) throw new Error(`Twitch Chatters HTTP ${r.status}`);
+    const j = await r.json();
+    for (const u of j?.data || []) {
+      users.push({ username: nick(u.user_login), display_name: u.user_name || u.user_login });
+    }
+    cursor = j?.pagination?.cursor || "";
+  } while (cursor && users.length < 10000);
+  return users;
+}
+
+async function currentChatters(channel) {
+  try {
+    const official = await officialChatters(channel);
+    if (official?.length) return official;
+  } catch (e) {
+    console.error("Lista oficial de chatters indisponível; usando IRC:", e.message);
+  }
+  return trackedChatters(channel);
+}
+
 async function currentGame(channel, create = true) {
   await ensureTables();
   const db = await getPool();
@@ -359,41 +657,50 @@ async function autoDistrict(gameId) {
 }
 
 async function join(channel, username, display, distRaw) {
-  const game = await currentGame(channel, true);
-  if (game.status !== "lobby") return "A partida já começou. Espere resetar.";
-  const db = await getPool();
-  const max = Number(process.env.HG_MAX_PLAYERS || 24);
-  const [cnt] = await db.query("SELECT COUNT(*) total FROM hg_players WHERE game_id=?", [game.id]);
-  const [ex] = await db.query("SELECT * FROM hg_players WHERE game_id=? AND username=? LIMIT 1", [game.id, username]);
-  if (!ex.length && Number(cnt?.[0]?.total || 0) >= max) return `A arena já está cheia (${max}).`;
+  return withChannelLock(channel, async () => {
+    const game = await currentGame(channel, true);
+    if (game.status !== "lobby") return "A partida já começou. Espere resetar.";
+    const db = await getPool();
+    const max = Number(process.env.HG_MAX_PLAYERS || 24);
+    const [cnt] = await db.query("SELECT COUNT(*) total FROM hg_players WHERE game_id=?", [game.id]);
+    const [ex] = await db.query("SELECT * FROM hg_players WHERE game_id=? AND username=? LIMIT 1", [game.id, username]);
+    if (!ex.length && Number(cnt?.[0]?.total || 0) >= max) return `A arena já está cheia (${max}).`;
 
-  const dist = distRaw ? district(distRaw) : (ex.length ? ex[0].district : await autoDistrict(game.id));
-  const avatar = ex.length ? (ex[0].avatar_url || "") : await getTwitchAvatar(username);
+    const dist = distRaw ? district(distRaw) : (ex.length ? ex[0].district : await autoDistrict(game.id));
+    const avatar = ex.length ? (ex[0].avatar_url || "") : await getTwitchAvatar(username);
 
-  await db.query(`
-    INSERT INTO hg_players (game_id,channel,username,display_name,district,avatar_url,alive)
-    VALUES (?,?,?,?,?,?,1)
-    ON DUPLICATE KEY UPDATE display_name=VALUES(display_name), district=VALUES(district), avatar_url=COALESCE(NULLIF(VALUES(avatar_url),''),avatar_url), alive=1
-  `, [game.id, channel, username, display || username, dist, avatar || ""]);
+    await db.query(`
+      INSERT INTO hg_players (game_id,channel,username,display_name,district,avatar_url,alive)
+      VALUES (?,?,?,?,?,?,1)
+      ON DUPLICATE KEY UPDATE
+        display_name=VALUES(display_name),
+        district=VALUES(district),
+        avatar_url=COALESCE(NULLIF(VALUES(avatar_url),''),avatar_url)
+    `, [game.id, channel, username, display || username, dist, avatar || ""]);
 
-  return `✅ ${display || username} entrou no Distrito ${dist}.`;
+    return `✅ ${display || username} entrou no Distrito ${dist}.`;
+  });
 }
 
 async function leave(channel, username) {
-  const game = await currentGame(channel, false);
-  if (!game || game.status !== "lobby") return "Só dá para sair antes da partida começar.";
-  const db = await getPool();
-  await db.query("DELETE FROM hg_players WHERE game_id=? AND username=?", [game.id, username]);
-  return `✅ ${username} saiu da arena.`;
+  return withChannelLock(channel, async () => {
+    const game = await currentGame(channel, false);
+    if (!game || game.status !== "lobby") return "Só dá para sair antes da partida começar.";
+    const db = await getPool();
+    await db.query("DELETE FROM hg_players WHERE game_id=? AND username=?", [game.id, username]);
+    return `✅ ${username} saiu da arena.`;
+  });
 }
 
 async function changeDistrict(channel, username, distRaw) {
-  const game = await currentGame(channel, false);
-  if (!game || game.status !== "lobby") return "Só dá para trocar distrito antes da partida começar.";
-  const db = await getPool();
-  const [r] = await db.query("UPDATE hg_players SET district=? WHERE game_id=? AND username=?", [district(distRaw), game.id, username]);
-  if (!r.affectedRows) return `Você ainda não entrou. Use !hg entrar ${district(distRaw)}`;
-  return `✅ ${username} foi para o Distrito ${district(distRaw)}.`;
+  return withChannelLock(channel, async () => {
+    const game = await currentGame(channel, false);
+    if (!game || game.status !== "lobby") return "Só dá para trocar distrito antes da partida começar.";
+    const db = await getPool();
+    const [r] = await db.query("UPDATE hg_players SET district=? WHERE game_id=? AND username=?", [district(distRaw), game.id, username]);
+    if (!r.affectedRows) return `Você ainda não entrou. Use !hg entrar ${district(distRaw)}`;
+    return `✅ ${username} foi para o Distrito ${district(distRaw)}.`;
+  });
 }
 
 async function addManual(channel, name, distRaw) {
@@ -402,23 +709,98 @@ async function addManual(channel, name, distRaw) {
   return join(channel, nick(display) || `player${Date.now()}`, display, distRaw);
 }
 
+async function addAllChatters(channel) {
+  return withChannelLock(channel, async () => {
+    const game = await currentGame(channel, true);
+    if (game.status !== "lobby") return "Só é possível adicionar todos antes da partida começar.";
+
+    const chatters = await currentChatters(channel);
+    const ignore = ignoredChatters();
+    const unique = new Map();
+    for (const person of chatters || []) {
+      const username = nick(person?.username || person?.user_login || person);
+      if (!username || ignore.has(username) || username.startsWith("justinfan")) continue;
+      unique.set(username, {
+        username,
+        display_name: String(person?.display_name || person?.user_name || username).trim() || username
+      });
+    }
+    if (!unique.size) {
+      return "Não consegui ler os usuários do chat agora. Aguarde alguns segundos e use !hg todos novamente.";
+    }
+
+    const db = await getPool();
+    const [existing] = await db.query("SELECT username,district FROM hg_players WHERE game_id=?", [game.id]);
+    const existingNames = new Set(existing.map(p => nick(p.username)));
+    const max = Math.max(2, Number(process.env.HG_MAX_PLAYERS || 24));
+    const room = Math.max(0, max - existing.length);
+    const candidates = [...unique.values()].filter(p => !existingNames.has(p.username));
+    if (!room) return `A arena já está cheia (${max}).`;
+
+    const selected = candidates.slice(0, room);
+    if (!selected.length) return `✅ Todos que estavam no chat já foram adicionados. Total: ${existing.length}/${max}.`;
+
+    const profiles = await getTwitchProfiles(selected.map(p => p.username));
+    const counts = new Map();
+    for (const p of existing) counts.set(Number(p.district), (counts.get(Number(p.district)) || 0) + 1);
+    function nextBalancedDistrict() {
+      let best = 1;
+      let amount = counts.get(1) || 0;
+      for (let d = 2; d <= 12; d++) {
+        const value = counts.get(d) || 0;
+        if (value < amount) { best = d; amount = value; }
+      }
+      counts.set(best, amount + 1);
+      return best;
+    }
+
+    const values = selected.map(person => {
+      const profile = profiles.get(person.username);
+      return [
+        game.id,
+        channel,
+        person.username,
+        profile?.display_name || person.display_name || person.username,
+        nextBalancedDistrict(),
+        profile?.avatar_url || "",
+        1
+      ];
+    });
+    await db.query(`
+      INSERT IGNORE INTO hg_players
+        (game_id,channel,username,display_name,district,avatar_url,alive)
+      VALUES ?
+    `, [values]);
+
+    const skipped = Math.max(0, candidates.length - selected.length);
+    return `✅ ${selected.length} participante(s) do chat adicionado(s). Total: ${existing.length + selected.length}/${max}` +
+      (skipped ? ` • ${skipped} não couberam porque a arena atingiu o limite.` : ".");
+  });
+}
+
 async function start(channel) {
-  const game = await currentGame(channel, true);
-  if (game.status === "running") return "A partida já está rodando.";
-  const db = await getPool();
-  const [players] = await db.query("SELECT * FROM hg_players WHERE game_id=?", [game.id]);
-  if (players.length < 2) return "Precisa de pelo menos 2 participantes.";
-  await db.query("UPDATE hg_players SET alive=1,kills=0 WHERE game_id=?", [game.id]);
-  await db.query("UPDATE hg_games SET status='running',phase='bloodbath',day_number=1,winner=NULL WHERE id=?", [game.id]);
-  await db.query("INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,'reaping',0,?,'')", [game.id, channel, `🎲 A arena começou com ${players.length} participantes.`]);
-  return `🔥 Partida iniciada com ${players.length} participantes.`;
+  return withChannelLock(channel, async () => {
+    const game = await currentGame(channel, true);
+    if (game.status === "running") return "A partida já está rodando.";
+    if (game.status === "ended") return "A partida já terminou. Use Resetar antes de iniciar outra.";
+    if (game.status !== "lobby") return "Esta arena não está disponível para iniciar.";
+    const db = await getPool();
+    const [players] = await db.query("SELECT * FROM hg_players WHERE game_id=?", [game.id]);
+    if (players.length < 2) return "Precisa de pelo menos 2 participantes.";
+    await db.query("UPDATE hg_players SET kills=0 WHERE game_id=?", [game.id]);
+    await db.query("UPDATE hg_games SET status='running',phase='bloodbath',day_number=1,winner=NULL WHERE id=? AND status='lobby'", [game.id]);
+    await db.query("INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,'reaping',0,?,'')", [game.id, channel, `🎲 A arena começou com ${players.length} participantes.`]);
+    return `🔥 Partida iniciada com ${players.length} participantes.`;
+  });
 }
 
 async function reset(channel) {
   stopAuto(channel);
-  const old = await currentGame(channel, false);
-  await newLobby(channel, old?.adult_mode || (process.env.HG_ADULT_DEFAULT === "1" ? 1 : 0));
-  return "✅ Arena resetada. Use !hg entrar.";
+  return withChannelLock(channel, async () => {
+    const old = await currentGame(channel, false);
+    await newLobby(channel, old?.adult_mode || (process.env.HG_ADULT_DEFAULT === "1" ? 1 : 0));
+    return "✅ Arena resetada. Use !hg entrar ou !hg todos.";
+  });
 }
 
 async function adult(channel, on) {
@@ -450,6 +832,21 @@ function killIndexes(kills) {
     return m ? Number(m[1])-1 : -1;
   }).filter(n => n >= 0);
 }
+function validEventKillIndexes(event) {
+  const players = Math.max(1, Math.min(4, Number(event?.players || 1)));
+  return [...new Set(killIndexes(event?.kills).filter(index => index < players))];
+}
+function validateEventDeathConfig(type, players, kills) {
+  const raw = String(kills || "").trim();
+  const valid = validEventKillIndexes({ players, kills });
+  if (raw && valid.length !== killIndexes(raw).length) {
+    return `Mortes inválidas. Use apenas p1 até p${players}, separadas por vírgula.`;
+  }
+  if (String(type || "").toLowerCase() === "death" && valid.length === 0) {
+    return "Evento do tipo Morte precisa indicar quem morre no campo Mortes, por exemplo: p2.";
+  }
+  return "";
+}
 function phaseName(phase, day) {
   if (phase === "bloodbath") return "Cornucópia";
   if (phase === "day") return `Dia ${day}`;
@@ -476,72 +873,163 @@ async function alivePlayers(gameId) {
 }
 
 async function nextRound(channel) {
-  const game = await currentGame(channel, false);
-  if (!game) return "Nenhuma partida criada.";
-  if (game.status === "lobby") return "A partida ainda não começou. Use !hg iniciar.";
-  if (game.status === "ended") return `A partida já acabou. Vencedor: ${game.winner || "ninguém"}.`;
+  return withChannelLock(channel, async (conn) => {
+    // Uma rodada inteira é gravada em uma única transação. Assim, o painel nunca
+    // enxerga o texto da morte sem enxergar também alive=0, e duas rodadas não
+    // conseguem usar a mesma lista antiga de participantes vivos.
+    await conn.beginTransaction();
+    try {
+      const [games] = await conn.query(
+        "SELECT * FROM hg_games WHERE channel=? AND status IN ('lobby','running','ended') ORDER BY id DESC LIMIT 1 FOR UPDATE",
+        [channel]
+      );
+      const game = games[0];
+      if (!game) {
+        await conn.rollback();
+        return "Nenhuma partida criada.";
+      }
+      if (game.status === "lobby") {
+        await conn.rollback();
+        return "A partida ainda não começou. Use !hg iniciar.";
+      }
+      if (game.status === "ended") {
+        await conn.rollback();
+        return `A partida já acabou. Vencedor: ${game.winner || "ninguém"}.`;
+      }
 
-  const db = await getPool();
-  let alive = await alivePlayers(game.id);
-  if (alive.length <= 1) {
-    const winner = alive[0]?.display_name || null;
-    await db.query("UPDATE hg_games SET status='ended',winner=? WHERE id=?", [winner, game.id]);
-    return winner ? `🏆 ${winner} venceu a arena!` : "A partida acabou sem vencedor.";
-  }
+      let [alive] = await conn.query(
+        "SELECT * FROM hg_players WHERE game_id=? AND alive=1 ORDER BY RAND() FOR UPDATE",
+        [game.id]
+      );
+      if (alive.length <= 1) {
+        const winner = alive[0]?.display_name || null;
+        await conn.query("UPDATE hg_games SET status='ended',winner=? WHERE id=?", [winner, game.id]);
+        await conn.commit();
+        return winner ? `🏆 ${winner} venceu a arena!` : "A partida acabou sem vencedor.";
+      }
 
-  const phase = game.phase || "bloodbath";
-  const day = Number(game.day_number || 1);
-  const title = phaseName(phase, day);
-  const phases = (phase === "day" || phase === "night") ? [phase, "arena"] : [phase];
-  const [events] = await db.query(
-    `SELECT * FROM hg_events WHERE active=1 AND phase IN (${phases.map(()=>"?").join(",")}) AND (adult=0 OR ?=1) ORDER BY RAND()`,
-    [...phases, Number(game.adult_mode) === 1 ? 1 : 0]
-  );
-  if (!events.length) return "Sem eventos para essa fase.";
+      const phase = game.phase || "bloodbath";
+      const day = Number(game.day_number || 1);
+      const title = phaseName(phase, day);
+      const phases = (phase === "day" || phase === "night") ? [phase, "arena"] : [phase];
+      const [events] = await conn.query(
+        `SELECT * FROM hg_events WHERE active=1 AND phase IN (${phases.map(() => "?").join(",")}) AND (adult=0 OR ?=1) ORDER BY RAND()`,
+        [...phases, Number(game.adult_mode) === 1 ? 1 : 0]
+      );
+      if (!events.length) {
+        await conn.rollback();
+        return "Sem eventos para essa fase.";
+      }
 
-  await db.query("INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,?,?,?,'')", [game.id, channel, phase, day, `📍 ${title}`]);
+      await conn.query(
+        "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,?,?,?,'')",
+        [game.id, channel, phase, day, `📍 ${title}`]
+      );
 
-  const available = shuffle(alive);
-  while (available.length > 0) {
-    const aliveNow = await alivePlayers(game.id);
-    if (aliveNow.length <= 1) break;
+      let available = shuffle(alive);
+      while (available.length > 0) {
+        // Confirma novamente quem continua vivo antes de montar cada evento.
+        const [aliveNow] = await conn.query(
+          "SELECT id FROM hg_players WHERE game_id=? AND alive=1 FOR UPDATE",
+          [game.id]
+        );
+        const aliveIds = new Set(aliveNow.map(p => Number(p.id)));
+        available = available.filter(p => aliveIds.has(Number(p.id)));
+        if (aliveIds.size <= 1 || available.length === 0) break;
 
-    const possible = events.filter(ev => Number(ev.players || 1) <= available.length);
-    if (!possible.length) break;
+        const possible = events.filter(ev => {
+          const participantCount = Number(ev.players || 1);
+          if (participantCount > available.length) return false;
+          const configuredDeaths = validEventKillIndexes(ev);
+          // Um evento marcado como Morte sem indicar p1/p2/etc. é ignorado para
+          // não narrar uma morte que não altera o estado do participante.
+          if (String(ev.type || "").toLowerCase() === "death" && configuredDeaths.length === 0) return false;
+          return true;
+        });
+        if (!possible.length) break;
 
-    const deathEvents = possible.filter(ev => String(ev.kills || "").trim());
-    const pool = aliveNow.length > 2 && deathEvents.length && Math.random() < 0.38 ? deathEvents : possible;
-    const ev = random(pool);
-    const count = Math.max(1, Math.min(Number(ev.players || 1), available.length));
-    const group = available.splice(0, count);
+        const deathEvents = possible.filter(ev => validEventKillIndexes(ev).length > 0);
+        const eventPool = aliveIds.size > 2 && deathEvents.length && Math.random() < 0.38
+          ? deathEvents
+          : possible;
+        const ev = random(eventPool);
+        const count = Math.max(1, Math.min(Number(ev.players || 1), available.length));
+        const group = available.splice(0, count);
 
-    let deaths = [];
-    for (const idx of killIndexes(ev.kills)) if (group[idx]) deaths.push(group[idx]);
-    if (aliveNow.length - deaths.length < 1) deaths = deaths.slice(0, Math.max(0, aliveNow.length - 1));
+        // Remove índices repetidos ou inválidos para a mesma pessoa não "morrer"
+        // duas vezes no mesmo evento.
+        const deathMap = new Map();
+        for (const idx of validEventKillIndexes(ev)) {
+          const person = group[idx];
+          if (person && aliveIds.has(Number(person.id))) deathMap.set(Number(person.id), person);
+        }
+        let deaths = [...deathMap.values()];
 
-    const text = fill(ev.text, group);
-    const deathNames = deaths.map(p => p.display_name || p.username);
+        // A rodada nunca elimina todos ao mesmo tempo; preserva ao menos um vencedor.
+        if (aliveIds.size - deaths.length < 1) {
+          deaths = deaths.slice(0, Math.max(0, aliveIds.size - 1));
+        }
 
-    for (const dead of deaths) {
-      await db.query("UPDATE hg_players SET alive=0 WHERE id=?", [dead.id]);
-      const killer = group.find(p => p.id !== dead.id);
-      if (killer) await db.query("UPDATE hg_players SET kills=kills+1 WHERE id=?", [killer.id]);
+        const confirmedDeaths = [];
+        for (const dead of deaths) {
+          const [deadUpdate] = await conn.query(
+            "UPDATE hg_players SET alive=0 WHERE id=? AND game_id=? AND alive=1",
+            [dead.id, game.id]
+          );
+          if (deadUpdate.affectedRows === 1) confirmedDeaths.push(dead);
+        }
+
+        // Se um evento de morte não conseguiu confirmar a morte, ele não é salvo
+        // como se tivesse matado alguém. Isso impede texto e estado de divergirem.
+        const expectedDeath = validEventKillIndexes(ev).length > 0;
+        if (expectedDeath && deaths.length > 0 && confirmedDeaths.length !== deaths.length) {
+          throw new Error("A morte do evento não pôde ser confirmada; a rodada foi cancelada para evitar reviver participante.");
+        }
+
+        const deadIds = new Set(confirmedDeaths.map(p => Number(p.id)));
+        const killer = group.find(p => !deadIds.has(Number(p.id)) && aliveIds.has(Number(p.id)));
+        if (killer && confirmedDeaths.length) {
+          await conn.query(
+            "UPDATE hg_players SET kills=kills+? WHERE id=? AND game_id=? AND alive=1",
+            [confirmedDeaths.length, killer.id, game.id]
+          );
+        }
+
+        const text = fill(ev.text, group);
+        const confirmedDeathNames = confirmedDeaths.map(p => p.display_name || p.username);
+        await conn.query(
+          "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,?,?,?,?)",
+          [game.id, channel, phase, day, text, confirmedDeathNames.join(", ")]
+        );
+      }
+
+      [alive] = await conn.query(
+        "SELECT * FROM hg_players WHERE game_id=? AND alive=1 ORDER BY RAND() FOR UPDATE",
+        [game.id]
+      );
+      if (alive.length <= 1) {
+        const winner = alive[0]?.display_name || null;
+        await conn.query("UPDATE hg_games SET status='ended',winner=? WHERE id=?", [winner, game.id]);
+        await conn.query(
+          "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,'winner',?,?, '')",
+          [game.id, channel, day, winner ? `🏆 ${winner} venceu a arena!` : "A partida acabou sem vencedor."]
+        );
+        await conn.commit();
+        return winner ? `🏆 ${winner} venceu a arena!` : "A partida acabou sem vencedor.";
+      }
+
+      const np = nextPhase(phase, day);
+      await conn.query(
+        "UPDATE hg_games SET phase=?,day_number=? WHERE id=? AND status='running'",
+        [np.phase, np.day, game.id]
+      );
+      await conn.commit();
+      return `✅ ${title} gerado. Restam ${alive.length} vivos.`;
+    } catch (error) {
+      try { await conn.rollback(); } catch {}
+      throw error;
     }
-
-    await db.query("INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,?,?,?,?)", [game.id, channel, phase, day, text, deathNames.join(", ")]);
-  }
-
-  alive = await alivePlayers(game.id);
-  if (alive.length <= 1) {
-    const winner = alive[0]?.display_name || null;
-    await db.query("UPDATE hg_games SET status='ended',winner=? WHERE id=?", [winner, game.id]);
-    await db.query("INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,'winner',?,?, '')", [game.id, channel, day, winner ? `🏆 ${winner} venceu a arena!` : "A partida acabou sem vencedor."]);
-    return winner ? `🏆 ${winner} venceu a arena!` : "A partida acabou sem vencedor.";
-  }
-
-  const np = nextPhase(phase, day);
-  await db.query("UPDATE hg_games SET phase=?,day_number=? WHERE id=?", [np.phase, np.day, game.id]);
-  return `✅ ${title} gerado. Restam ${alive.length} vivos.`;
+  });
 }
 
 
@@ -552,23 +1040,31 @@ async function startAuto(channel) {
   if (!game || game.status !== "running") return "A partida precisa estar rodando. Clique em Iniciar primeiro.";
   const intervalMs = getAutoIntervalMs();
 
-  const timer = setInterval(async () => {
-    try {
-      const g = await currentGame(ch, false);
-      if (!g || g.status !== "running") {
+  const scheduleNext = () => {
+    const timer = setTimeout(async () => {
+      if (!autoTimers.has(ch)) return;
+      try {
+        const g = await currentGame(ch, false);
+        if (!g || g.status !== "running") {
+          stopAuto(ch);
+          return;
+        }
+        const result = await nextRound(ch);
+        if (/venceu|acabou|já acabou/i.test(String(result))) {
+          stopAuto(ch);
+          return;
+        }
+        if (autoTimers.has(ch)) scheduleNext();
+      } catch (e) {
+        console.error("Erro no auto HG:", e);
         stopAuto(ch);
-        return;
       }
-      const result = await nextRound(ch);
-      if (/venceu|acabou|já acabou/i.test(String(result))) stopAuto(ch);
-    } catch (e) {
-      console.error("Erro no auto HG:", e);
-      stopAuto(ch);
-    }
-  }, intervalMs);
+    }, intervalMs);
+    autoTimers.set(ch, timer);
+  };
 
-  autoTimers.set(ch, timer);
-  return `▶️ Automático ligado. Rodada a cada ${Math.round(intervalMs / 1000)}s.`;
+  scheduleNext();
+  return `▶️ Automático ligado. Rodada a cada ${Math.round(intervalMs / 1000)}s, sem sobrepor rodadas.`;
 }
 
 function parseCommand(raw) {
@@ -585,6 +1081,7 @@ function parseCommand(raw) {
   if (/^(auto|automatico|automático|rodar|rodarsozinho|rodar sozinho|play)$/i.test(q)) return { action: "auto_start" };
   if (/^(parar|stop|pausar|auto off|automatico off|automático off)$/i.test(q)) return { action: "auto_stop" };
   if (/^(resetar|reset|limpar)$/i.test(q)) return { action: "reset" };
+  if (/^(todos|all|adicionar todos|add todos)$/i.test(q)) return { action: "add_all" };
   if (/^(\+18|18\+|adulto|adult)\s*(on|ligar|liga)?$/i.test(q)) return { action: "adult_on" };
   if (/^(\+18|18\+|adulto|adult)\s*(off|desligar|desliga)$/i.test(q)) return { action: "adult_off" };
   m = original.match(/^(add|adicionar)\s+(.+?)(?:\s+(?:distrito\s*)?(\d{1,2}))?$/i);
@@ -593,7 +1090,7 @@ function parseCommand(raw) {
 }
 
 function help() {
-  return "Comandos: !hg entrar | !hg entrar 5 | !hg distrito 5 | !hg sair | !hg iniciar | !hg proximo | !hg resetar | !hg +18 on/off";
+  return "Comandos: !hg entrar | !hg entrar 5 | !hg distrito 5 | !hg sair | !hg todos | !hg iniciar | !hg proximo | !hg auto | !hg parar | !hg resetar | !hg +18 ligar/desligar";
 }
 
 async function command(req, res) {
@@ -612,6 +1109,7 @@ async function command(req, res) {
 
     if (!checkAdmin(req, res)) return;
 
+    if (cmd.action === "add_all") return send(res, await addAllChatters(ch));
     if (cmd.action === "start") return send(res, await start(ch));
     if (cmd.action === "next") return send(res, await nextRound(ch));
     if (cmd.action === "auto_start") return send(res, await startAuto(ch));
@@ -644,6 +1142,7 @@ async function adminAction(req, res) {
     if (action === "adult_on") return send(res, await adult(ch, true));
     if (action === "adult_off") return send(res, await adult(ch, false));
     if (action === "add_player") return send(res, await addManual(ch, req.query.name || req.body?.name, req.query.district || req.body?.district));
+    if (action === "add_all_chat") return send(res, await addAllChatters(ch));
     if (action === "seed_adult_heavy") return send(res, await seedHeavyAdultEvents());
 
     if (action === "add_event") {
@@ -656,6 +1155,8 @@ async function adminAction(req, res) {
       const kills = String(req.body?.kills || req.query.kills || "").trim();
       const adultFlag = String(req.body?.adult ?? req.query.adult ?? "0") === "1" ? 1 : 0;
       if (!text) return send(res, "Faltou o texto do evento.");
+      const deathConfigError = validateEventDeathConfig(type, players, kills);
+      if (deathConfigError) return send(res, deathConfigError);
       await db.query("INSERT INTO hg_events (phase,type,players,text,kills,adult) VALUES (?,?,?,?,?,?)", [phase,type,players,text,kills,adultFlag]);
       return send(res, "✅ Evento adicionado.");
     }
@@ -673,6 +1174,8 @@ async function adminAction(req, res) {
       const activeFlag = String(req.body?.active ?? req.query.active ?? "1") === "1" ? 1 : 0;
       if (!id) return send(res, "ID inválido.");
       if (!text) return send(res, "Faltou o texto do evento.");
+      const deathConfigError = validateEventDeathConfig(type, players, kills);
+      if (deathConfigError) return send(res, deathConfigError);
       await db.query("UPDATE hg_events SET phase=?, type=?, players=?, text=?, kills=?, adult=?, active=? WHERE id=?", [phase,type,players,text,kills,adultFlag,activeFlag,id]);
       return send(res, "✅ Evento atualizado.");
     }
@@ -704,13 +1207,34 @@ async function adminAction(req, res) {
 }
 
 async function state(req, res) {
+  let conn = null;
   try {
     const ch = channelFrom(req);
-    const game = await currentGame(ch, true);
+    await currentGame(ch, true);
     const db = await getPool();
-    const [players] = await db.query("SELECT * FROM hg_players WHERE game_id=? ORDER BY district ASC, alive DESC, id ASC", [game.id]);
-    const [logs] = await db.query("SELECT * FROM hg_logs WHERE game_id=? ORDER BY id DESC LIMIT 150", [game.id]);
-    const [events] = await db.query("SELECT COUNT(*) total, SUM(adult=1) adultTotal FROM hg_events WHERE active=1");
+    conn = await db.getConnection();
+
+    // Todas as partes do painel vêm do mesmo retrato do banco. Sem isso, uma
+    // morte podia entrar nos logs entre a consulta dos jogadores e dos eventos,
+    // fazendo a pessoa parecer viva e morta ao mesmo tempo.
+    await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    await conn.beginTransaction();
+    const [games] = await conn.query(
+      "SELECT * FROM hg_games WHERE channel=? AND status IN ('lobby','running','ended') ORDER BY id DESC LIMIT 1",
+      [ch]
+    );
+    const game = games[0];
+    const [players] = game
+      ? await conn.query("SELECT * FROM hg_players WHERE game_id=? ORDER BY district ASC, alive DESC, id ASC", [game.id])
+      : [[]];
+    const [logs] = game
+      ? await conn.query("SELECT * FROM hg_logs WHERE game_id=? ORDER BY id DESC LIMIT 150", [game.id])
+      : [[]];
+    const [events] = await conn.query("SELECT COUNT(*) total, SUM(adult=1) adultTotal FROM hg_events WHERE active=1");
+    await conn.commit();
+
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
     res.json({
       game,
       players,
@@ -721,10 +1245,16 @@ async function state(req, res) {
       autoIntervalMs: getAutoIntervalMs()
     });
   } catch (e) {
+    if (conn) {
+      try { await conn.rollback(); } catch {}
+    }
     console.error(e);
     res.status(500).json({ error: e.message });
+  } finally {
+    if (conn) conn.release();
   }
 }
+
 
 function page(admin = false) {
   return `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -759,25 +1289,40 @@ body.hg-running .event-person .event-name,
 .event-person img,.event-person .avatar,.event-person .fake{font-size:16px!important;line-height:normal!important}
 
 </style></head><body><div class="wrap"><div class="top"><div><h1>Hunger Games da Live</h1><div class="sub">Participantes do chat, distritos, eventos, mortes e vencedor final.</div></div><div class="pill" id="statusPill">Carregando...</div></div>
-<div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div></div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar auto</button><button class="danger" onclick="act('reset')">Resetar</button><button class="secondary" onclick="act('adult_on')">+18 ON</button><button class="secondary" onclick="act('adult_off')">+18 OFF</button><button class="secondary" onclick="seedAdultHeavy()">Adicionar +18 pesado</button></div>` : ``}</div>
+<div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div></div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar automático</button><button class="danger" onclick="act('reset')">Resetar</button><button class="secondary" onclick="act('adult_on')">Ligar +18</button><button class="secondary" onclick="act('adult_off')">Desligar +18</button><button class="secondary" onclick="act('add_all_chat')">Adicionar todos do chat</button><button class="secondary" onclick="seedAdultHeavy()">Adicionar +18 pesado</button></div>` : ``}</div>
 ${admin ? `<div class="two" style="margin:16px 0"><input id="manualName" placeholder="Adicionar participante manual"/><input id="manualDistrict" placeholder="Distrito" type="number" min="1" max="12"/><button style="grid-column:1/-1" onclick="addPlayer()">Adicionar participante</button></div>` : ``}
 <div id="participantsBox" class="lobby-only"><h2>Participantes</h2><div class="players" id="players"></div></div></section><aside class="card events-card"><h2 class="events-title">Eventos</h2><div class="logs" id="logs"></div></aside></div>
-${admin ? `<section class="card" style="margin-top:18px"><h2>Adicionar evento próprio</h2><div class="small">Use {p1}, {p2}, {p3}, {p4}. Para matar alguém coloque kills: p2 ou p1,p3.</div><div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px"><select id="evPhase"><option>bloodbath</option><option>day</option><option>night</option><option>feast</option><option>arena</option></select><select id="evType"><option>neutral</option><option>death</option><option>item</option><option>alliance</option><option>adult</option></select><input id="evPlayers" type="number" min="1" max="4" value="1"/><input id="evKills" placeholder="kills: p2"/><select id="evAdult"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="evText" placeholder="{p1} faz alguma coisa com {p2}."></textarea><button onclick="addEvent()">Salvar evento</button><hr style="border-color:var(--b);margin:24px 0"><div class="top"><div><h2>Editar eventos existentes</h2><div class="small">Aqui edita, desativa ou exclui os eventos que já estão cadastrados.</div></div><button class="secondary" onclick="loadEvents()">Recarregar eventos</button></div><div id="eventsEditor" style="display:flex;flex-direction:column;gap:12px;margin-top:14px"></div></section>` : ``}</div>
+${admin ? `<section class="card" style="margin-top:18px"><h2>Adicionar evento próprio</h2><div class="small">Use {p1}, {p2}, {p3}, {p4}. Para matar alguém, coloque em Mortes: p2 ou p1,p3.</div><div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px"><select id="evPhase"><option value="bloodbath">Cornucópia</option><option value="day">Dia</option><option value="night">Noite</option><option value="feast">Banquete</option><option value="arena">Evento da arena</option></select><select id="evType"><option value="neutral">Neutro</option><option value="death">Morte</option><option value="item">Item</option><option value="alliance">Aliança</option><option value="adult">Adulto</option></select><input id="evPlayers" type="number" min="1" max="4" value="1"/><input id="evKills" placeholder="Mortes: p2"/><select id="evAdult"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="evText" placeholder="{p1} faz alguma coisa com {p2}."></textarea><button onclick="addEvent()">Salvar evento</button><hr style="border-color:var(--b);margin:24px 0"><div class="top"><div><h2>Editar eventos existentes</h2><div class="small">Aqui edita, desativa ou exclui os eventos que já estão cadastrados.</div></div><button class="secondary" onclick="loadEvents()">Recarregar eventos</button></div><div id="eventsEditor" style="display:flex;flex-direction:column;gap:12px;margin-top:14px"></div></section>` : ``}</div>
 <script>
 const params=new URLSearchParams(location.search),channel=params.get("channel")||"icarolinaporto",token=params.get("token")||"",admin=${admin?"true":"false"};
+const statusLabels={lobby:"AGUARDANDO",running:"EM ANDAMENTO",ended:"ENCERRADA",archived:"ARQUIVADA"};
+const phaseLabels={bloodbath:"Cornucópia",day:"Dia",night:"Noite",feast:"Banquete",arena:"Evento da arena",reaping:"Início da arena",winner:"Vencedor"};
+const typeLabels={neutral:"Neutro",death:"Morte",item:"Item",alliance:"Aliança",adult:"Adulto"};
+function phaseLabel(phase,day){const p=phaseLabels[phase]||phase||"Arena";if(["day","night","feast"].includes(phase))return p+" "+(day||1);return p}
+function typeLabel(type){return typeLabels[type]||type||"Neutro"}
 function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}[m]))}
-async function api(path,opt={}){const sep=path.includes("?")?"&":"?";const url=path+sep+"channel="+encodeURIComponent(channel)+(token?"&token="+encodeURIComponent(token):"");const r=await fetch(url,opt),ct=r.headers.get("content-type")||"";return ct.includes("json")?r.json():r.text()}
+async function api(path,opt={}){const sep=path.includes("?")?"&":"?";const url=path+sep+"channel="+encodeURIComponent(channel)+(token?"&token="+encodeURIComponent(token):"");const r=await fetch(url,{cache:"no-store",...opt}),ct=r.headers.get("content-type")||"";return ct.includes("json")?r.json():r.text()}
 function avatarHtml(p,cls="avatar"){return p&&p.avatar_url?'<img class="'+cls+'" src="'+esc(p.avatar_url)+'">':'<div class="'+cls+' fake">'+esc(((p&&p.display_name)||"?").slice(0,1).toUpperCase())+'</div>'}
 function mentionedPlayers(text,players){const found=[];const lower=String(text||"").toLowerCase();players.forEach(p=>{const nm=String(p.display_name||p.username||"").toLowerCase();if(nm&&lower.includes(nm)&&!found.some(x=>x.id===p.id))found.push(p)});return found.slice(0,4)}
-async function load(){const st=await api("/hg/state"),g=st.game||{};document.body.classList.toggle("hg-running",!admin&&(g.status==="running"||g.status==="ended"));document.getElementById("statusPill").textContent=(g.status||"lobby").toUpperCase()+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=(g.phase||"bloodbath")+" • dia "+(g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida rolando":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Lobby aberto";const alive=st.players.filter(p=>p.alive).length;document.getElementById("counts").textContent=st.players.length+" participantes • "+alive+" vivos • "+st.eventCount+" eventos"+(st.autoRunning?" • automático ligado":"");
+let loadInProgress=false,loadAgain=false;
+async function load(){
+  if(loadInProgress){loadAgain=true;return}
+  loadInProgress=true;
+  try{
+    const st=await api("/hg/state"),g=st.game||{};document.body.classList.toggle("hg-running",!admin&&(g.status==="running"||g.status==="ended"));document.getElementById("statusPill").textContent=(statusLabels[g.status]||"AGUARDANDO")+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=phaseLabel(g.phase||"bloodbath",g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida rolando":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Aguardando participantes";const alive=st.players.filter(p=>p.alive).length;document.getElementById("counts").textContent=st.players.length+" participantes • "+alive+" vivos • "+st.eventCount+" eventos"+(st.autoRunning?" • automático ligado":"");
 const box=document.getElementById("participantsBox");if(box)box.classList.toggle("hidden",g.status==="running");
-document.getElementById("players").innerHTML=st.players.map(p=>{const av=avatarHtml(p);return '<div class="player '+(p.alive?'':'dead')+'">'+av+'<div><div class="district">Distrito '+p.district+'</div><div class="name">'+esc(p.display_name)+'</div><div class="kills">'+(p.kills||0)+' kill(s) '+(p.alive?'🟢':'💀')+'</div></div></div>'}).join("")||"<div class='small'>Ninguém entrou ainda.</div>";
-document.getElementById("logs").innerHTML=st.logs.map(l=>{const ps=mentionedPlayers(l.text,st.players);const avs=ps.length?'<div class="event-avatars">'+ps.map(p=>'<div class="event-person">'+avatarHtml(p,"avatar")+'</div>').join("")+'</div>':'';return '<div class="log '+(l.deaths?'death':'')+'"><div class="phase">'+esc(l.phase)+' '+(l.day_number?'• '+l.day_number:'')+'</div>'+avs+'<div class="event-text">'+esc(l.text)+'</div>'+(l.deaths?'<div class="small">Mortes: '+esc(l.deaths)+'</div>':'')+'</div>'}).join("")||"<div class='small'>Sem eventos ainda.</div>";document.querySelectorAll(".event-name").forEach(e=>e.remove())}
-async function act(a){if(!token)return alert("Abra com ?token=SEU_TOKEN");const t=await api("/hg/admin?action="+encodeURIComponent(a));alert(t);load()}
+document.getElementById("players").innerHTML=st.players.map(p=>{const av=avatarHtml(p);return '<div class="player '+(p.alive?'':'dead')+'">'+av+'<div><div class="district">Distrito '+p.district+'</div><div class="name">'+esc(p.display_name)+'</div><div class="kills">'+(p.kills||0)+' abate(s) '+(p.alive?'🟢':'💀')+'</div></div></div>'}).join("")||"<div class='small'>Ninguém entrou ainda.</div>";
+document.getElementById("logs").innerHTML=st.logs.map(l=>{const ps=mentionedPlayers(l.text,st.players);const avs=ps.length?'<div class="event-avatars">'+ps.map(p=>'<div class="event-person">'+avatarHtml(p,"avatar")+'</div>').join("")+'</div>':'';return '<div class="log '+(l.deaths?'death':'')+'"><div class="phase">'+esc(phaseLabel(l.phase,l.day_number))+'</div>'+avs+'<div class="event-text">'+esc(l.text)+'</div>'+(l.deaths?'<div class="small">Mortes: '+esc(l.deaths)+'</div>':'')+'</div>'}).join("")||"<div class='small'>Sem eventos ainda.</div>";document.querySelectorAll(".event-name").forEach(e=>e.remove())  }finally{
+    loadInProgress=false;
+    if(loadAgain){loadAgain=false;queueMicrotask(load)}
+  }
+}
+let actionBusy=false;
+async function act(a){if(!token)return alert("Abra com ?token=SEU_TOKEN");if(actionBusy)return;actionBusy=true;try{const t=await api("/hg/admin?action="+encodeURIComponent(a));alert(t);await load()}finally{actionBusy=false}}
 async function seedAdultHeavy(){if(!confirm("Adicionar pacote de eventos +18 pesado ao banco?"))return;const t=await api("/hg/admin?action=seed_adult_heavy");alert(t);load();if(admin)loadEvents()}
 async function addPlayer(){const name=document.getElementById("manualName").value.trim(),d=document.getElementById("manualDistrict").value.trim();if(!name)return alert("Nome vazio");const t=await api("/hg/admin?action=add_player&name="+encodeURIComponent(name)+"&district="+encodeURIComponent(d));alert(t);load()}
 async function addEvent(){const body={action:"add_event",phase:evPhase.value,type:evType.value,players:evPlayers.value,kills:evKills.value,adult:evAdult.value,text:evText.value};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);evText.value="";load();if(admin)loadEvents()}
-function eventRow(e){return '<div class="log" style="max-width:none;margin:0"><div class="phase">ID '+e.id+' • '+esc(e.phase)+' • '+(e.adult?" +18":"Normal")+' • '+(e.active?"Ativo":"Desativado")+'</div><div style="display:grid;grid-template-columns:120px 120px 80px 1fr 100px 100px;gap:8px;margin:8px 0"><select id="phase_'+e.id+'"><option '+(e.phase==="bloodbath"?"selected":"")+'>bloodbath</option><option '+(e.phase==="day"?"selected":"")+'>day</option><option '+(e.phase==="night"?"selected":"")+'>night</option><option '+(e.phase==="feast"?"selected":"")+'>feast</option><option '+(e.phase==="arena"?"selected":"")+'>arena</option></select><select id="type_'+e.id+'"><option '+(e.type==="neutral"?"selected":"")+'>neutral</option><option '+(e.type==="death"?"selected":"")+'>death</option><option '+(e.type==="item"?"selected":"")+'>item</option><option '+(e.type==="alliance"?"selected":"")+'>alliance</option><option '+(e.type==="adult"?"selected":"")+'>adult</option></select><input id="players_'+e.id+'" type="number" min="1" max="4" value="'+esc(e.players)+'"><input id="kills_'+e.id+'" placeholder="kills" value="'+esc(e.kills||"")+'"><select id="adult_'+e.id+'"><option value="0" '+(!e.adult?"selected":"")+'>Normal</option><option value="1" '+(e.adult?"selected":"")+'>+18</option></select><select id="active_'+e.id+'"><option value="1" '+(e.active?"selected":"")+'>Ativo</option><option value="0" '+(!e.active?"selected":"")+'>Desativado</option></select></div><textarea id="text_'+e.id+'">'+esc(e.text)+'</textarea><div class="controls" style="margin-top:8px"><button onclick="saveEvent('+e.id+')">Salvar edição</button><button class="danger" onclick="deleteEvent('+e.id+')">Excluir</button></div></div>'}
+function eventRow(e){return '<div class="log" style="max-width:none;margin:0"><div class="phase">ID '+e.id+' • '+esc(phaseLabels[e.phase]||e.phase)+' • '+esc(typeLabel(e.type))+' • '+(e.adult?"+18":"Normal")+' • '+(e.active?"Ativo":"Desativado")+'</div><div style="display:grid;grid-template-columns:120px 120px 80px 1fr 100px 100px;gap:8px;margin:8px 0"><select id="phase_'+e.id+'"><option value="bloodbath" '+(e.phase==="bloodbath"?"selected":"")+'>Cornucópia</option><option value="day" '+(e.phase==="day"?"selected":"")+'>Dia</option><option value="night" '+(e.phase==="night"?"selected":"")+'>Noite</option><option value="feast" '+(e.phase==="feast"?"selected":"")+'>Banquete</option><option value="arena" '+(e.phase==="arena"?"selected":"")+'>Evento da arena</option></select><select id="type_'+e.id+'"><option value="neutral" '+(e.type==="neutral"?"selected":"")+'>Neutro</option><option value="death" '+(e.type==="death"?"selected":"")+'>Morte</option><option value="item" '+(e.type==="item"?"selected":"")+'>Item</option><option value="alliance" '+(e.type==="alliance"?"selected":"")+'>Aliança</option><option value="adult" '+(e.type==="adult"?"selected":"")+'>Adulto</option></select><input id="players_'+e.id+'" type="number" min="1" max="4" value="'+esc(e.players)+'"><input id="kills_'+e.id+'" placeholder="Mortes" value="'+esc(e.kills||"")+'"><select id="adult_'+e.id+'"><option value="0" '+(!e.adult?"selected":"")+'>Normal</option><option value="1" '+(e.adult?"selected":"")+'>+18</option></select><select id="active_'+e.id+'"><option value="1" '+(e.active?"selected":"")+'>Ativo</option><option value="0" '+(!e.active?"selected":"")+'>Desativado</option></select></div><textarea id="text_'+e.id+'">'+esc(e.text)+'</textarea><div class="controls" style="margin-top:8px"><button onclick="saveEvent('+e.id+')">Salvar edição</button><button class="danger" onclick="deleteEvent('+e.id+')">Excluir</button></div></div>'}
 async function loadEvents(){if(!admin)return;const box=document.getElementById("eventsEditor");if(!box)return;box.innerHTML="<div class='small'>Carregando eventos...</div>";const evs=await api("/hg/events");if(!Array.isArray(evs)){box.innerHTML="<div class='small'>Erro ao carregar eventos.</div>";return}box.innerHTML=evs.map(eventRow).join("")||"<div class='small'>Sem eventos cadastrados.</div>"}
 async function saveEvent(id){const body={action:"update_event",id,phase:document.getElementById("phase_"+id).value,type:document.getElementById("type_"+id).value,players:document.getElementById("players_"+id).value,kills:document.getElementById("kills_"+id).value,adult:document.getElementById("adult_"+id).value,active:document.getElementById("active_"+id).value,text:document.getElementById("text_"+id).value};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);loadEvents();load()}
 async function deleteEvent(id){if(!confirm("Excluir este evento?"))return;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"delete_event",id})});alert(t);loadEvents();load()}
@@ -820,4 +1365,11 @@ app.get("/permissions", (req, res) => {
     adminPage: "https://site-jogo-o9d1.onrender.com/admin/hungergames?channel=icarolinaporto&token=carolina-hg"
   });
 });
-app.listen(PORT, () => console.log("HG Live separado rodando na porta " + PORT));
+app.listen(PORT, () => {
+  console.log("HG Live separado rodando na porta " + PORT);
+  const channels = new Set([
+    nick(process.env.DEFAULT_CHANNEL || "icarolinaporto"),
+    ...envList("ALLOWED_CHANNELS")
+  ]);
+  for (const channel of channels) if (channel) startChatTracker(channel);
+});

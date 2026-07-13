@@ -26,3 +26,9 @@ services:
         sync: false
       - key: HG_AUTO_INTERVAL_MS
         value: "12000"
+      - key: HG_IGNORE_CHATTERS
+        value: "streamelements,nightbot,moobot,streamlabs"
+      - key: TWITCH_CHAT_TOKEN
+        sync: false
+      - key: TWITCH_CHAT_MODERATOR
+        value: "icarolinaporto"
