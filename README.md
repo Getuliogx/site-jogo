@@ -1,48 +1,23 @@
-# Hunger Games da Live — versão 5.3.0
+# Hunger Games da Live — v5.4.0
 
-Esta versão mantém o mesmo banco de dados e **não apaga** eventos normais, histórias ou participantes já cadastrados.
+Versão corrigida do modo história e da narração.
 
-## Correções desta versão
+## Modo história
 
-### História exclusiva sem mistura
+Com **Misturar com eventos normais** desligado, a história ganha prioridade total. A introdução aparece primeiro e os acontecimentos internos seguem a ordem cadastrada. Nenhum evento normal entra enquanto a história estiver em andamento.
 
-Quando **Misturar com eventos normais** estiver desligado:
+Ao desligar essa chave durante uma partida, a história é preparada novamente e começa pela introdução no próximo passo automático.
 
-- a introdução da história tem prioridade;
-- nenhum evento normal entra antes da introdução na mesma rodada;
-- enquanto a história estiver ativa, somente os eventos internos dela são usados;
-- ao terminar, os eventos normais voltam apenas na próxima fase.
+## Narração
 
-As chaves **Misturar com eventos normais** e **História ativa** agora são salvas automaticamente ao marcar ou desmarcar.
+A voz padrão é **Google online — português do Brasil**. O servidor envia o áudio em partes curtas e o navegador usa uma voz local como alternativa caso o serviço online falhe. Evento, rolagem e voz são processados em uma única fila.
 
-### Narração corrigida
-
-- A narração agora funciona também na tela administrativa.
-- Ao ativar, o navegador é desbloqueado com a mensagem “Narração ativada”.
-- Cada fala é reiniciada de forma segura antes do próximo evento.
-- Se a voz travar ao iniciar, o sistema tenta novamente uma vez.
-- A fala usa um temporizador maior e mantém o mecanismo de voz acordado.
-- Se a tela administrativa e a pública estiverem abertas no mesmo navegador, a administrativa tem prioridade para evitar duas vozes ao mesmo tempo.
-- Os controles de voz continuam aparecendo somente na tela administrativa.
+Os controles de narração aparecem somente em `/admin/hungergames`.
 
 ## Atualização
 
-Substitua os arquivos na raiz do repositório e use no Render:
+Substitua os arquivos na raiz do GitHub e use no Render:
 
-```txt
-Manual Deploy → Clear build cache & deploy
-```
+`Manual Deploy → Clear build cache & deploy`
 
-Mantenha a mesma `DATABASE_URL`.
-
-Depois confirme:
-
-```txt
-/version
-```
-
-O retorno deve ser:
-
-```json
-{"version":"5.3.0"}
-```
+Mantenha a mesma `DATABASE_URL`. Os eventos e histórias já cadastrados não são apagados.

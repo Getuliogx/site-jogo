@@ -23,7 +23,7 @@ services:
       - key: TWITCH_CLIENT_SECRET
         sync: false
       - key: HG_AUTO_INTERVAL_MS
-        value: "12000"
+        value: "5000"
       - key: HG_IGNORE_CHATTERS
         value: "streamelements,nightbot,moobot,streamlabs"
       - key: TWITCH_CHAT_TOKEN

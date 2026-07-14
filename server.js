@@ -6,7 +6,7 @@ import tls from "node:tls";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = "5.3.0";
+const APP_VERSION = "5.4.0";
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
@@ -27,6 +27,7 @@ app.use((req, res, next) => {
 const autoTimers = new Map();
 const chatTrackers = new Map();
 const channelQueues = new Map();
+const ttsCache = new Map();
 
 const DEFAULT_IGNORED_CHATTERS = new Set([
   "streamelements", "nightbot", "moobot", "streamlabs", "soundalerts",
@@ -34,8 +35,8 @@ const DEFAULT_IGNORED_CHATTERS = new Set([
 ]);
 
 function getAutoIntervalMs() {
-  const ms = Number(process.env.HG_AUTO_INTERVAL_MS || 12000);
-  return Math.max(4000, Math.min(120000, Number.isFinite(ms) ? ms : 12000));
+  const ms = Number(process.env.HG_AUTO_INTERVAL_MS || 5000);
+  return Math.max(2000, Math.min(120000, Number.isFinite(ms) ? ms : 5000));
 }
 
 function stopAuto(channel) {
@@ -985,9 +986,170 @@ async function finishScenario(conn, gameId, scenarioId, channel, phase, day, sce
   if (scenarioName) {
     await conn.query(
       "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,?,?,?,'')",
-      [gameId, channel, phase, day, `✅ O evento especial “${scenarioName}” terminou.`]
+      [gameId, channel, phase, day, `✅ A história “${scenarioName}” terminou.`]
     );
   }
+}
+
+// Executa exatamente um trecho de uma história exclusiva por rodada.
+// Enquanto existir uma história com "Misturar com eventos normais" desligado,
+// nenhum evento normal é sorteado. A introdução inicia primeiro e os eventos
+// internos seguem a ordem cadastrada, sem depender da fase Dia/Noite.
+async function runExclusiveStoryBeat(conn, game, alive, channel, adultAllowed) {
+  const day = Number(game.day_number || 1);
+  let scenario = null;
+  let isIntroduction = false;
+
+  if (Number(game.active_scenario_id || 0)) {
+    const [rows] = await conn.query(
+      "SELECT * FROM hg_scenarios WHERE id=? AND active=1 AND mix_with_normal=0 LIMIT 1",
+      [Number(game.active_scenario_id)]
+    );
+    scenario = rows[0] || null;
+  } else {
+    const [rows] = await conn.query(
+      `SELECT s.*
+       FROM hg_scenarios s
+       LEFT JOIN hg_game_scenario_runs r
+         ON r.game_id=? AND r.scenario_id=s.id
+       WHERE s.active=1 AND s.mix_with_normal=0
+         AND r.scenario_id IS NULL
+         AND (s.adult=0 OR ?=1)
+       ORDER BY s.updated_at DESC, s.id DESC
+       LIMIT 1`,
+      [game.id, adultAllowed]
+    );
+    scenario = rows[0] || null;
+    isIntroduction = Boolean(scenario);
+  }
+
+  if (!scenario) return { handled: false };
+
+  let event = null;
+  if (isIntroduction) {
+    event = { ...scenario, event_source: "scenario_trigger", scenario_id: scenario.id };
+  } else {
+    const [children] = await conn.query(
+      `SELECT se.*
+       FROM hg_scenario_events se
+       LEFT JOIN hg_scenario_usage u
+         ON u.game_id=? AND u.event_id=se.id
+       WHERE se.scenario_id=? AND se.active=1 AND u.event_id IS NULL
+         AND (se.adult=0 OR ?=1)
+       ORDER BY se.sort_order ASC, se.id ASC`,
+      [game.id, scenario.id, adultAllowed]
+    );
+
+    if (!children.length) {
+      await finishScenario(conn, game.id, scenario.id, channel, "story", day, scenario.name);
+      return { handled: true, message: `✅ A história “${scenario.name}” terminou.` };
+    }
+    event = { ...children[0], event_source: "scenario_child", scenario_id: scenario.id };
+  }
+
+  // Cada trecho pega uma lista atualizada de vivos. Isso impede que alguém
+  // morto em um trecho anterior volte a aparecer na história.
+  const [aliveNowRows] = await conn.query(
+    "SELECT * FROM hg_players WHERE game_id=? AND alive=1 ORDER BY RAND() FOR UPDATE",
+    [game.id]
+  );
+  const aliveNow = aliveNowRows.length ? aliveNowRows : alive;
+  if (aliveNow.length <= 1) return { handled: false };
+
+  const requested = eventParticipantCount(event, aliveNow.length);
+  const group = eventUsesAllPlayers(event)
+    ? shuffle(aliveNow)
+    : shuffle(aliveNow).slice(0, Math.min(requested, aliveNow.length));
+  const aliveIds = new Set(aliveNow.map(p => Number(p.id)));
+
+  const deathMap = new Map();
+  for (const idx of validEventKillIndexes(event)) {
+    const person = group[idx];
+    if (person && aliveIds.has(Number(person.id))) deathMap.set(Number(person.id), person);
+  }
+  let deaths = [...deathMap.values()];
+  if (aliveIds.size - deaths.length < 1) {
+    deaths = deaths.slice(0, Math.max(0, aliveIds.size - 1));
+  }
+
+  const confirmedDeaths = [];
+  for (const dead of deaths) {
+    const [updated] = await conn.query(
+      "UPDATE hg_players SET alive=0 WHERE id=? AND game_id=? AND alive=1",
+      [dead.id, game.id]
+    );
+    if (updated.affectedRows === 1) confirmedDeaths.push(dead);
+  }
+
+  const deadIds = new Set(confirmedDeaths.map(p => Number(p.id)));
+  const killer = group.find(p => !deadIds.has(Number(p.id)) && aliveIds.has(Number(p.id)));
+  if (killer && confirmedDeaths.length) {
+    await conn.query(
+      "UPDATE hg_players SET kills=kills+? WHERE id=? AND game_id=? AND alive=1",
+      [confirmedDeaths.length, killer.id, game.id]
+    );
+  }
+
+  const text = fill(event.text, group);
+  const deathNames = confirmedDeaths.map(p => p.display_name || p.username);
+  await conn.query(
+    "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,?,?,?,?)",
+    [game.id, channel, "story", day, text, deathNames.join(", ")]
+  );
+
+  if (isIntroduction) {
+    await conn.query(
+      "INSERT IGNORE INTO hg_game_scenario_runs (game_id,scenario_id) VALUES (?,?)",
+      [game.id, scenario.id]
+    );
+    await conn.query("UPDATE hg_games SET active_scenario_id=? WHERE id=?", [scenario.id, game.id]);
+
+    const [childCount] = await conn.query(
+      "SELECT COUNT(*) AS total FROM hg_scenario_events WHERE scenario_id=? AND active=1 AND (adult=0 OR ?=1)",
+      [scenario.id, adultAllowed]
+    );
+    if (Number(childCount?.[0]?.total || 0) === 0) {
+      await finishScenario(conn, game.id, scenario.id, channel, "story", day, scenario.name);
+    }
+  } else {
+    await conn.query(
+      "INSERT IGNORE INTO hg_scenario_usage (game_id,scenario_id,event_id) VALUES (?,?,?)",
+      [game.id, scenario.id, event.id]
+    );
+    const [remaining] = await conn.query(
+      `SELECT COUNT(*) AS total
+       FROM hg_scenario_events se
+       LEFT JOIN hg_scenario_usage u
+         ON u.game_id=? AND u.event_id=se.id
+       WHERE se.scenario_id=? AND se.active=1 AND u.event_id IS NULL
+         AND (se.adult=0 OR ?=1)`,
+      [game.id, scenario.id, adultAllowed]
+    );
+    if (Number(remaining?.[0]?.total || 0) === 0) {
+      await finishScenario(conn, game.id, scenario.id, channel, "story", day, scenario.name);
+    }
+  }
+
+  const [survivors] = await conn.query(
+    "SELECT * FROM hg_players WHERE game_id=? AND alive=1 ORDER BY RAND() FOR UPDATE",
+    [game.id]
+  );
+  if (survivors.length <= 1) {
+    const winner = survivors[0]?.display_name || null;
+    await conn.query("UPDATE hg_games SET status='ended',winner=?,active_scenario_id=NULL WHERE id=?", [winner, game.id]);
+    await conn.query(
+      "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,'winner',?,?, '')",
+      [game.id, channel, day, winner ? `🏆 ${winner} venceu a arena!` : "A partida acabou sem vencedor."]
+    );
+    return { handled: true, message: winner ? `🏆 ${winner} venceu a arena!` : "A partida acabou sem vencedor." };
+  }
+
+  return {
+    handled: true,
+    message: isIntroduction
+      ? `🎬 História iniciada: ${scenario.name}.`
+      : `▶️ Próximo acontecimento de “${scenario.name}”.`
+  };
 }
 
 async function nextRound(channel) {
@@ -1032,6 +1194,15 @@ async function nextRound(channel) {
       const phaseMarks = phases.map(() => "?").join(",");
       const adultAllowed = Number(game.adult_mode) === 1 ? 1 : 0;
 
+      // Histórias exclusivas têm prioridade absoluta. Uma chamada gera apenas
+      // um trecho da história e encerra a rodada, portanto eventos normais
+      // jamais entram no meio dela.
+      const exclusiveStory = await runExclusiveStoryBeat(conn, game, alive, channel, adultAllowed);
+      if (exclusiveStory.handled) {
+        await conn.commit();
+        return exclusiveStory.message;
+      }
+
       const [normalEvents] = await conn.query(
         `SELECT e.*, 'normal' AS event_source, NULL AS scenario_id, NULL AS scenario_name
          FROM hg_events e
@@ -1050,7 +1221,7 @@ async function nextRound(channel) {
            FROM hg_scenarios s
            LEFT JOIN hg_game_scenario_runs r
              ON r.game_id=? AND r.scenario_id=s.id
-           WHERE s.active=1 AND r.scenario_id IS NULL
+           WHERE s.active=1 AND s.mix_with_normal=1 AND r.scenario_id IS NULL
              AND s.phase IN (${phaseMarks}) AND (s.adult=0 OR ?=1)
            ORDER BY RAND()`,
           [game.id, ...phases, adultAllowed]
@@ -1515,13 +1686,44 @@ async function adminAction(req, res) {
       );
       if (!activeFlag) {
         await db.query("UPDATE hg_games SET active_scenario_id=NULL WHERE active_scenario_id=?", [id]);
+      } else if (!mixFlag) {
+        // Ao desligar a mistura, a história é preparada novamente na partida
+        // atual. Assim a introdução entra no próximo passo automático, mesmo
+        // que uma tentativa anterior já a tenha marcado como executada.
+        const [games] = await db.query(
+          "SELECT id FROM hg_games WHERE channel=? AND status IN ('lobby','running') ORDER BY id DESC LIMIT 1",
+          [ch]
+        );
+        const current = games[0];
+        if (current) {
+          await db.query("DELETE FROM hg_scenario_usage WHERE game_id=? AND scenario_id=?", [current.id, id]);
+          await db.query("DELETE FROM hg_game_scenario_runs WHERE game_id=? AND scenario_id=?", [current.id, id]);
+          await db.query("UPDATE hg_games SET active_scenario_id=NULL WHERE id=?", [current.id]);
+        }
       }
       return send(
         res,
         mixFlag
           ? "✅ Opções salvas: esta história pode misturar com eventos normais."
-          : "✅ Opções salvas: durante esta história serão usados somente os eventos internos."
+          : "✅ Opções salvas: modo exclusivo preparado. A introdução será o próximo evento."
       );
+    }
+
+    if (action === "restart_scenario") {
+      await ensureTables();
+      const db = await getPool();
+      const id = Number(req.body?.id || req.query.id || 0);
+      if (!id) return send(res, "ID inválido.");
+      const [games] = await db.query(
+        "SELECT id FROM hg_games WHERE channel=? AND status IN ('lobby','running') ORDER BY id DESC LIMIT 1",
+        [ch]
+      );
+      const current = games[0];
+      if (!current) return send(res, "Não existe uma partida atual para reiniciar a história.");
+      await db.query("DELETE FROM hg_scenario_usage WHERE game_id=? AND scenario_id=?", [current.id, id]);
+      await db.query("DELETE FROM hg_game_scenario_runs WHERE game_id=? AND scenario_id=?", [current.id, id]);
+      await db.query("UPDATE hg_games SET active_scenario_id=NULL WHERE id=?", [current.id]);
+      return send(res, "✅ História preparada. A introdução será o próximo evento automático.");
     }
 
     if (action === "update_scenario") {
@@ -1545,8 +1747,23 @@ async function adminAction(req, res) {
         "UPDATE hg_scenarios SET name=?,phase=?,type=?,players=?,text=?,kills=?,adult=?,mix_with_normal=?,active=? WHERE id=?",
         [name, phase, type, players, text, kills, adultFlag, mixFlag, activeFlag, id]
       );
-      if (!activeFlag) await db.query("UPDATE hg_games SET active_scenario_id=NULL WHERE active_scenario_id=?", [id]);
-      return send(res, "✅ Evento especial atualizado.");
+      if (!activeFlag) {
+        await db.query("UPDATE hg_games SET active_scenario_id=NULL WHERE active_scenario_id=?", [id]);
+      } else if (!mixFlag) {
+        const [games] = await db.query(
+          "SELECT id FROM hg_games WHERE channel=? AND status IN ('lobby','running') ORDER BY id DESC LIMIT 1",
+          [ch]
+        );
+        const current = games[0];
+        if (current) {
+          await db.query("DELETE FROM hg_scenario_usage WHERE game_id=? AND scenario_id=?", [current.id, id]);
+          await db.query("DELETE FROM hg_game_scenario_runs WHERE game_id=? AND scenario_id=?", [current.id, id]);
+          await db.query("UPDATE hg_games SET active_scenario_id=NULL WHERE id=?", [current.id]);
+        }
+      }
+      return send(res, !mixFlag && activeFlag
+        ? "✅ História atualizada e preparada para começar pela introdução."
+        : "✅ Evento especial atualizado.");
     }
 
     if (action === "delete_scenario") {
@@ -1747,7 +1964,7 @@ ${admin ? `<section class="card story-card" style="margin-top:18px"><h2>Modo His
 <script>
 const params=new URLSearchParams(location.search),channel=params.get("channel")||"icarolinaporto",token=params.get("token")||"",admin=${admin?"true":"false"};
 const statusLabels={lobby:"AGUARDANDO",running:"EM ANDAMENTO",ended:"ENCERRADA",archived:"ARQUIVADA"};
-const phaseLabels={any:"Qualquer fase",bloodbath:"Cornucópia",day:"Dia",night:"Noite",feast:"Banquete",arena:"Evento da arena",reaping:"Início da arena",winner:"Vencedor"};
+const phaseLabels={any:"Qualquer fase",bloodbath:"Cornucópia",day:"Dia",night:"Noite",feast:"Banquete",arena:"Evento da arena",story:"Modo História",reaping:"Início da arena",winner:"Vencedor"};
 const typeLabels={neutral:"Neutro",death:"Morte",item:"Item",alliance:"Aliança",adult:"Adulto"};
 function phaseLabel(phase,day){const p=phaseLabels[phase]||phase||"Arena";if(["day","night","feast"].includes(phase))return p+" "+(day||1);return p}
 function typeLabel(type){return typeLabels[type]||type||"Neutro"}
@@ -1757,34 +1974,37 @@ function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&l
 async function api(path,opt={}){const sep=path.includes("?")?"&":"?";const url=path+sep+"channel="+encodeURIComponent(channel)+(token?"&token="+encodeURIComponent(token):"");const r=await fetch(url,{cache:"no-store",...opt}),ct=r.headers.get("content-type")||"";return ct.includes("json")?r.json():r.text()}
 function avatarHtml(p,cls="avatar"){return p&&p.avatar_url?'<img class="'+cls+'" src="'+esc(p.avatar_url)+'">':'<div class="'+cls+' fake">'+esc(((p&&p.display_name)||"?").slice(0,1).toUpperCase())+'</div>'}
 function mentionedPlayers(text,players){const found=[];const lower=String(text||"").toLowerCase();players.forEach(p=>{const nm=String(p.display_name||p.username||"").toLowerCase();if(nm&&lower.includes(nm)&&!found.some(x=>x.id===p.id))found.push(p)});return found}
-const NARRATION_ENABLED_KEY="hgNarrationEnabledV52",NARRATION_VOICE_KEY="hgNarrationVoiceNaturalV52",NARRATION_RATE_KEY="hgNarrationRate";
-let narrationEnabled=localStorage.getItem(NARRATION_ENABLED_KEY)==="1",narrationVoices=[];
-let narrationChannel=null,narrationAdminLastSeen=0;
+const NARRATION_ENABLED_KEY="hgNarrationEnabledV54",NARRATION_VOICE_KEY="hgNarrationVoiceNaturalV54",NARRATION_RATE_KEY="hgNarrationRate";
+let narrationEnabled=(localStorage.getItem(NARRATION_ENABLED_KEY)||localStorage.getItem("hgNarrationEnabledV52"))==="1",narrationVoices=[];
+let narrationChannel=null,narrationAdminLastSeen=0,currentNarrationAudio=null,currentNarrationUtterance=null,narrationStopToken=0;
 const narrationTabId=Math.random().toString(36).slice(2)+Date.now().toString(36);
-try{if("BroadcastChannel" in window){narrationChannel=new BroadcastChannel("hg-narration-sync-v53")}}catch{}
+try{if("BroadcastChannel" in window){narrationChannel=new BroadcastChannel("hg-narration-sync-v54")}}catch{}
 function sendNarrationHeartbeat(){if(!admin)return;try{narrationChannel?.postMessage({type:"admin-heartbeat",tabId:narrationTabId,at:Date.now()})}catch{}}
 function shouldNarrateHere(){return admin||Date.now()-narrationAdminLastSeen>2600}
 function availableNarrationVoices(){return (window.speechSynthesis?.getVoices?.()||[]).slice()}
 function narrationVoiceScore(v){const name=String(v?.name||"");const lang=String(v?.lang||"");let score=0;if(/^pt(-|_)?br/i.test(lang))score+=1000;else if(/^pt/i.test(lang))score+=700;if(/natural|neural|online|francisca|antonio|thalita/i.test(name))score+=350;if(/google/i.test(name))score+=120;if(v&&v.localService===false)score+=40;return score}
-function savedNarrationVoice(){return localStorage.getItem(NARRATION_VOICE_KEY)||localStorage.getItem("hgNarrationVoiceNaturalV51")||""}
+function savedNarrationVoice(){return localStorage.getItem(NARRATION_VOICE_KEY)||"google-online"}
 function broadcastNarrationSettings(){try{narrationChannel?.postMessage({enabled:narrationEnabled,voice:savedNarrationVoice(),rate:narrationRate()})}catch{}}
-function populateNarrationVoices(){if(!window.speechSynthesis)return;narrationVoices=availableNarrationVoices();narrationVoices.sort((a,b)=>narrationVoiceScore(b)-narrationVoiceScore(a)||a.name.localeCompare(b.name));const select=document.getElementById("narrationVoice");if(!select)return;const saved=savedNarrationVoice();select.innerHTML=narrationVoices.map((v,i)=>'<option value="'+i+'">'+esc(v.name+' — '+v.lang)+'</option>').join("")||'<option value="">Voz padrão do navegador</option>';let chosen=narrationVoices.findIndex(v=>v.name===saved);if(chosen<0)chosen=narrationVoices.findIndex(v=>narrationVoiceScore(v)>=1000);if(chosen<0)chosen=narrationVoices.findIndex(v=>/^pt/i.test(v.lang));if(chosen>=0)select.value=String(chosen);select.onchange=()=>{const v=narrationVoices[Number(select.value)];if(v){localStorage.setItem(NARRATION_VOICE_KEY,v.name);broadcastNarrationSettings()}}}
-function selectedNarrationVoice(){const select=document.getElementById("narrationVoice");if(select&&select.value!=="")return narrationVoices[Number(select.value)]||null;const saved=savedNarrationVoice();return narrationVoices.find(v=>v.name===saved)||narrationVoices.find(v=>narrationVoiceScore(v)>=1000)||narrationVoices.find(v=>/^pt/i.test(v.lang))||null}
+function populateNarrationVoices(){narrationVoices=availableNarrationVoices();narrationVoices.sort((a,b)=>narrationVoiceScore(b)-narrationVoiceScore(a)||a.name.localeCompare(b.name));const select=document.getElementById("narrationVoice");if(!select)return;const saved=savedNarrationVoice();select.innerHTML='<option value="google-online">Google online — português do Brasil</option>'+narrationVoices.map((v,i)=>'<option value="voice-'+i+'">'+esc(v.name+' — '+v.lang)+'</option>').join("");if(saved==="google-online")select.value="google-online";else{const chosen=narrationVoices.findIndex(v=>v.name===saved);select.value=chosen>=0?"voice-"+chosen:"google-online"}select.onchange=()=>{const value=String(select.value||"google-online");if(value==="google-online")localStorage.setItem(NARRATION_VOICE_KEY,"google-online");else{const v=narrationVoices[Number(value.replace("voice-",""))];localStorage.setItem(NARRATION_VOICE_KEY,v?.name||"google-online")}broadcastNarrationSettings()}}
+function selectedNarrationMode(){const select=document.getElementById("narrationVoice");if(select)return String(select.value||"google-online")==="google-online"?"google":"browser";return savedNarrationVoice()==="google-online"?"google":"browser"}
+function selectedNarrationVoice(){const select=document.getElementById("narrationVoice");if(select&&String(select.value).startsWith("voice-"))return narrationVoices[Number(String(select.value).replace("voice-",""))]||null;const saved=savedNarrationVoice();if(saved==="google-online")return narrationVoices.find(v=>narrationVoiceScore(v)>=1000)||narrationVoices.find(v=>/^pt/i.test(v.lang))||null;return narrationVoices.find(v=>v.name===saved)||narrationVoices.find(v=>narrationVoiceScore(v)>=1000)||narrationVoices.find(v=>/^pt/i.test(v.lang))||null}
 function narrationRate(){const slider=document.getElementById("narrationRate");const n=Number(slider?.value||localStorage.getItem(NARRATION_RATE_KEY)||1.30);return Math.max(.70,Math.min(2,Number.isFinite(n)?n:1.30))}
 function updateNarrationRate(shouldBroadcast=true){const slider=document.getElementById("narrationRate"),label=document.getElementById("narrationRateValue");if(!slider)return;const saved=Number(localStorage.getItem(NARRATION_RATE_KEY)||1.30);if(!slider.dataset.ready){slider.value=String(Math.max(.70,Math.min(2,Number.isFinite(saved)?saved:1.30)));slider.dataset.ready="1"}const rate=narrationRate();localStorage.setItem(NARRATION_RATE_KEY,String(rate));if(label)label.textContent=rate.toFixed(2).replace(".",",")+"x";if(shouldBroadcast===true)broadcastNarrationSettings()}
 function initNarrationControls(){const slider=document.getElementById("narrationRate");if(slider&&!slider.dataset.bound){slider.dataset.bound="1";slider.addEventListener("input",()=>updateNarrationRate(true));slider.addEventListener("change",()=>updateNarrationRate(true))}if(slider)updateNarrationRate(false);populateNarrationVoices();updateNarrationButton()}
 function updateNarrationButton(){const b=document.getElementById("narrationToggle");if(b)b.textContent=narrationEnabled?"🔇 Desativar narração":"🔊 Ativar narração"}
-function stopNarrationSpeech(){if(!("speechSynthesis" in window))return;try{window.speechSynthesis.cancel();window.speechSynthesis.resume()}catch{}}
-function applyNarrationSettings(data={}){if(data&&data.type==="admin-heartbeat"){narrationAdminLastSeen=Date.now();return}if(typeof data.voice==="string"&&data.voice)localStorage.setItem(NARRATION_VOICE_KEY,data.voice);if(Number.isFinite(Number(data.rate)))localStorage.setItem(NARRATION_RATE_KEY,String(data.rate));if(typeof data.enabled==="boolean"){narrationEnabled=data.enabled;localStorage.setItem(NARRATION_ENABLED_KEY,narrationEnabled?"1":"0")}else narrationEnabled=localStorage.getItem(NARRATION_ENABLED_KEY)==="1";if(!narrationEnabled)stopNarrationSpeech();const slider=document.getElementById("narrationRate");if(slider){slider.dataset.ready="";updateNarrationRate(false)}populateNarrationVoices();updateNarrationButton()}
-async function toggleNarration(){if(!("speechSynthesis" in window)){alert("Este navegador não oferece narração de texto.");return}narrationEnabled=!narrationEnabled;localStorage.setItem(NARRATION_ENABLED_KEY,narrationEnabled?"1":"0");if(!narrationEnabled)stopNarrationSpeech();else{try{window.speechSynthesis.resume()}catch{}}initNarrationControls();updateNarrationButton();broadcastNarrationSettings();if(narrationEnabled)await speakNarration("Narração ativada.",true)}
-async function testNarration(){if(!("speechSynthesis" in window)){alert("Este navegador não oferece narração de texto.");return}initNarrationControls();stopNarrationSpeech();await speakNarration("Teste de narração do modo história. A arena está pronta, e a aventura vai começar.",true)}
+function stopNarrationSpeech(){narrationStopToken++;if(currentNarrationAudio){try{currentNarrationAudio.pause();currentNarrationAudio.removeAttribute("src");currentNarrationAudio.load()}catch{}currentNarrationAudio=null}currentNarrationUtterance=null;if("speechSynthesis" in window){try{window.speechSynthesis.cancel();window.speechSynthesis.resume()}catch{}}}
+function applyNarrationSettings(data={}){if(data&&data.type==="admin-heartbeat"){narrationAdminLastSeen=Date.now();return}if(typeof data.voice==="string"&&data.voice)localStorage.setItem(NARRATION_VOICE_KEY,data.voice);if(Number.isFinite(Number(data.rate)))localStorage.setItem(NARRATION_RATE_KEY,String(data.rate));if(typeof data.enabled==="boolean"){narrationEnabled=data.enabled;localStorage.setItem(NARRATION_ENABLED_KEY,narrationEnabled?"1":"0")}else narrationEnabled=(localStorage.getItem(NARRATION_ENABLED_KEY)||localStorage.getItem("hgNarrationEnabledV52"))==="1";if(!narrationEnabled)stopNarrationSpeech();const slider=document.getElementById("narrationRate");if(slider){slider.dataset.ready="";updateNarrationRate(false)}populateNarrationVoices();updateNarrationButton()}
+async function toggleNarration(){narrationEnabled=!narrationEnabled;localStorage.setItem(NARRATION_ENABLED_KEY,narrationEnabled?"1":"0");if(!narrationEnabled)stopNarrationSpeech();initNarrationControls();updateNarrationButton();broadcastNarrationSettings();if(narrationEnabled)await speakNarration("Narração ativada.",true)}
+async function testNarration(){initNarrationControls();stopNarrationSpeech();await speakNarration("Teste de narração do modo história. A arena está pronta, e a aventura vai começar.",true)}
 function narrationText(text){return String(text||"").replace(/[📍🎲🔥💀🔞✅⛔🗑️]/g," ").replace(/\s*•\s*/g,", ").replace(/\s+/g," ").trim()}
-function speakNarrationOnce(clean){return new Promise(resolve=>{const synth=window.speechSynthesis;const u=new SpeechSynthesisUtterance(clean);u.lang="pt-BR";u.rate=narrationRate();u.pitch=1.04;u.volume=1;const v=selectedNarrationVoice();if(v){u.voice=v;u.lang=v.lang||"pt-BR"}let finished=false,started=false;const finish=ok=>{if(finished)return;finished=true;clearTimeout(startTimer);clearTimeout(endTimer);clearInterval(keepAlive);resolve(ok)};u.onstart=()=>{started=true;clearTimeout(startTimer)};u.onend=()=>finish(true);u.onerror=()=>finish(false);const startTimer=setTimeout(()=>{if(!started){try{synth.cancel();synth.resume()}catch{}finish(false)}},3200);const estimate=Math.max(5000,Math.min(120000,Math.round((clean.length*78)/Math.max(.7,u.rate)+2200)));const endTimer=setTimeout(()=>{try{synth.cancel();synth.resume()}catch{}finish(false)},estimate);const keepAlive=setInterval(()=>{try{if(synth.paused)synth.resume()}catch{}},3500);try{synth.resume();synth.speak(u)}catch{finish(false)}})}
-async function speakNarration(text,force=false){const clean=narrationText(text);if((!narrationEnabled&&!force)||!("speechSynthesis" in window)||!clean)return false;for(let attempt=0;attempt<2;attempt++){stopNarrationSpeech();await clientSleep(attempt?180:110);const ok=await speakNarrationOnce(clean);if(ok)return true}return false}
-window.addEventListener("storage",e=>{if([NARRATION_ENABLED_KEY,NARRATION_VOICE_KEY,NARRATION_RATE_KEY,"hgNarrationVoiceNaturalV51"].includes(e.key))applyNarrationSettings()});
+function narrationChunks(text,max=180){const clean=narrationText(text);if(!clean)return[];const parts=clean.match(/[^.!?;:]+[.!?;:]?|[^.!?;:]+$/g)||[clean];const chunks=[];let current="";for(const raw of parts){const part=raw.trim();if(!part)continue;if((current+" "+part).trim().length<=max){current=(current+" "+part).trim();continue}if(current)chunks.push(current);if(part.length<=max){current=part;continue}const words=part.split(/\s+/);current="";for(const word of words){if((current+" "+word).trim().length>max){if(current)chunks.push(current);current=word}else current=(current+" "+word).trim()}}if(current)chunks.push(current);return chunks}
+function playGoogleNarrationChunk(chunk,token){return new Promise(resolve=>{if(token!==narrationStopToken)return resolve(false);const audio=new Audio("/hg/tts?text="+encodeURIComponent(chunk));currentNarrationAudio=audio;audio.preload="auto";audio.playbackRate=narrationRate();let done=false;const finish=ok=>{if(done)return;done=true;clearTimeout(timer);audio.onended=null;audio.onerror=null;audio.onabort=null;if(currentNarrationAudio===audio)currentNarrationAudio=null;resolve(ok)};audio.onended=()=>finish(true);audio.onerror=()=>finish(false);audio.onabort=()=>finish(false);const timer=setTimeout(()=>{try{audio.pause()}catch{}finish(false)},Math.max(12000,Math.min(90000,chunk.length*180)));audio.play().catch(()=>finish(false))})}
+function playBrowserNarrationChunk(chunk,token){return new Promise(resolve=>{if(token!==narrationStopToken||!("speechSynthesis" in window))return resolve(false);const synth=window.speechSynthesis;const u=new SpeechSynthesisUtterance(chunk);currentNarrationUtterance=u;u.lang="pt-BR";u.rate=narrationRate();u.pitch=1.03;u.volume=1;const v=selectedNarrationVoice();if(v){u.voice=v;u.lang=v.lang||"pt-BR"}let done=false,started=false;const finish=ok=>{if(done)return;done=true;clearTimeout(startTimer);clearTimeout(endTimer);clearInterval(keepAlive);if(currentNarrationUtterance===u)currentNarrationUtterance=null;resolve(ok)};u.onstart=()=>{started=true};u.onend=()=>finish(true);u.onerror=e=>finish(e?.error==="interrupted"||e?.error==="canceled"?false:false);const startTimer=setTimeout(()=>{if(!started){try{synth.cancel()}catch{}finish(false)}},10000);const endTimer=setTimeout(()=>{try{synth.cancel()}catch{}finish(false)},Math.max(15000,Math.min(120000,chunk.length*220)));const keepAlive=setInterval(()=>{try{if(synth.paused)synth.resume()}catch{}},2500);try{synth.resume();synth.speak(u)}catch{finish(false)}})}
+async function speakNarration(text,force=false){const chunks=narrationChunks(text);if((!narrationEnabled&&!force)||!chunks.length)return false;stopNarrationSpeech();const token=narrationStopToken;let allOk=true;for(const chunk of chunks){if(token!==narrationStopToken)return false;let ok=false;if(selectedNarrationMode()==="google")ok=await playGoogleNarrationChunk(chunk,token);if(!ok)ok=await playBrowserNarrationChunk(chunk,token);if(!ok){allOk=false;await clientSleep(80)}}return allOk}
+window.addEventListener("storage",e=>{if([NARRATION_ENABLED_KEY,NARRATION_VOICE_KEY,NARRATION_RATE_KEY,"hgNarrationEnabledV52","hgNarrationVoiceNaturalV52","hgNarrationVoiceNaturalV51"].includes(e.key))applyNarrationSettings()});
 if(narrationChannel)narrationChannel.onmessage=e=>applyNarrationSettings(e.data||{});
 if(admin){sendNarrationHeartbeat();setInterval(sendNarrationHeartbeat,1000)}
-if("speechSynthesis" in window){initNarrationControls();window.speechSynthesis.onvoiceschanged=populateNarrationVoices}
+initNarrationControls();if("speechSynthesis" in window){window.speechSynthesis.onvoiceschanged=populateNarrationVoices}
 const clientSleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 let timelineGameId=null,timelineInitialized=false,timelinePlayers=[],timelineQueue=[],timelineQueueRunning=false,timelineGeneration=0;
 const timelineKnownIds=new Set(),timelineQueuedIds=new Set();
@@ -1824,9 +2044,10 @@ function toggleScenario(id){const body=document.getElementById("scenario_body_"+
 async function addScenario(){const g=id=>document.getElementById(id);const body={action:"add_scenario",name:g("scName").value,phase:g("scPhase").value,type:g("scType").value,players:g("scPlayers").value,kills:g("scKills").value,adult:g("scAdult").value,text:g("scText").value,mix_with_normal:g("scMix").checked?"1":"0",active:g("scActive").checked?"1":"0"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);if(String(t).startsWith("✅")){g("scName").value="";g("scText").value=""}await loadScenarios();load()}
 function scenarioChildRow(c,sid){return '<div class="child-card"><div class="phase">EVENTO DA HISTÓRIA ID '+c.id+' • '+esc(phaseLabels[c.phase]||c.phase)+' • '+esc(typeLabel(c.type))+' • '+esc(playerLabel(c.players))+' • '+(c.active?"Ativo":"Desativado")+'</div><div class="child-edit-grid"><select id="sce_phase_'+c.id+'">'+phaseOptions(c.phase,true)+'</select><select id="sce_type_'+c.id+'">'+typeOptions(c.type)+'</select>'+playerInput("sce_players_"+c.id,c.players)+'<input id="sce_kills_'+c.id+'" placeholder="Mortes: p2" value="'+esc(c.kills||"")+'"><select id="sce_adult_'+c.id+'"><option value="0" '+(!c.adult?"selected":"")+'>Normal</option><option value="1" '+(c.adult?"selected":"")+'>+18</option></select></div><textarea id="sce_text_'+c.id+'">'+esc(c.text)+'</textarea><div class="wide-actions"><label class="switch-row"><input id="sce_active_'+c.id+'" type="checkbox" '+(c.active?"checked":"")+'><span>Evento decorrente ativo</span></label><button onclick="saveScenarioEvent('+c.id+','+sid+')">Salvar evento interno</button><button class="danger" onclick="deleteScenarioEvent('+c.id+','+sid+')">Excluir</button></div></div>'}
 async function saveScenarioOptions(id){const mix=document.getElementById("sc_mix_"+id),active=document.getElementById("sc_active_"+id),status=document.getElementById("sc_options_status_"+id);if(!mix||!active)return;if(status)status.textContent="Salvando opções...";mix.disabled=true;active.disabled=true;try{const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"update_scenario_options",id,mix_with_normal:mix.checked?"1":"0",active:active.checked?"1":"0"})});if(status)status.textContent=String(t);openScenarios.add(Number(id));await load()}catch(e){if(status)status.textContent="Erro ao salvar as opções."}finally{mix.disabled=false;active.disabled=false}}
-function scenarioRow(s){const opened=openScenarios.has(Number(s.id));const children=(s.events||[]).map(c=>scenarioChildRow(c,s.id)).join("")||'<div class="small">Nenhum evento decorrente criado. Use o formulário abaixo.</div>';return '<div class="scenario-card"><div class="scenario-head" onclick="toggleScenario('+s.id+')"><button class="scenario-arrow" id="scenario_arrow_'+s.id+'">'+(opened?"▼":"▶")+'</button><div class="scenario-title"><div style="font-weight:950;font-size:17px">'+esc(s.name)+'</div><div class="scenario-flags"><span class="flag">ID '+s.id+'</span><span class="flag">'+esc(phaseLabels[s.phase]||s.phase)+'</span><span class="flag">'+(s.mix_with_normal?"Mistura com normais":"Somente esta história")+'</span><span class="flag">'+(s.active?"Ativo":"Desativado")+'</span><span class="flag">'+esc(playerLabel(s.players))+'</span><span class="flag">'+(s.events||[]).length+' decorrente(s)</span></div></div></div><div id="scenario_body_'+s.id+'" class="scenario-body '+(opened?"":"collapsed")+'"><input id="sc_name_'+s.id+'" value="'+esc(s.name)+'"><div class="scenario-edit-grid"><select id="sc_phase_'+s.id+'">'+phaseOptions(s.phase,false)+'</select><select id="sc_type_'+s.id+'">'+typeOptions(s.type)+'</select>'+playerInput("sc_players_"+s.id,s.players)+'<input id="sc_kills_'+s.id+'" placeholder="Mortes: p2" value="'+esc(s.kills||"")+'"><select id="sc_adult_'+s.id+'"><option value="0" '+(!s.adult?"selected":"")+'>Normal</option><option value="1" '+(s.adult?"selected":"")+'>+18</option></select></div><textarea id="sc_text_'+s.id+'">'+esc(s.text)+'</textarea><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><label class="switch-row"><input id="sc_mix_'+s.id+'" type="checkbox" onchange="saveScenarioOptions('+s.id+')" '+(s.mix_with_normal?"checked":"")+'><span><b>Misturar com eventos normais</b><br><span class="small">Desligado: somente os eventos internos.</span></span></label><label class="switch-row"><input id="sc_active_'+s.id+'" type="checkbox" onchange="saveScenarioOptions('+s.id+')" '+(s.active?"checked":"")+'><span><b>História ativa</b><br><span class="small">Controla se o início pode ser sorteado.</span></span></label></div><div id="sc_options_status_'+s.id+'" class="small" style="margin-top:8px;color:#c4b5fd">As duas chaves são salvas automaticamente.</div><div class="wide-actions"><button onclick="saveScenario('+s.id+')">Salvar história</button><button class="danger" onclick="deleteScenario('+s.id+')">Excluir tudo</button></div><hr style="border-color:var(--b);margin:18px 0"><h3>Adicionar evento decorrente</h3><div class="small">“Qualquer fase” é recomendado para a história continuar sem ficar esperando Dia ou Noite.</div><div class="child-edit-grid"><select id="new_sce_phase_'+s.id+'">'+phaseOptions("any",true)+'</select><select id="new_sce_type_'+s.id+'">'+typeOptions("neutral")+'</select>'+playerInput("new_sce_players_"+s.id,1)+'<input id="new_sce_kills_'+s.id+'" placeholder="Mortes: p2"><select id="new_sce_adult_'+s.id+'"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="new_sce_text_'+s.id+'" placeholder="{p1} tenta conversar com o ET. Use {p} para Todos."></textarea><span class="small player-count-note">Digite qualquer número ou escreva Todos. Use {p} ou {todos} para colocar todos os vivos nesta cena.</span><button onclick="addScenarioEvent('+s.id+')">Adicionar dentro desta história</button><hr style="border-color:var(--b);margin:18px 0"><h3>Eventos decorrentes cadastrados</h3><div class="child-list">'+children+'</div></div></div>'}
+function scenarioRow(s){const opened=openScenarios.has(Number(s.id));const children=(s.events||[]).map(c=>scenarioChildRow(c,s.id)).join("")||'<div class="small">Nenhum evento decorrente criado. Use o formulário abaixo.</div>';return '<div class="scenario-card"><div class="scenario-head" onclick="toggleScenario('+s.id+')"><button class="scenario-arrow" id="scenario_arrow_'+s.id+'">'+(opened?"▼":"▶")+'</button><div class="scenario-title"><div style="font-weight:950;font-size:17px">'+esc(s.name)+'</div><div class="scenario-flags"><span class="flag">ID '+s.id+'</span><span class="flag">'+esc(phaseLabels[s.phase]||s.phase)+'</span><span class="flag">'+(s.mix_with_normal?"Mistura com normais":"Somente esta história")+'</span><span class="flag">'+(s.active?"Ativo":"Desativado")+'</span><span class="flag">'+esc(playerLabel(s.players))+'</span><span class="flag">'+(s.events||[]).length+' decorrente(s)</span></div></div></div><div id="scenario_body_'+s.id+'" class="scenario-body '+(opened?"":"collapsed")+'"><input id="sc_name_'+s.id+'" value="'+esc(s.name)+'"><div class="scenario-edit-grid"><select id="sc_phase_'+s.id+'">'+phaseOptions(s.phase,false)+'</select><select id="sc_type_'+s.id+'">'+typeOptions(s.type)+'</select>'+playerInput("sc_players_"+s.id,s.players)+'<input id="sc_kills_'+s.id+'" placeholder="Mortes: p2" value="'+esc(s.kills||"")+'"><select id="sc_adult_'+s.id+'"><option value="0" '+(!s.adult?"selected":"")+'>Normal</option><option value="1" '+(s.adult?"selected":"")+'>+18</option></select></div><textarea id="sc_text_'+s.id+'">'+esc(s.text)+'</textarea><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><label class="switch-row"><input id="sc_mix_'+s.id+'" type="checkbox" onchange="saveScenarioOptions('+s.id+')" '+(s.mix_with_normal?"checked":"")+'><span><b>Misturar com eventos normais</b><br><span class="small">Desligado: somente os eventos internos.</span></span></label><label class="switch-row"><input id="sc_active_'+s.id+'" type="checkbox" onchange="saveScenarioOptions('+s.id+')" '+(s.active?"checked":"")+'><span><b>História ativa</b><br><span class="small">Controla se o início pode ser sorteado.</span></span></label></div><div id="sc_options_status_'+s.id+'" class="small" style="margin-top:8px;color:#c4b5fd">As duas chaves são salvas automaticamente.</div><div class="wide-actions"><button onclick="saveScenario('+s.id+')">Salvar história</button><button class="secondary" onclick="restartScenario('+s.id+')">Reiniciar história agora</button><button class="danger" onclick="deleteScenario('+s.id+')">Excluir tudo</button></div><hr style="border-color:var(--b);margin:18px 0"><h3>Adicionar evento decorrente</h3><div class="small">No modo exclusivo, os acontecimentos seguem a ordem cadastrada e não esperam Dia ou Noite.</div><div class="child-edit-grid"><select id="new_sce_phase_'+s.id+'">'+phaseOptions("any",true)+'</select><select id="new_sce_type_'+s.id+'">'+typeOptions("neutral")+'</select>'+playerInput("new_sce_players_"+s.id,1)+'<input id="new_sce_kills_'+s.id+'" placeholder="Mortes: p2"><select id="new_sce_adult_'+s.id+'"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="new_sce_text_'+s.id+'" placeholder="{p1} tenta conversar com o ET. Use {p} para Todos."></textarea><span class="small player-count-note">Digite qualquer número ou escreva Todos. Use {p} ou {todos} para colocar todos os vivos nesta cena.</span><button onclick="addScenarioEvent('+s.id+')">Adicionar dentro desta história</button><hr style="border-color:var(--b);margin:18px 0"><h3>Eventos decorrentes cadastrados</h3><div class="child-list">'+children+'</div></div></div>'}
 async function loadScenarios(){if(!admin)return;const box=document.getElementById("scenariosEditor");if(!box)return;box.innerHTML="<div class='small'>Carregando histórias...</div>";const rows=await api("/hg/scenarios");if(!Array.isArray(rows)){box.innerHTML="<div class='small'>Erro ao carregar histórias.</div>";return}box.innerHTML=rows.map(scenarioRow).join("")||"<div class='small'>Nenhuma história criada.</div>"}
 async function saveScenario(id){const body={action:"update_scenario",id,name:document.getElementById("sc_name_"+id).value,phase:document.getElementById("sc_phase_"+id).value,type:document.getElementById("sc_type_"+id).value,players:document.getElementById("sc_players_"+id).value,kills:document.getElementById("sc_kills_"+id).value,adult:document.getElementById("sc_adult_"+id).value,text:document.getElementById("sc_text_"+id).value,mix_with_normal:document.getElementById("sc_mix_"+id).checked?"1":"0",active:document.getElementById("sc_active_"+id).checked?"1":"0"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);openScenarios.add(Number(id));loadScenarios();load()}
+async function restartScenario(id){if(!confirm("Reiniciar esta história na partida atual e voltar para a introdução?"))return;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"restart_scenario",id})});alert(t);await load()}
 async function deleteScenario(id){if(!confirm("Excluir esta história e TODOS os eventos que estão dentro dela?"))return;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"delete_scenario",id})});alert(t);openScenarios.delete(Number(id));loadScenarios();load()}
 async function addScenarioEvent(id){const body={action:"add_scenario_event",scenario_id:id,phase:document.getElementById("new_sce_phase_"+id).value,type:document.getElementById("new_sce_type_"+id).value,players:document.getElementById("new_sce_players_"+id).value,kills:document.getElementById("new_sce_kills_"+id).value,adult:document.getElementById("new_sce_adult_"+id).value,text:document.getElementById("new_sce_text_"+id).value,active:"1"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);openScenarios.add(Number(id));loadScenarios();load()}
 async function saveScenarioEvent(id,sid){const body={action:"update_scenario_event",id,phase:document.getElementById("sce_phase_"+id).value,type:document.getElementById("sce_type_"+id).value,players:document.getElementById("sce_players_"+id).value,kills:document.getElementById("sce_kills_"+id).value,adult:document.getElementById("sce_adult_"+id).value,text:document.getElementById("sce_text_"+id).value,active:document.getElementById("sce_active_"+id).checked?"1":"0"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);openScenarios.add(Number(sid));loadScenarios();load()}
@@ -1838,6 +2059,46 @@ load();if(admin){loadEvents();loadScenarios()}setInterval(load,800);
 app.get("/", (_req, res) => res.type("text/plain").send(`OK - Hunger Games da Live v${APP_VERSION}`));
 app.get("/health", (_req, res) => res.json({ ok: true, version: APP_VERSION }));
 app.get("/version", (_req, res) => res.json({ version: APP_VERSION }));
+
+// Voz Google online sem expor chave no navegador. O texto é curto, dividido
+// pelo cliente e armazenado em cache para evitar baixar a mesma fala várias vezes.
+app.get("/hg/tts", async (req, res) => {
+  const text = String(req.query.text || "").replace(/\s+/g, " ").trim().slice(0, 220);
+  if (!text) return res.status(400).type("text/plain").send("Texto vazio.");
+  const key = `pt-BR:${text}`;
+  const cached = ttsCache.get(key);
+  if (cached) {
+    res.set("Cache-Control", "public, max-age=86400");
+    return res.type("audio/mpeg").send(cached);
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const url = "https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=pt-BR&q=" + encodeURIComponent(text);
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36",
+        "Accept": "audio/mpeg,audio/*;q=0.9,*/*;q=0.8",
+        "Referer": "https://translate.google.com/"
+      }
+    });
+    if (!response.ok) throw new Error(`Google TTS respondeu ${response.status}`);
+    const audio = Buffer.from(await response.arrayBuffer());
+    if (audio.length < 256) throw new Error("Áudio vazio recebido do Google TTS.");
+    if (ttsCache.size >= 300) ttsCache.delete(ttsCache.keys().next().value);
+    ttsCache.set(key, audio);
+    res.set("Cache-Control", "public, max-age=86400");
+    return res.type("audio/mpeg").send(audio);
+  } catch (error) {
+    console.error("Erro no Google TTS:", error.message);
+    return res.status(502).type("text/plain").send("Voz Google indisponível temporariamente.");
+  } finally {
+    clearTimeout(timeout);
+  }
+});
+
 app.get("/hg", command);
 app.post("/hg", command);
 app.get("/hg/admin", adminAction);
