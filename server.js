@@ -6,7 +6,7 @@ import tls from "node:tls";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = "5.4.0";
+const APP_VERSION = "5.5.0";
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
@@ -443,6 +443,7 @@ async function ensureTables() {
           phase VARCHAR(30) NOT NULL DEFAULT 'bloodbath',
           day_number INT NOT NULL DEFAULT 1,
           adult_mode TINYINT(1) NOT NULL DEFAULT 0,
+          normal_events_enabled TINYINT(1) NOT NULL DEFAULT 1,
           winner VARCHAR(120) NULL,
           created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -501,6 +502,11 @@ async function ensureTables() {
       // A coluna só é criada na primeira execução desta versão.
       try {
         await db.query("ALTER TABLE hg_games ADD COLUMN active_scenario_id INT NULL AFTER adult_mode");
+      } catch (e) {
+        if (e?.code !== "ER_DUP_FIELDNAME") throw e;
+      }
+      try {
+        await db.query("ALTER TABLE hg_games ADD COLUMN normal_events_enabled TINYINT(1) NOT NULL DEFAULT 1 AFTER adult_mode");
       } catch (e) {
         if (e?.code !== "ER_DUP_FIELDNAME") throw e;
       }
@@ -713,16 +719,16 @@ async function currentGame(channel, create = true) {
   const [rows] = await db.query("SELECT * FROM hg_games WHERE channel=? AND status IN ('lobby','running','ended') ORDER BY id DESC LIMIT 1", [channel]);
   if (rows.length) return rows[0];
   if (!create) return null;
-  const [r] = await db.query("INSERT INTO hg_games (channel,status,phase,day_number,adult_mode) VALUES (?, 'lobby', 'bloodbath', 1, ?)", [channel, process.env.HG_ADULT_DEFAULT === "1" ? 1 : 0]);
+  const [r] = await db.query("INSERT INTO hg_games (channel,status,phase,day_number,adult_mode,normal_events_enabled) VALUES (?, 'lobby', 'bloodbath', 1, ?, ?)", [channel, process.env.HG_ADULT_DEFAULT === "1" ? 1 : 0, process.env.HG_NORMAL_EVENTS_DEFAULT === "0" ? 0 : 1]);
   const [created] = await db.query("SELECT * FROM hg_games WHERE id=?", [r.insertId]);
   return created[0];
 }
 
-async function newLobby(channel, adult = 0) {
+async function newLobby(channel, adult = 0, normalEventsEnabled = 1) {
   await ensureTables();
   const db = await getPool();
   await db.query("UPDATE hg_games SET status='archived' WHERE channel=? AND status IN ('lobby','running','ended')", [channel]);
-  const [r] = await db.query("INSERT INTO hg_games (channel,status,phase,day_number,adult_mode) VALUES (?, 'lobby', 'bloodbath', 1, ?)", [channel, adult ? 1 : 0]);
+  const [r] = await db.query("INSERT INTO hg_games (channel,status,phase,day_number,adult_mode,normal_events_enabled) VALUES (?, 'lobby', 'bloodbath', 1, ?, ?)", [channel, adult ? 1 : 0, normalEventsEnabled ? 1 : 0]);
   return r.insertId;
 }
 
@@ -876,7 +882,7 @@ async function reset(channel) {
   stopAuto(channel);
   return withChannelLock(channel, async () => {
     const old = await currentGame(channel, false);
-    await newLobby(channel, old?.adult_mode || (process.env.HG_ADULT_DEFAULT === "1" ? 1 : 0));
+    await newLobby(channel, old?.adult_mode || (process.env.HG_ADULT_DEFAULT === "1" ? 1 : 0), Number(old?.normal_events_enabled ?? 1));
     return "✅ Arena resetada. Use !hg entrar ou !hg todos.";
   });
 }
@@ -886,6 +892,17 @@ async function adult(channel, on) {
   const db = await getPool();
   await db.query("UPDATE hg_games SET adult_mode=? WHERE id=?", [on ? 1 : 0, game.id]);
   return on ? "🔞 Modo +18 ligado." : "✅ Modo +18 desligado.";
+}
+
+async function setNormalEvents(channel, on) {
+  return withChannelLock(channel, async () => {
+    const game = await currentGame(channel, true);
+    const db = await getPool();
+    await db.query("UPDATE hg_games SET normal_events_enabled=? WHERE id=?", [on ? 1 : 0, game.id]);
+    return on
+      ? "✅ Eventos normais/antigos ativados novamente."
+      : "⛔ Eventos normais/antigos desativados. O automático usará somente o Modo História.";
+  });
 }
 
 function shuffle(a) {
@@ -995,24 +1012,37 @@ async function finishScenario(conn, gameId, scenarioId, channel, phase, day, sce
 // Enquanto existir uma história com "Misturar com eventos normais" desligado,
 // nenhum evento normal é sorteado. A introdução inicia primeiro e os eventos
 // internos seguem a ordem cadastrada, sem depender da fase Dia/Noite.
-async function runExclusiveStoryBeat(conn, game, alive, channel, adultAllowed) {
+async function runExclusiveStoryBeat(conn, game, alive, channel, adultAllowed, forceStoryOnly = false) {
   const day = Number(game.day_number || 1);
   let scenario = null;
   let isIntroduction = false;
 
-  if (Number(game.active_scenario_id || 0)) {
+  const activeScenarioId = Number(game.active_scenario_id || 0);
+  if (activeScenarioId) {
     const [rows] = await conn.query(
-      "SELECT * FROM hg_scenarios WHERE id=? AND active=1 AND mix_with_normal=0 LIMIT 1",
-      [Number(game.active_scenario_id)]
+      `SELECT * FROM hg_scenarios
+       WHERE id=? AND active=1 ${forceStoryOnly ? "" : "AND mix_with_normal=0"}
+       LIMIT 1`,
+      [activeScenarioId]
     );
     scenario = rows[0] || null;
-  } else {
+
+    // No modo forçado, um ID antigo/inativo não pode bloquear outra história.
+    if (!scenario && forceStoryOnly) {
+      await conn.query("UPDATE hg_games SET active_scenario_id=NULL WHERE id=?", [game.id]);
+    } else if (!scenario) {
+      return { handled: false };
+    }
+  }
+
+  if (!scenario) {
     const [rows] = await conn.query(
       `SELECT s.*
        FROM hg_scenarios s
        LEFT JOIN hg_game_scenario_runs r
          ON r.game_id=? AND r.scenario_id=s.id
-       WHERE s.active=1 AND s.mix_with_normal=0
+       WHERE s.active=1
+         ${forceStoryOnly ? "" : "AND s.mix_with_normal=0"}
          AND r.scenario_id IS NULL
          AND (s.adult=0 OR ?=1)
        ORDER BY s.updated_at DESC, s.id DESC
@@ -1194,13 +1224,26 @@ async function nextRound(channel) {
       const phaseMarks = phases.map(() => "?").join(",");
       const adultAllowed = Number(game.adult_mode) === 1 ? 1 : 0;
 
-      // Histórias exclusivas têm prioridade absoluta. Uma chamada gera apenas
-      // um trecho da história e encerra a rodada, portanto eventos normais
-      // jamais entram no meio dela.
-      const exclusiveStory = await runExclusiveStoryBeat(conn, game, alive, channel, adultAllowed);
+      const normalEventsEnabled = Number(game.normal_events_enabled ?? 1) === 1;
+
+      // Quando os eventos normais/antigos estão desligados, o Modo História
+      // vira a única fonte possível. A introdução e cada evento decorrente são
+      // executados em ordem, um por chamada, sem qualquer consulta a hg_events.
+      const exclusiveStory = await runExclusiveStoryBeat(
+        conn,
+        game,
+        alive,
+        channel,
+        adultAllowed,
+        !normalEventsEnabled
+      );
       if (exclusiveStory.handled) {
         await conn.commit();
         return exclusiveStory.message;
+      }
+      if (!normalEventsEnabled) {
+        await conn.rollback();
+        return "⛔ Eventos normais/antigos estão desativados e não há nenhuma história ativa pendente. Ative ou reinicie uma história.";
       }
 
       const [normalEvents] = await conn.query(
@@ -1501,7 +1544,7 @@ async function startAuto(channel) {
           return;
         }
         const result = await nextRound(ch);
-        if (/venceu|acabou|já acabou/i.test(String(result))) {
+        if (/venceu|acabou|já acabou|não há nenhuma história ativa pendente/i.test(String(result))) {
           stopAuto(ch);
           return;
         }
@@ -1592,6 +1635,8 @@ async function adminAction(req, res) {
     if (action === "reset") return send(res, await reset(ch));
     if (action === "adult_on") return send(res, await adult(ch, true));
     if (action === "adult_off") return send(res, await adult(ch, false));
+    if (action === "normal_events_on") return send(res, await setNormalEvents(ch, true));
+    if (action === "normal_events_off") return send(res, await setNormalEvents(ch, false));
     if (action === "add_player") return send(res, await addManual(ch, req.query.name || req.body?.name, req.query.district || req.body?.district));
     if (action === "add_all_chat") return send(res, await addAllChatters(ch));
     if (action === "seed_adult_heavy") return send(res, await seedHeavyAdultEvents());
@@ -1670,7 +1715,18 @@ async function adminAction(req, res) {
         "INSERT INTO hg_scenarios (name,phase,type,players,text,kills,adult,mix_with_normal,active) VALUES (?,?,?,?,?,?,?,?,?)",
         [name, phase, type, players, text, kills, adultFlag, mixFlag, activeFlag]
       );
-      return send(res, `✅ Evento especial criado. Abra a seta para adicionar os eventos decorrentes. ID ${result.insertId}.`);
+      if (!mixFlag && activeFlag) {
+        const [games] = await db.query(
+          "SELECT id FROM hg_games WHERE channel=? AND status IN ('lobby','running') ORDER BY id DESC LIMIT 1",
+          [ch]
+        );
+        if (games[0]) {
+          await db.query("UPDATE hg_games SET active_scenario_id=NULL, normal_events_enabled=0 WHERE id=?", [games[0].id]);
+        }
+      }
+      return send(res, !mixFlag && activeFlag
+        ? `✅ História criada em modo exclusivo. Eventos antigos desativados. ID ${result.insertId}.`
+        : `✅ Evento especial criado. Abra a seta para adicionar os eventos decorrentes. ID ${result.insertId}.`);
     }
 
     if (action === "update_scenario_options") {
@@ -1698,14 +1754,14 @@ async function adminAction(req, res) {
         if (current) {
           await db.query("DELETE FROM hg_scenario_usage WHERE game_id=? AND scenario_id=?", [current.id, id]);
           await db.query("DELETE FROM hg_game_scenario_runs WHERE game_id=? AND scenario_id=?", [current.id, id]);
-          await db.query("UPDATE hg_games SET active_scenario_id=NULL WHERE id=?", [current.id]);
+          await db.query("UPDATE hg_games SET active_scenario_id=NULL, normal_events_enabled=0 WHERE id=?", [current.id]);
         }
       }
       return send(
         res,
         mixFlag
           ? "✅ Opções salvas: esta história pode misturar com eventos normais."
-          : "✅ Opções salvas: modo exclusivo preparado. A introdução será o próximo evento."
+          : "✅ Opções salvas: modo exclusivo preparado e eventos antigos desativados. A introdução será o próximo evento."
       );
     }
 
@@ -1722,8 +1778,8 @@ async function adminAction(req, res) {
       if (!current) return send(res, "Não existe uma partida atual para reiniciar a história.");
       await db.query("DELETE FROM hg_scenario_usage WHERE game_id=? AND scenario_id=?", [current.id, id]);
       await db.query("DELETE FROM hg_game_scenario_runs WHERE game_id=? AND scenario_id=?", [current.id, id]);
-      await db.query("UPDATE hg_games SET active_scenario_id=NULL WHERE id=?", [current.id]);
-      return send(res, "✅ História preparada. A introdução será o próximo evento automático.");
+      await db.query("UPDATE hg_games SET active_scenario_id=NULL, normal_events_enabled=0 WHERE id=?", [current.id]);
+      return send(res, "✅ História preparada. Os eventos antigos foram desativados e a introdução será o próximo evento automático.");
     }
 
     if (action === "update_scenario") {
@@ -1758,7 +1814,7 @@ async function adminAction(req, res) {
         if (current) {
           await db.query("DELETE FROM hg_scenario_usage WHERE game_id=? AND scenario_id=?", [current.id, id]);
           await db.query("DELETE FROM hg_game_scenario_runs WHERE game_id=? AND scenario_id=?", [current.id, id]);
-          await db.query("UPDATE hg_games SET active_scenario_id=NULL WHERE id=?", [current.id]);
+          await db.query("UPDATE hg_games SET active_scenario_id=NULL, normal_events_enabled=0 WHERE id=?", [current.id]);
         }
       }
       return send(res, !mixFlag && activeFlag
@@ -1879,12 +1935,12 @@ async function state(req, res) {
       : [[]];
     const [events] = await conn.query(`
       SELECT
-        (SELECT COUNT(*) FROM hg_events WHERE active=1) +
+        (SELECT COUNT(*) FROM hg_events WHERE active=1) AS normalTotal,
         (SELECT COUNT(*) FROM hg_scenarios WHERE active=1) +
-        (SELECT COUNT(*) FROM hg_scenario_events se JOIN hg_scenarios sc ON sc.id=se.scenario_id WHERE se.active=1 AND sc.active=1) AS total,
-        (SELECT COUNT(*) FROM hg_events WHERE active=1 AND adult=1) +
+        (SELECT COUNT(*) FROM hg_scenario_events se JOIN hg_scenarios sc ON sc.id=se.scenario_id WHERE se.active=1 AND sc.active=1) AS storyTotal,
+        (SELECT COUNT(*) FROM hg_events WHERE active=1 AND adult=1) AS normalAdultTotal,
         (SELECT COUNT(*) FROM hg_scenarios WHERE active=1 AND adult=1) +
-        (SELECT COUNT(*) FROM hg_scenario_events se JOIN hg_scenarios sc ON sc.id=se.scenario_id WHERE se.active=1 AND sc.active=1 AND se.adult=1) AS adultTotal
+        (SELECT COUNT(*) FROM hg_scenario_events se JOIN hg_scenarios sc ON sc.id=se.scenario_id WHERE se.active=1 AND sc.active=1 AND se.adult=1) AS storyAdultTotal
     `);
     const [activeScenarioRows] = game?.active_scenario_id
       ? await conn.query("SELECT id,name,mix_with_normal FROM hg_scenarios WHERE id=? LIMIT 1", [game.active_scenario_id])
@@ -1897,8 +1953,14 @@ async function state(req, res) {
       game,
       players,
       logs: logs.reverse(),
-      eventCount: Number(events?.[0]?.total || 0),
-      adultEventCount: Number(events?.[0]?.adultTotal || 0),
+      eventCount: Number(game?.normal_events_enabled ?? 1)
+        ? Number(events?.[0]?.normalTotal || 0) + Number(events?.[0]?.storyTotal || 0)
+        : Number(events?.[0]?.storyTotal || 0),
+      normalEventCount: Number(events?.[0]?.normalTotal || 0),
+      storyEventCount: Number(events?.[0]?.storyTotal || 0),
+      adultEventCount: Number(game?.normal_events_enabled ?? 1)
+        ? Number(events?.[0]?.normalAdultTotal || 0) + Number(events?.[0]?.storyAdultTotal || 0)
+        : Number(events?.[0]?.storyAdultTotal || 0),
       activeScenario: activeScenarioRows?.[0] || null,
       autoRunning: isAutoRunning(ch),
       autoIntervalMs: getAutoIntervalMs()
@@ -1951,7 +2013,7 @@ body.hg-running .event-person .event-name,
 
 .scenario-create-grid,.scenario-edit-grid,.child-edit-grid{display:grid;grid-template-columns:1.25fr 1fr .7fr 1.4fr .8fr;gap:8px;margin-top:12px}.scenario-card{border:1px solid var(--b);background:#10101a;border-radius:20px;overflow:hidden}.scenario-head{display:flex;align-items:center;gap:10px;padding:14px;cursor:pointer;background:#171726}.scenario-arrow{width:42px;min-width:42px;padding:9px;background:#303044}.scenario-title{flex:1}.scenario-body{padding:14px;border-top:1px solid var(--b)}.scenario-body.collapsed{display:none}.scenario-flags{display:flex;gap:8px;flex-wrap:wrap}.flag{font-size:11px;font-weight:950;border:1px solid var(--b);border-radius:999px;padding:5px 8px;color:#ddd6fe}.switch-row{display:flex;align-items:center;gap:10px;border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:10px 12px}.switch-row input{width:20px;height:20px;accent-color:var(--p)}.child-list{display:flex;flex-direction:column;gap:10px;margin-top:12px}.child-card{border:1px solid var(--b);border-radius:16px;padding:12px;background:#0d0d16}.scenario-help{border-left:4px solid var(--p);padding:10px 12px;background:#1b1026;border-radius:10px;margin:10px 0}.wide-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.narration-bar{display:grid;grid-template-columns:auto minmax(210px,1fr) minmax(180px,.75fr) auto;gap:8px;margin:0 0 8px;align-items:center}.narration-bar button{white-space:nowrap}.narration-speed{border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:7px 10px}.narration-speed label{display:flex;justify-content:space-between;gap:8px;font-size:12px;font-weight:900;color:#ddd6fe}.narration-speed input{padding:0;height:18px;accent-color:var(--p)}.narration-help{margin:0 0 14px}.story-card{border-color:#6b21a8;box-shadow:0 18px 60px #581c8730}.player-count-note{display:block;margin-top:6px;color:#c4b5fd}.player-count-input{font-weight:900}.log.event-sync-active{outline:3px solid #a855f7;box-shadow:0 0 0 6px #a855f720,0 18px 45px #0008;transform:scale(1.012);transition:outline-color .18s,box-shadow .18s,transform .18s}.log.event-sync-enter{animation:eventSyncEnter .22s ease-out}@keyframes eventSyncEnter{from{opacity:.15;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}@media(max-width:900px){.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{grid-template-columns:1fr 1fr}.scenario-create-grid textarea,.scenario-edit-grid textarea,.child-edit-grid textarea,.span-all{grid-column:1/-1}.narration-bar{grid-template-columns:1fr}.admin-event-grid{grid-template-columns:1fr 1fr!important}}
 </style></head><body><div class="wrap"><div class="top"><div><h1>Hunger Games da Live</h1><div class="sub">Participantes do chat, distritos, eventos, mortes e vencedor final.</div></div><div class="pill" id="statusPill">Carregando...</div></div>
-<div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div></div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar automático</button><button class="danger" onclick="act('reset')">Resetar</button><button class="secondary" onclick="act('adult_on')">Ligar +18</button><button class="secondary" onclick="act('adult_off')">Desligar +18</button><button class="secondary" onclick="act('add_all_chat')">Adicionar todos do chat</button><button class="secondary" onclick="seedAdultHeavy()">Adicionar +18 pesado</button></div>` : ``}</div>
+<div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div>${admin ? `<div id="normalEventsStatus" class="small" style="margin-top:7px;font-weight:950"></div>` : ``}</div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar automático</button><button class="danger" onclick="act('reset')">Resetar</button><button id="normalEventsToggle" class="danger" onclick="toggleNormalEvents()">Desativar eventos antigos</button><button class="secondary" onclick="act('adult_on')">Ligar +18</button><button class="secondary" onclick="act('adult_off')">Desligar +18</button><button class="secondary" onclick="act('add_all_chat')">Adicionar todos do chat</button><button class="secondary" onclick="seedAdultHeavy()">Adicionar +18 pesado</button></div>` : ``}</div>
 ${admin ? `<div class="two" style="margin:16px 0"><input id="manualName" placeholder="Adicionar participante manual"/><input id="manualDistrict" placeholder="Distrito" type="number" min="1" max="12"/><button style="grid-column:1/-1" onclick="addPlayer()">Adicionar participante</button></div>` : ``}
 <div id="participantsBox" class="lobby-only"><h2>Participantes</h2><div class="players" id="players"></div></div></section><aside class="card events-card"><h2 class="events-title">Eventos</h2>${admin ? `<div class="narration-bar"><button id="narrationToggle" class="secondary" onclick="toggleNarration()">🔊 Ativar narração</button><select id="narrationVoice" aria-label="Voz da narração"></select><div class="narration-speed"><label><span>Velocidade</span><span id="narrationRateValue">1,30x</span></label><input id="narrationRate" type="range" min="0.70" max="2.00" step="0.05" value="1.30" aria-label="Velocidade da narração"></div><button class="secondary" onclick="testNarration()">▶ Testar voz</button></div><div class="small narration-help">Esses controles aparecem somente no painel administrativo. A página pública usa a voz, a velocidade e o estado definidos aqui.</div>` : ``}<div class="logs" id="logs"></div></aside></div>
 ${admin ? `<section class="card story-card" style="margin-top:18px"><h2>Modo História</h2><div class="scenario-help"><b>Exemplo:</b> “Um ET invade a arena”. Crie a introdução e depois abra a seta para cadastrar os acontecimentos decorrentes.</div><div class="small">Na seleção de pessoas, escolha <b>Todos</b> para colocar todos os participantes vivos na mesma cena. No texto, use <b>{p}</b> ou <b>{todos}</b> para mostrar todos os nomes.</div>
@@ -2020,7 +2082,7 @@ async function load(){
   if(loadInProgress){loadAgain=true;return}
   loadInProgress=true;
   try{
-    const st=await api("/hg/state"),g=st.game||{};document.body.classList.toggle("hg-running",!admin&&(g.status==="running"||g.status==="ended"));document.getElementById("statusPill").textContent=(statusLabels[g.status]||"AGUARDANDO")+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=phaseLabel(g.phase||"bloodbath",g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida rolando":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Aguardando participantes";const alive=st.players.filter(p=>p.alive).length;document.getElementById("counts").textContent=st.players.length+" participantes • "+alive+" vivos • "+st.eventCount+" eventos"+(st.activeScenario?" • Especial: "+st.activeScenario.name:"")+(st.autoRunning?" • automático ligado":"");
+    const st=await api("/hg/state"),g=st.game||{};document.body.classList.toggle("hg-running",!admin&&(g.status==="running"||g.status==="ended"));document.getElementById("statusPill").textContent=(statusLabels[g.status]||"AGUARDANDO")+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=phaseLabel(g.phase||"bloodbath",g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida rolando":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Aguardando participantes";const alive=st.players.filter(p=>p.alive).length;document.getElementById("counts").textContent=st.players.length+" participantes • "+alive+" vivos • "+st.eventCount+(Number(g.normal_events_enabled??1)===1?" eventos ativos":" eventos de história")+(st.activeScenario?" • História: "+st.activeScenario.name:"")+(st.autoRunning?" • automático ligado":"");normalEventsCurrentlyEnabled=Number(g.normal_events_enabled??1)===1;if(admin){const toggle=document.getElementById("normalEventsToggle"),label=document.getElementById("normalEventsStatus");if(toggle){toggle.textContent=normalEventsCurrentlyEnabled?"Desativar eventos antigos":"Ativar eventos antigos";toggle.className=normalEventsCurrentlyEnabled?"danger":"ok"}if(label){label.textContent=normalEventsCurrentlyEnabled?"⚠️ Eventos normais/antigos: ATIVADOS":"✅ Modo História exclusivo: eventos normais/antigos DESATIVADOS";label.style.color=normalEventsCurrentlyEnabled?"#fca5a5":"#86efac"}}
 const box=document.getElementById("participantsBox");if(box)box.classList.toggle("hidden",g.status==="running");
 document.getElementById("players").innerHTML=st.players.map(p=>{const av=avatarHtml(p);return '<div class="player '+(p.alive?'':'dead')+'">'+av+'<div><div class="district">Distrito '+p.district+'</div><div class="name">'+esc(p.display_name)+'</div><div class="kills">'+(p.kills||0)+' abate(s) '+(p.alive?'🟢':'💀')+'</div></div></div>'}).join("")||"<div class='small'>Ninguém entrou ainda.</div>";
 syncEventTimeline(g.id||0,st.logs,st.players,g.status)  }finally{
@@ -2029,6 +2091,24 @@ syncEventTimeline(g.id||0,st.logs,st.players,g.status)  }finally{
   }
 }
 let actionBusy=false;
+let normalEventsCurrentlyEnabled=true;
+async function toggleNormalEvents(){
+  if(!token)return alert("Abra com ?token=SEU_TOKEN");
+  if(actionBusy)return;
+  actionBusy=true;
+  const turningOff=normalEventsCurrentlyEnabled;
+  try{
+    const action=turningOff?"normal_events_off":"normal_events_on";
+    const t=await api("/hg/admin?action="+encodeURIComponent(action));
+    if(turningOff){
+      // Para imediatamente qualquer evento antigo que já estivesse na fila de voz.
+      clearTimelinePlayback();
+      timelineInitialized=false;
+    }
+    alert(t);
+    await load();
+  }finally{actionBusy=false}
+}
 async function act(a){if(!token)return alert("Abra com ?token=SEU_TOKEN");if(actionBusy)return;actionBusy=true;try{const t=await api("/hg/admin?action="+encodeURIComponent(a));alert(t);await load()}finally{actionBusy=false}}
 async function seedAdultHeavy(){if(!confirm("Adicionar pacote de eventos +18 pesado ao banco?"))return;const t=await api("/hg/admin?action=seed_adult_heavy");alert(t);load();if(admin)loadEvents()}
 async function addPlayer(){const name=document.getElementById("manualName").value.trim(),d=document.getElementById("manualDistrict").value.trim();if(!name)return alert("Nome vazio");const t=await api("/hg/admin?action=add_player&name="+encodeURIComponent(name)+"&district="+encodeURIComponent(d));alert(t);load()}
@@ -2043,11 +2123,11 @@ function typeOptions(value){return [["neutral","Neutro"],["death","Morte"],["ite
 function toggleScenario(id){const body=document.getElementById("scenario_body_"+id),arrow=document.getElementById("scenario_arrow_"+id);if(!body)return;const opening=body.classList.contains("collapsed");body.classList.toggle("collapsed",!opening);arrow.textContent=opening?"▼":"▶";if(opening)openScenarios.add(id);else openScenarios.delete(id)}
 async function addScenario(){const g=id=>document.getElementById(id);const body={action:"add_scenario",name:g("scName").value,phase:g("scPhase").value,type:g("scType").value,players:g("scPlayers").value,kills:g("scKills").value,adult:g("scAdult").value,text:g("scText").value,mix_with_normal:g("scMix").checked?"1":"0",active:g("scActive").checked?"1":"0"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);if(String(t).startsWith("✅")){g("scName").value="";g("scText").value=""}await loadScenarios();load()}
 function scenarioChildRow(c,sid){return '<div class="child-card"><div class="phase">EVENTO DA HISTÓRIA ID '+c.id+' • '+esc(phaseLabels[c.phase]||c.phase)+' • '+esc(typeLabel(c.type))+' • '+esc(playerLabel(c.players))+' • '+(c.active?"Ativo":"Desativado")+'</div><div class="child-edit-grid"><select id="sce_phase_'+c.id+'">'+phaseOptions(c.phase,true)+'</select><select id="sce_type_'+c.id+'">'+typeOptions(c.type)+'</select>'+playerInput("sce_players_"+c.id,c.players)+'<input id="sce_kills_'+c.id+'" placeholder="Mortes: p2" value="'+esc(c.kills||"")+'"><select id="sce_adult_'+c.id+'"><option value="0" '+(!c.adult?"selected":"")+'>Normal</option><option value="1" '+(c.adult?"selected":"")+'>+18</option></select></div><textarea id="sce_text_'+c.id+'">'+esc(c.text)+'</textarea><div class="wide-actions"><label class="switch-row"><input id="sce_active_'+c.id+'" type="checkbox" '+(c.active?"checked":"")+'><span>Evento decorrente ativo</span></label><button onclick="saveScenarioEvent('+c.id+','+sid+')">Salvar evento interno</button><button class="danger" onclick="deleteScenarioEvent('+c.id+','+sid+')">Excluir</button></div></div>'}
-async function saveScenarioOptions(id){const mix=document.getElementById("sc_mix_"+id),active=document.getElementById("sc_active_"+id),status=document.getElementById("sc_options_status_"+id);if(!mix||!active)return;if(status)status.textContent="Salvando opções...";mix.disabled=true;active.disabled=true;try{const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"update_scenario_options",id,mix_with_normal:mix.checked?"1":"0",active:active.checked?"1":"0"})});if(status)status.textContent=String(t);openScenarios.add(Number(id));await load()}catch(e){if(status)status.textContent="Erro ao salvar as opções."}finally{mix.disabled=false;active.disabled=false}}
-function scenarioRow(s){const opened=openScenarios.has(Number(s.id));const children=(s.events||[]).map(c=>scenarioChildRow(c,s.id)).join("")||'<div class="small">Nenhum evento decorrente criado. Use o formulário abaixo.</div>';return '<div class="scenario-card"><div class="scenario-head" onclick="toggleScenario('+s.id+')"><button class="scenario-arrow" id="scenario_arrow_'+s.id+'">'+(opened?"▼":"▶")+'</button><div class="scenario-title"><div style="font-weight:950;font-size:17px">'+esc(s.name)+'</div><div class="scenario-flags"><span class="flag">ID '+s.id+'</span><span class="flag">'+esc(phaseLabels[s.phase]||s.phase)+'</span><span class="flag">'+(s.mix_with_normal?"Mistura com normais":"Somente esta história")+'</span><span class="flag">'+(s.active?"Ativo":"Desativado")+'</span><span class="flag">'+esc(playerLabel(s.players))+'</span><span class="flag">'+(s.events||[]).length+' decorrente(s)</span></div></div></div><div id="scenario_body_'+s.id+'" class="scenario-body '+(opened?"":"collapsed")+'"><input id="sc_name_'+s.id+'" value="'+esc(s.name)+'"><div class="scenario-edit-grid"><select id="sc_phase_'+s.id+'">'+phaseOptions(s.phase,false)+'</select><select id="sc_type_'+s.id+'">'+typeOptions(s.type)+'</select>'+playerInput("sc_players_"+s.id,s.players)+'<input id="sc_kills_'+s.id+'" placeholder="Mortes: p2" value="'+esc(s.kills||"")+'"><select id="sc_adult_'+s.id+'"><option value="0" '+(!s.adult?"selected":"")+'>Normal</option><option value="1" '+(s.adult?"selected":"")+'>+18</option></select></div><textarea id="sc_text_'+s.id+'">'+esc(s.text)+'</textarea><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><label class="switch-row"><input id="sc_mix_'+s.id+'" type="checkbox" onchange="saveScenarioOptions('+s.id+')" '+(s.mix_with_normal?"checked":"")+'><span><b>Misturar com eventos normais</b><br><span class="small">Desligado: somente os eventos internos.</span></span></label><label class="switch-row"><input id="sc_active_'+s.id+'" type="checkbox" onchange="saveScenarioOptions('+s.id+')" '+(s.active?"checked":"")+'><span><b>História ativa</b><br><span class="small">Controla se o início pode ser sorteado.</span></span></label></div><div id="sc_options_status_'+s.id+'" class="small" style="margin-top:8px;color:#c4b5fd">As duas chaves são salvas automaticamente.</div><div class="wide-actions"><button onclick="saveScenario('+s.id+')">Salvar história</button><button class="secondary" onclick="restartScenario('+s.id+')">Reiniciar história agora</button><button class="danger" onclick="deleteScenario('+s.id+')">Excluir tudo</button></div><hr style="border-color:var(--b);margin:18px 0"><h3>Adicionar evento decorrente</h3><div class="small">No modo exclusivo, os acontecimentos seguem a ordem cadastrada e não esperam Dia ou Noite.</div><div class="child-edit-grid"><select id="new_sce_phase_'+s.id+'">'+phaseOptions("any",true)+'</select><select id="new_sce_type_'+s.id+'">'+typeOptions("neutral")+'</select>'+playerInput("new_sce_players_"+s.id,1)+'<input id="new_sce_kills_'+s.id+'" placeholder="Mortes: p2"><select id="new_sce_adult_'+s.id+'"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="new_sce_text_'+s.id+'" placeholder="{p1} tenta conversar com o ET. Use {p} para Todos."></textarea><span class="small player-count-note">Digite qualquer número ou escreva Todos. Use {p} ou {todos} para colocar todos os vivos nesta cena.</span><button onclick="addScenarioEvent('+s.id+')">Adicionar dentro desta história</button><hr style="border-color:var(--b);margin:18px 0"><h3>Eventos decorrentes cadastrados</h3><div class="child-list">'+children+'</div></div></div>'}
+async function saveScenarioOptions(id){const mix=document.getElementById("sc_mix_"+id),active=document.getElementById("sc_active_"+id),status=document.getElementById("sc_options_status_"+id);if(!mix||!active)return;if(status)status.textContent="Salvando opções...";mix.disabled=true;active.disabled=true;try{const exclusive=!mix.checked&&active.checked;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"update_scenario_options",id,mix_with_normal:mix.checked?"1":"0",active:active.checked?"1":"0"})});if(exclusive){clearTimelinePlayback();timelineInitialized=false}if(status)status.textContent=String(t);openScenarios.add(Number(id));await load()}catch(e){if(status)status.textContent="Erro ao salvar as opções."}finally{mix.disabled=false;active.disabled=false}}
+function scenarioRow(s){const opened=openScenarios.has(Number(s.id));const children=(s.events||[]).map(c=>scenarioChildRow(c,s.id)).join("")||'<div class="small">Nenhum evento decorrente criado. Use o formulário abaixo.</div>';return '<div class="scenario-card"><div class="scenario-head" onclick="toggleScenario('+s.id+')"><button class="scenario-arrow" id="scenario_arrow_'+s.id+'">'+(opened?"▼":"▶")+'</button><div class="scenario-title"><div style="font-weight:950;font-size:17px">'+esc(s.name)+'</div><div class="scenario-flags"><span class="flag">ID '+s.id+'</span><span class="flag">'+esc(phaseLabels[s.phase]||s.phase)+'</span><span class="flag">'+(s.mix_with_normal?"Mistura com normais":"Somente esta história")+'</span><span class="flag">'+(s.active?"Ativo":"Desativado")+'</span><span class="flag">'+esc(playerLabel(s.players))+'</span><span class="flag">'+(s.events||[]).length+' decorrente(s)</span></div></div></div><div id="scenario_body_'+s.id+'" class="scenario-body '+(opened?"":"collapsed")+'"><input id="sc_name_'+s.id+'" value="'+esc(s.name)+'"><div class="scenario-edit-grid"><select id="sc_phase_'+s.id+'">'+phaseOptions(s.phase,false)+'</select><select id="sc_type_'+s.id+'">'+typeOptions(s.type)+'</select>'+playerInput("sc_players_"+s.id,s.players)+'<input id="sc_kills_'+s.id+'" placeholder="Mortes: p2" value="'+esc(s.kills||"")+'"><select id="sc_adult_'+s.id+'"><option value="0" '+(!s.adult?"selected":"")+'>Normal</option><option value="1" '+(s.adult?"selected":"")+'>+18</option></select></div><textarea id="sc_text_'+s.id+'">'+esc(s.text)+'</textarea><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><label class="switch-row"><input id="sc_mix_'+s.id+'" type="checkbox" onchange="saveScenarioOptions('+s.id+')" '+(s.mix_with_normal?"checked":"")+'><span><b>Misturar com eventos normais</b><br><span class="small">Desligado: bloqueia os eventos antigos e usa somente esta história.</span></span></label><label class="switch-row"><input id="sc_active_'+s.id+'" type="checkbox" onchange="saveScenarioOptions('+s.id+')" '+(s.active?"checked":"")+'><span><b>História ativa</b><br><span class="small">Controla se o início pode ser sorteado.</span></span></label></div><div id="sc_options_status_'+s.id+'" class="small" style="margin-top:8px;color:#c4b5fd">As duas chaves são salvas automaticamente.</div><div class="wide-actions"><button onclick="saveScenario('+s.id+')">Salvar história</button><button class="secondary" onclick="restartScenario('+s.id+')">Reiniciar história agora</button><button class="danger" onclick="deleteScenario('+s.id+')">Excluir tudo</button></div><hr style="border-color:var(--b);margin:18px 0"><h3>Adicionar evento decorrente</h3><div class="small">No modo exclusivo, os acontecimentos seguem a ordem cadastrada e não esperam Dia ou Noite.</div><div class="child-edit-grid"><select id="new_sce_phase_'+s.id+'">'+phaseOptions("any",true)+'</select><select id="new_sce_type_'+s.id+'">'+typeOptions("neutral")+'</select>'+playerInput("new_sce_players_"+s.id,1)+'<input id="new_sce_kills_'+s.id+'" placeholder="Mortes: p2"><select id="new_sce_adult_'+s.id+'"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="new_sce_text_'+s.id+'" placeholder="{p1} tenta conversar com o ET. Use {p} para Todos."></textarea><span class="small player-count-note">Digite qualquer número ou escreva Todos. Use {p} ou {todos} para colocar todos os vivos nesta cena.</span><button onclick="addScenarioEvent('+s.id+')">Adicionar dentro desta história</button><hr style="border-color:var(--b);margin:18px 0"><h3>Eventos decorrentes cadastrados</h3><div class="child-list">'+children+'</div></div></div>'}
 async function loadScenarios(){if(!admin)return;const box=document.getElementById("scenariosEditor");if(!box)return;box.innerHTML="<div class='small'>Carregando histórias...</div>";const rows=await api("/hg/scenarios");if(!Array.isArray(rows)){box.innerHTML="<div class='small'>Erro ao carregar histórias.</div>";return}box.innerHTML=rows.map(scenarioRow).join("")||"<div class='small'>Nenhuma história criada.</div>"}
 async function saveScenario(id){const body={action:"update_scenario",id,name:document.getElementById("sc_name_"+id).value,phase:document.getElementById("sc_phase_"+id).value,type:document.getElementById("sc_type_"+id).value,players:document.getElementById("sc_players_"+id).value,kills:document.getElementById("sc_kills_"+id).value,adult:document.getElementById("sc_adult_"+id).value,text:document.getElementById("sc_text_"+id).value,mix_with_normal:document.getElementById("sc_mix_"+id).checked?"1":"0",active:document.getElementById("sc_active_"+id).checked?"1":"0"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);openScenarios.add(Number(id));loadScenarios();load()}
-async function restartScenario(id){if(!confirm("Reiniciar esta história na partida atual e voltar para a introdução?"))return;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"restart_scenario",id})});alert(t);await load()}
+async function restartScenario(id){if(!confirm("Reiniciar esta história na partida atual e voltar para a introdução?"))return;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"restart_scenario",id})});clearTimelinePlayback();timelineInitialized=false;alert(t);await load()}
 async function deleteScenario(id){if(!confirm("Excluir esta história e TODOS os eventos que estão dentro dela?"))return;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"delete_scenario",id})});alert(t);openScenarios.delete(Number(id));loadScenarios();load()}
 async function addScenarioEvent(id){const body={action:"add_scenario_event",scenario_id:id,phase:document.getElementById("new_sce_phase_"+id).value,type:document.getElementById("new_sce_type_"+id).value,players:document.getElementById("new_sce_players_"+id).value,kills:document.getElementById("new_sce_kills_"+id).value,adult:document.getElementById("new_sce_adult_"+id).value,text:document.getElementById("new_sce_text_"+id).value,active:"1"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);openScenarios.add(Number(id));loadScenarios();load()}
 async function saveScenarioEvent(id,sid){const body={action:"update_scenario_event",id,phase:document.getElementById("sce_phase_"+id).value,type:document.getElementById("sce_type_"+id).value,players:document.getElementById("sce_players_"+id).value,kills:document.getElementById("sce_kills_"+id).value,adult:document.getElementById("sce_adult_"+id).value,text:document.getElementById("sce_text_"+id).value,active:document.getElementById("sce_active_"+id).checked?"1":"0"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);openScenarios.add(Number(sid));loadScenarios();load()}

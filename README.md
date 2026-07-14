@@ -1,18 +1,19 @@
-# Hunger Games da Live — v5.4.0
+# Hunger Games da Live — v5.5.0
 
-Versão corrigida do modo história e da narração.
+## Correção do Modo História
 
-## Modo história
+Esta versão adiciona um controle real por partida para bloquear os eventos normais/antigos.
 
-Com **Misturar com eventos normais** desligado, a história ganha prioridade total. A introdução aparece primeiro e os acontecimentos internos seguem a ordem cadastrada. Nenhum evento normal entra enquanto a história estiver em andamento.
+No painel administrativo há um botão:
 
-Ao desligar essa chave durante uma partida, a história é preparada novamente e começa pela introdução no próximo passo automático.
+- **Desativar eventos antigos**: o servidor passa a usar somente o Modo História.
+- **Ativar eventos antigos**: os eventos normais voltam a participar do sorteio.
 
-## Narração
+Quando os eventos antigos estão desativados, a função de próxima rodada encerra antes de consultar a tabela `hg_events`. Assim, a introdução e os eventos decorrentes da história são executados um por vez, na ordem cadastrada.
 
-A voz padrão é **Google online — português do Brasil**. O servidor envia o áudio em partes curtas e o navegador usa uma voz local como alternativa caso o serviço online falhe. Evento, rolagem e voz são processados em uma única fila.
+Desmarcar **Misturar com eventos normais** ou clicar em **Reiniciar história agora** também desativa os eventos antigos automaticamente na partida atual e limpa qualquer fala antiga que ainda estivesse na fila do navegador.
 
-Os controles de narração aparecem somente em `/admin/hungergames`.
+A escolha fica salva na partida e é preservada ao usar **Resetar**.
 
 ## Atualização
 
@@ -20,4 +21,4 @@ Substitua os arquivos na raiz do GitHub e use no Render:
 
 `Manual Deploy → Clear build cache & deploy`
 
-Mantenha a mesma `DATABASE_URL`. Os eventos e histórias já cadastrados não são apagados.
+Mantenha a mesma `DATABASE_URL`. Nenhum evento ou história cadastrada é apagado.
