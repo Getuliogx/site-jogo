@@ -6,7 +6,7 @@ import tls from "node:tls";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = "3.2.0";
+const APP_VERSION = "4.0.0";
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
@@ -496,6 +496,72 @@ async function ensureTables() {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
       `);
 
+      // Migração segura: mantém todos os eventos e partidas já existentes.
+      // A coluna só é criada na primeira execução desta versão.
+      try {
+        await db.query("ALTER TABLE hg_games ADD COLUMN active_scenario_id INT NULL AFTER adult_mode");
+      } catch (e) {
+        if (e?.code !== "ER_DUP_FIELDNAME") throw e;
+      }
+
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS hg_scenarios (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          name VARCHAR(120) NOT NULL,
+          phase VARCHAR(30) NOT NULL DEFAULT 'arena',
+          type VARCHAR(30) NOT NULL DEFAULT 'neutral',
+          players INT NOT NULL DEFAULT 1,
+          text TEXT NOT NULL,
+          kills VARCHAR(50) NULL,
+          adult TINYINT(1) NOT NULL DEFAULT 0,
+          mix_with_normal TINYINT(1) NOT NULL DEFAULT 1,
+          active TINYINT(1) NOT NULL DEFAULT 1,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          INDEX idx_scenario_active_phase (active, phase, adult)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
+
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS hg_scenario_events (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          scenario_id INT NOT NULL,
+          phase VARCHAR(30) NOT NULL DEFAULT 'any',
+          type VARCHAR(30) NOT NULL DEFAULT 'neutral',
+          players INT NOT NULL DEFAULT 1,
+          text TEXT NOT NULL,
+          kills VARCHAR(50) NULL,
+          adult TINYINT(1) NOT NULL DEFAULT 0,
+          active TINYINT(1) NOT NULL DEFAULT 1,
+          sort_order INT NOT NULL DEFAULT 0,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          INDEX idx_scenario_event (scenario_id, active, phase, adult)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
+
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS hg_game_scenario_runs (
+          game_id INT NOT NULL,
+          scenario_id INT NOT NULL,
+          started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          completed_at DATETIME NULL,
+          PRIMARY KEY (game_id, scenario_id),
+          INDEX idx_scenario_run (scenario_id, completed_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
+
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS hg_scenario_usage (
+          game_id INT NOT NULL,
+          scenario_id INT NOT NULL,
+          event_id INT NOT NULL,
+          used_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (game_id, event_id),
+          INDEX idx_scenario_usage (game_id, scenario_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
+
       const [count] = await db.query("SELECT COUNT(*) AS total FROM hg_events");
       if (Number(count?.[0]?.total || 0) === 0) {
         await db.query("INSERT INTO hg_events (phase,type,players,text,kills,adult) VALUES ?", [DEFAULT_EVENTS.map(e => [e[0],e[1],e[2],e[3],e[4],e[5]])]);
@@ -791,7 +857,9 @@ async function start(channel) {
     const [players] = await db.query("SELECT * FROM hg_players WHERE game_id=?", [game.id]);
     if (players.length < 2) return "Precisa de pelo menos 2 participantes.";
     await db.query("UPDATE hg_players SET kills=0 WHERE game_id=?", [game.id]);
-    await db.query("UPDATE hg_games SET status='running',phase='bloodbath',day_number=1,winner=NULL WHERE id=? AND status='lobby'", [game.id]);
+    await db.query("DELETE FROM hg_scenario_usage WHERE game_id=?", [game.id]);
+    await db.query("DELETE FROM hg_game_scenario_runs WHERE game_id=?", [game.id]);
+    await db.query("UPDATE hg_games SET status='running',phase='bloodbath',day_number=1,winner=NULL,active_scenario_id=NULL WHERE id=? AND status='lobby'", [game.id]);
     await db.query("INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,'reaping',0,?,'')", [game.id, channel, `🎲 A arena começou com ${players.length} participantes.`]);
     return `🔥 Partida iniciada com ${players.length} participantes.`;
   });
@@ -875,11 +943,21 @@ async function alivePlayers(gameId) {
   return rows;
 }
 
+async function finishScenario(conn, gameId, scenarioId, channel, phase, day, scenarioName) {
+  await conn.query("UPDATE hg_games SET active_scenario_id=NULL WHERE id=? AND active_scenario_id=?", [gameId, scenarioId]);
+  await conn.query("UPDATE hg_game_scenario_runs SET completed_at=COALESCE(completed_at,CURRENT_TIMESTAMP) WHERE game_id=? AND scenario_id=?", [gameId, scenarioId]);
+  if (scenarioName) {
+    await conn.query(
+      "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,?,?,?,'')",
+      [gameId, channel, phase, day, `✅ O evento especial “${scenarioName}” terminou.`]
+    );
+  }
+}
+
 async function nextRound(channel) {
   return withChannelLock(channel, async (conn) => {
-    // Uma rodada inteira é gravada em uma única transação. Assim, o painel nunca
-    // enxerga o texto da morte sem enxergar também alive=0, e duas rodadas não
-    // conseguem usar a mesma lista antiga de participantes vivos.
+    // A rodada inteira usa uma transação e um bloqueio por canal. Mortes,
+    // eventos normais e eventos encadeados ficam sempre no mesmo estado.
     await conn.beginTransaction();
     try {
       const [games] = await conn.query(
@@ -915,11 +993,36 @@ async function nextRound(channel) {
       const day = Number(game.day_number || 1);
       const title = phaseName(phase, day);
       const phases = (phase === "day" || phase === "night") ? [phase, "arena"] : [phase];
-      const [events] = await conn.query(
-        `SELECT * FROM hg_events WHERE active=1 AND phase IN (${phases.map(() => "?").join(",")}) AND (adult=0 OR ?=1) ORDER BY RAND()`,
-        [...phases, Number(game.adult_mode) === 1 ? 1 : 0]
+      const phaseMarks = phases.map(() => "?").join(",");
+      const adultAllowed = Number(game.adult_mode) === 1 ? 1 : 0;
+
+      const [normalEvents] = await conn.query(
+        `SELECT e.*, 'normal' AS event_source, NULL AS scenario_id, NULL AS scenario_name
+         FROM hg_events e
+         WHERE e.active=1 AND e.phase IN (${phaseMarks}) AND (e.adult=0 OR ?=1)
+         ORDER BY RAND()`,
+        [...phases, adultAllowed]
       );
-      if (!events.length) {
+
+      // Um evento especial só pode começar uma vez em cada partida.
+      let scenarioTriggers = [];
+      if (!Number(game.active_scenario_id || 0)) {
+        const [rows] = await conn.query(
+          `SELECT s.id, s.phase, s.type, s.players, s.text, s.kills, s.adult,
+                  'scenario_trigger' AS event_source, s.id AS scenario_id,
+                  s.name AS scenario_name, s.mix_with_normal
+           FROM hg_scenarios s
+           LEFT JOIN hg_game_scenario_runs r
+             ON r.game_id=? AND r.scenario_id=s.id
+           WHERE s.active=1 AND r.scenario_id IS NULL
+             AND s.phase IN (${phaseMarks}) AND (s.adult=0 OR ?=1)
+           ORDER BY RAND()`,
+          [game.id, ...phases, adultAllowed]
+        );
+        scenarioTriggers = rows;
+      }
+
+      if (!normalEvents.length && !scenarioTriggers.length && !Number(game.active_scenario_id || 0)) {
         await conn.rollback();
         return "Sem eventos para essa fase.";
       }
@@ -930,8 +1033,10 @@ async function nextRound(channel) {
       );
 
       let available = shuffle(alive);
+      let activeScenarioId = Number(game.active_scenario_id || 0);
+      let allowScenarioTrigger = activeScenarioId === 0;
+
       while (available.length > 0) {
-        // Confirma novamente quem continua vivo antes de montar cada evento.
         const [aliveNow] = await conn.query(
           "SELECT id FROM hg_players WHERE game_id=? AND alive=1 FOR UPDATE",
           [game.id]
@@ -940,12 +1045,76 @@ async function nextRound(channel) {
         available = available.filter(p => aliveIds.has(Number(p.id)));
         if (aliveIds.size <= 1 || available.length === 0) break;
 
-        const possible = events.filter(ev => {
+        let pool = [];
+        let activeScenario = null;
+        let childEvents = [];
+
+        if (activeScenarioId) {
+          const [scenarioRows] = await conn.query(
+            "SELECT * FROM hg_scenarios WHERE id=? LIMIT 1",
+            [activeScenarioId]
+          );
+          activeScenario = scenarioRows[0] || null;
+
+          if (!activeScenario || !Number(activeScenario.active)) {
+            await finishScenario(conn, game.id, activeScenarioId, channel, phase, day, activeScenario?.name || "");
+            activeScenarioId = 0;
+            activeScenario = null;
+            allowScenarioTrigger = false;
+          } else {
+            const [children] = await conn.query(
+              `SELECT se.*, 'scenario_child' AS event_source, se.scenario_id,
+                      ? AS scenario_name
+               FROM hg_scenario_events se
+               LEFT JOIN hg_scenario_usage u
+                 ON u.game_id=? AND u.event_id=se.id
+               WHERE se.scenario_id=? AND se.active=1 AND u.event_id IS NULL
+                 AND (se.phase='any' OR se.phase IN (${phaseMarks}))
+                 AND (se.adult=0 OR ?=1)
+               ORDER BY se.sort_order ASC, RAND()`,
+              [activeScenario.name, game.id, activeScenarioId, ...phases, adultAllowed]
+            );
+            childEvents = children;
+
+            const [remainingRows] = await conn.query(
+              `SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN se.players<=? THEN 1 ELSE 0 END) AS usable
+               FROM hg_scenario_events se
+               LEFT JOIN hg_scenario_usage u
+                 ON u.game_id=? AND u.event_id=se.id
+               WHERE se.scenario_id=? AND se.active=1 AND u.event_id IS NULL
+                 AND (se.adult=0 OR ?=1)`,
+              [aliveIds.size, game.id, activeScenarioId, adultAllowed]
+            );
+            const remainingTotal = Number(remainingRows?.[0]?.total || 0);
+            const usableRemaining = Number(remainingRows?.[0]?.usable || 0);
+
+            if (remainingTotal === 0 || usableRemaining === 0) {
+              await finishScenario(conn, game.id, activeScenarioId, channel, phase, day, activeScenario.name);
+              activeScenarioId = 0;
+              activeScenario = null;
+              allowScenarioTrigger = false;
+            }
+          }
+        }
+
+        if (activeScenario) {
+          pool = Number(activeScenario.mix_with_normal)
+            ? [...normalEvents, ...childEvents]
+            : [...childEvents];
+
+          // No modo exclusivo, uma fase sem evento decorrente é pulada. Assim
+          // nenhum evento normal entra no meio da história especial.
+          if (!pool.length && !Number(activeScenario.mix_with_normal)) break;
+        } else {
+          pool = [...normalEvents];
+          if (allowScenarioTrigger) pool.push(...scenarioTriggers);
+        }
+
+        const possible = pool.filter(ev => {
           const participantCount = Number(ev.players || 1);
           if (participantCount > available.length) return false;
           const configuredDeaths = validEventKillIndexes(ev);
-          // Um evento marcado como Morte sem indicar p1/p2/etc. é ignorado para
-          // não narrar uma morte que não altera o estado do participante.
           if (String(ev.type || "").toLowerCase() === "death" && configuredDeaths.length === 0) return false;
           return true;
         });
@@ -959,16 +1128,12 @@ async function nextRound(channel) {
         const count = Math.max(1, Math.min(Number(ev.players || 1), available.length));
         const group = available.splice(0, count);
 
-        // Remove índices repetidos ou inválidos para a mesma pessoa não "morrer"
-        // duas vezes no mesmo evento.
         const deathMap = new Map();
         for (const idx of validEventKillIndexes(ev)) {
           const person = group[idx];
           if (person && aliveIds.has(Number(person.id))) deathMap.set(Number(person.id), person);
         }
         let deaths = [...deathMap.values()];
-
-        // A rodada nunca elimina todos ao mesmo tempo; preserva ao menos um vencedor.
         if (aliveIds.size - deaths.length < 1) {
           deaths = deaths.slice(0, Math.max(0, aliveIds.size - 1));
         }
@@ -982,8 +1147,6 @@ async function nextRound(channel) {
           if (deadUpdate.affectedRows === 1) confirmedDeaths.push(dead);
         }
 
-        // Se um evento de morte não conseguiu confirmar a morte, ele não é salvo
-        // como se tivesse matado alguém. Isso impede texto e estado de divergirem.
         const expectedDeath = validEventKillIndexes(ev).length > 0;
         if (expectedDeath && deaths.length > 0 && confirmedDeaths.length !== deaths.length) {
           throw new Error("A morte do evento não pôde ser confirmada; a rodada foi cancelada para evitar reviver participante.");
@@ -1004,6 +1167,37 @@ async function nextRound(channel) {
           "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,?,?,?,?)",
           [game.id, channel, phase, day, text, confirmedDeathNames.join(", ")]
         );
+
+        if (ev.event_source === "scenario_trigger") {
+          const scenarioId = Number(ev.scenario_id || ev.id);
+          await conn.query(
+            "INSERT IGNORE INTO hg_game_scenario_runs (game_id,scenario_id) VALUES (?,?)",
+            [game.id, scenarioId]
+          );
+          await conn.query("UPDATE hg_games SET active_scenario_id=? WHERE id=?", [scenarioId, game.id]);
+          activeScenarioId = scenarioId;
+          allowScenarioTrigger = false;
+        } else if (ev.event_source === "scenario_child") {
+          await conn.query(
+            "INSERT IGNORE INTO hg_scenario_usage (game_id,scenario_id,event_id) VALUES (?,?,?)",
+            [game.id, Number(ev.scenario_id), Number(ev.id)]
+          );
+
+          const [remaining] = await conn.query(
+            `SELECT COUNT(*) AS total
+             FROM hg_scenario_events se
+             LEFT JOIN hg_scenario_usage u
+               ON u.game_id=? AND u.event_id=se.id
+             WHERE se.scenario_id=? AND se.active=1 AND u.event_id IS NULL
+               AND (se.adult=0 OR ?=1)`,
+            [game.id, Number(ev.scenario_id), adultAllowed]
+          );
+          if (Number(remaining?.[0]?.total || 0) === 0) {
+            await finishScenario(conn, game.id, Number(ev.scenario_id), channel, phase, day, ev.scenario_name || "");
+            activeScenarioId = 0;
+            allowScenarioTrigger = false;
+          }
+        }
       }
 
       [alive] = await conn.query(
@@ -1202,6 +1396,134 @@ async function adminAction(req, res) {
       return send(res, activeFlag ? "✅ Evento ativado." : "⛔ Evento desativado.");
     }
 
+    if (action === "add_scenario") {
+      await ensureTables();
+      const db = await getPool();
+      const name = String(req.body?.name || "").trim().slice(0, 120);
+      const phase = String(req.body?.phase || "arena").trim();
+      const type = String(req.body?.type || "neutral").trim();
+      const players = Math.max(1, Math.min(4, Number(req.body?.players || 1)));
+      const text = String(req.body?.text || "").trim();
+      const kills = String(req.body?.kills || "").trim();
+      const adultFlag = String(req.body?.adult ?? "0") === "1" ? 1 : 0;
+      const mixFlag = String(req.body?.mix_with_normal ?? "1") === "1" ? 1 : 0;
+      const activeFlag = String(req.body?.active ?? "1") === "1" ? 1 : 0;
+      if (!name) return send(res, "Faltou o nome do evento especial.");
+      if (!text) return send(res, "Faltou o texto que inicia o evento especial.");
+      const deathConfigError = validateEventDeathConfig(type, players, kills);
+      if (deathConfigError) return send(res, deathConfigError);
+      const [result] = await db.query(
+        "INSERT INTO hg_scenarios (name,phase,type,players,text,kills,adult,mix_with_normal,active) VALUES (?,?,?,?,?,?,?,?,?)",
+        [name, phase, type, players, text, kills, adultFlag, mixFlag, activeFlag]
+      );
+      return send(res, `✅ Evento especial criado. Abra a seta para adicionar os eventos decorrentes. ID ${result.insertId}.`);
+    }
+
+    if (action === "update_scenario") {
+      await ensureTables();
+      const db = await getPool();
+      const id = Number(req.body?.id || 0);
+      const name = String(req.body?.name || "").trim().slice(0, 120);
+      const phase = String(req.body?.phase || "arena").trim();
+      const type = String(req.body?.type || "neutral").trim();
+      const players = Math.max(1, Math.min(4, Number(req.body?.players || 1)));
+      const text = String(req.body?.text || "").trim();
+      const kills = String(req.body?.kills || "").trim();
+      const adultFlag = String(req.body?.adult ?? "0") === "1" ? 1 : 0;
+      const mixFlag = String(req.body?.mix_with_normal ?? "1") === "1" ? 1 : 0;
+      const activeFlag = String(req.body?.active ?? "1") === "1" ? 1 : 0;
+      if (!id) return send(res, "ID inválido.");
+      if (!name || !text) return send(res, "Preencha o nome e o texto inicial.");
+      const deathConfigError = validateEventDeathConfig(type, players, kills);
+      if (deathConfigError) return send(res, deathConfigError);
+      await db.query(
+        "UPDATE hg_scenarios SET name=?,phase=?,type=?,players=?,text=?,kills=?,adult=?,mix_with_normal=?,active=? WHERE id=?",
+        [name, phase, type, players, text, kills, adultFlag, mixFlag, activeFlag, id]
+      );
+      if (!activeFlag) await db.query("UPDATE hg_games SET active_scenario_id=NULL WHERE active_scenario_id=?", [id]);
+      return send(res, "✅ Evento especial atualizado.");
+    }
+
+    if (action === "delete_scenario") {
+      await ensureTables();
+      const db = await getPool();
+      const id = Number(req.body?.id || 0);
+      if (!id) return send(res, "ID inválido.");
+      const conn = await db.getConnection();
+      try {
+        await conn.beginTransaction();
+        await conn.query("UPDATE hg_games SET active_scenario_id=NULL WHERE active_scenario_id=?", [id]);
+        await conn.query("DELETE FROM hg_scenario_usage WHERE scenario_id=?", [id]);
+        await conn.query("DELETE FROM hg_game_scenario_runs WHERE scenario_id=?", [id]);
+        await conn.query("DELETE FROM hg_scenario_events WHERE scenario_id=?", [id]);
+        await conn.query("DELETE FROM hg_scenarios WHERE id=?", [id]);
+        await conn.commit();
+      } catch (e) {
+        try { await conn.rollback(); } catch {}
+        throw e;
+      } finally {
+        conn.release();
+      }
+      return send(res, "🗑️ Evento especial e seus eventos decorrentes foram excluídos.");
+    }
+
+    if (action === "add_scenario_event") {
+      await ensureTables();
+      const db = await getPool();
+      const scenarioId = Number(req.body?.scenario_id || 0);
+      const phase = String(req.body?.phase || "any").trim();
+      const type = String(req.body?.type || "neutral").trim();
+      const players = Math.max(1, Math.min(4, Number(req.body?.players || 1)));
+      const text = String(req.body?.text || "").trim();
+      const kills = String(req.body?.kills || "").trim();
+      const adultFlag = String(req.body?.adult ?? "0") === "1" ? 1 : 0;
+      const activeFlag = String(req.body?.active ?? "1") === "1" ? 1 : 0;
+      if (!scenarioId) return send(res, "Evento especial inválido.");
+      if (!text) return send(res, "Faltou o texto do evento decorrente.");
+      const deathConfigError = validateEventDeathConfig(type, players, kills);
+      if (deathConfigError) return send(res, deathConfigError);
+      const [exists] = await db.query("SELECT id FROM hg_scenarios WHERE id=? LIMIT 1", [scenarioId]);
+      if (!exists.length) return send(res, "Evento especial não encontrado.");
+      const [ord] = await db.query("SELECT COALESCE(MAX(sort_order),0)+1 AS next_order FROM hg_scenario_events WHERE scenario_id=?", [scenarioId]);
+      await db.query(
+        "INSERT INTO hg_scenario_events (scenario_id,phase,type,players,text,kills,adult,active,sort_order) VALUES (?,?,?,?,?,?,?,?,?)",
+        [scenarioId, phase, type, players, text, kills, adultFlag, activeFlag, Number(ord?.[0]?.next_order || 1)]
+      );
+      return send(res, "✅ Evento decorrente adicionado.");
+    }
+
+    if (action === "update_scenario_event") {
+      await ensureTables();
+      const db = await getPool();
+      const id = Number(req.body?.id || 0);
+      const phase = String(req.body?.phase || "any").trim();
+      const type = String(req.body?.type || "neutral").trim();
+      const players = Math.max(1, Math.min(4, Number(req.body?.players || 1)));
+      const text = String(req.body?.text || "").trim();
+      const kills = String(req.body?.kills || "").trim();
+      const adultFlag = String(req.body?.adult ?? "0") === "1" ? 1 : 0;
+      const activeFlag = String(req.body?.active ?? "1") === "1" ? 1 : 0;
+      if (!id) return send(res, "ID inválido.");
+      if (!text) return send(res, "Faltou o texto do evento decorrente.");
+      const deathConfigError = validateEventDeathConfig(type, players, kills);
+      if (deathConfigError) return send(res, deathConfigError);
+      await db.query(
+        "UPDATE hg_scenario_events SET phase=?,type=?,players=?,text=?,kills=?,adult=?,active=? WHERE id=?",
+        [phase, type, players, text, kills, adultFlag, activeFlag, id]
+      );
+      return send(res, "✅ Evento decorrente atualizado.");
+    }
+
+    if (action === "delete_scenario_event") {
+      await ensureTables();
+      const db = await getPool();
+      const id = Number(req.body?.id || 0);
+      if (!id) return send(res, "ID inválido.");
+      await db.query("DELETE FROM hg_scenario_usage WHERE event_id=?", [id]);
+      await db.query("DELETE FROM hg_scenario_events WHERE id=?", [id]);
+      return send(res, "🗑️ Evento decorrente excluído.");
+    }
+
     return send(res, "Ação inválida.");
   } catch (e) {
     console.error(e);
@@ -1233,7 +1555,18 @@ async function state(req, res) {
     const [logs] = game
       ? await conn.query("SELECT * FROM hg_logs WHERE game_id=? ORDER BY id DESC LIMIT 150", [game.id])
       : [[]];
-    const [events] = await conn.query("SELECT COUNT(*) total, SUM(adult=1) adultTotal FROM hg_events WHERE active=1");
+    const [events] = await conn.query(`
+      SELECT
+        (SELECT COUNT(*) FROM hg_events WHERE active=1) +
+        (SELECT COUNT(*) FROM hg_scenarios WHERE active=1) +
+        (SELECT COUNT(*) FROM hg_scenario_events se JOIN hg_scenarios sc ON sc.id=se.scenario_id WHERE se.active=1 AND sc.active=1) AS total,
+        (SELECT COUNT(*) FROM hg_events WHERE active=1 AND adult=1) +
+        (SELECT COUNT(*) FROM hg_scenarios WHERE active=1 AND adult=1) +
+        (SELECT COUNT(*) FROM hg_scenario_events se JOIN hg_scenarios sc ON sc.id=se.scenario_id WHERE se.active=1 AND sc.active=1 AND se.adult=1) AS adultTotal
+    `);
+    const [activeScenarioRows] = game?.active_scenario_id
+      ? await conn.query("SELECT id,name,mix_with_normal FROM hg_scenarios WHERE id=? LIMIT 1", [game.active_scenario_id])
+      : [[]];
     await conn.commit();
 
     res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
@@ -1244,6 +1577,7 @@ async function state(req, res) {
       logs: logs.reverse(),
       eventCount: Number(events?.[0]?.total || 0),
       adultEventCount: Number(events?.[0]?.adultTotal || 0),
+      activeScenario: activeScenarioRows?.[0] || null,
       autoRunning: isAutoRunning(ch),
       autoIntervalMs: getAutoIntervalMs()
     });
@@ -1293,15 +1627,22 @@ body.hg-running .event-person .event-name,
 .event-person{font-size:0!important;line-height:0!important}
 .event-person img,.event-person .avatar,.event-person .fake{font-size:16px!important;line-height:normal!important}
 
+.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{display:grid;grid-template-columns:1.25fr 1fr .7fr 1.4fr .8fr;gap:8px;margin-top:12px}.scenario-card{border:1px solid var(--b);background:#10101a;border-radius:20px;overflow:hidden}.scenario-head{display:flex;align-items:center;gap:10px;padding:14px;cursor:pointer;background:#171726}.scenario-arrow{width:42px;min-width:42px;padding:9px;background:#303044}.scenario-title{flex:1}.scenario-body{padding:14px;border-top:1px solid var(--b)}.scenario-body.collapsed{display:none}.scenario-flags{display:flex;gap:8px;flex-wrap:wrap}.flag{font-size:11px;font-weight:950;border:1px solid var(--b);border-radius:999px;padding:5px 8px;color:#ddd6fe}.switch-row{display:flex;align-items:center;gap:10px;border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:10px 12px}.switch-row input{width:20px;height:20px;accent-color:var(--p)}.child-list{display:flex;flex-direction:column;gap:10px;margin-top:12px}.child-card{border:1px solid var(--b);border-radius:16px;padding:12px;background:#0d0d16}.scenario-help{border-left:4px solid var(--p);padding:10px 12px;background:#1b1026;border-radius:10px;margin:10px 0}.wide-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}@media(max-width:900px){.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{grid-template-columns:1fr 1fr}.scenario-create-grid textarea,.scenario-edit-grid textarea,.child-edit-grid textarea,.span-all{grid-column:1/-1}}
 </style></head><body><div class="wrap"><div class="top"><div><h1>Hunger Games da Live</h1><div class="sub">Participantes do chat, distritos, eventos, mortes e vencedor final.</div></div><div class="pill" id="statusPill">Carregando...</div></div>
 <div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div></div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar automático</button><button class="danger" onclick="act('reset')">Resetar</button><button class="secondary" onclick="act('adult_on')">Ligar +18</button><button class="secondary" onclick="act('adult_off')">Desligar +18</button><button class="secondary" onclick="act('add_all_chat')">Adicionar todos do chat</button><button class="secondary" onclick="seedAdultHeavy()">Adicionar +18 pesado</button></div>` : ``}</div>
 ${admin ? `<div class="two" style="margin:16px 0"><input id="manualName" placeholder="Adicionar participante manual"/><input id="manualDistrict" placeholder="Distrito" type="number" min="1" max="12"/><button style="grid-column:1/-1" onclick="addPlayer()">Adicionar participante</button></div>` : ``}
 <div id="participantsBox" class="lobby-only"><h2>Participantes</h2><div class="players" id="players"></div></div></section><aside class="card events-card"><h2 class="events-title">Eventos</h2><div class="logs" id="logs"></div></aside></div>
-${admin ? `<section class="card" style="margin-top:18px"><h2>Adicionar evento próprio</h2><div class="small">Use {p1}, {p2}, {p3}, {p4}. Para matar alguém, coloque em Mortes: p2 ou p1,p3.</div><div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px"><select id="evPhase"><option value="bloodbath">Cornucópia</option><option value="day">Dia</option><option value="night">Noite</option><option value="feast">Banquete</option><option value="arena">Evento da arena</option></select><select id="evType"><option value="neutral">Neutro</option><option value="death">Morte</option><option value="item">Item</option><option value="alliance">Aliança</option><option value="adult">Adulto</option></select><input id="evPlayers" type="number" min="1" max="4" value="1"/><input id="evKills" placeholder="Mortes: p2"/><select id="evAdult"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="evText" placeholder="{p1} faz alguma coisa com {p2}."></textarea><button onclick="addEvent()">Salvar evento</button><hr style="border-color:var(--b);margin:24px 0"><div class="top"><div><h2>Editar eventos existentes</h2><div class="small">Aqui edita, desativa ou exclui os eventos que já estão cadastrados.</div></div><button class="secondary" onclick="loadEvents()">Recarregar eventos</button></div><div id="eventsEditor" style="display:flex;flex-direction:column;gap:12px;margin-top:14px"></div></section>` : ``}</div>
+${admin ? `<section class="card" style="margin-top:18px"><h2>Adicionar evento próprio</h2><div class="small">Use {p1}, {p2}, {p3}, {p4}. Para matar alguém, coloque em Mortes: p2 ou p1,p3.</div><div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px"><select id="evPhase"><option value="bloodbath">Cornucópia</option><option value="day">Dia</option><option value="night">Noite</option><option value="feast">Banquete</option><option value="arena">Evento da arena</option></select><select id="evType"><option value="neutral">Neutro</option><option value="death">Morte</option><option value="item">Item</option><option value="alliance">Aliança</option><option value="adult">Adulto</option></select><input id="evPlayers" type="number" min="1" max="4" value="1"/><input id="evKills" placeholder="Mortes: p2"/><select id="evAdult"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="evText" placeholder="{p1} faz alguma coisa com {p2}."></textarea><button onclick="addEvent()">Salvar evento</button><hr style="border-color:var(--b);margin:24px 0"><div class="top"><div><h2>Editar eventos existentes</h2><div class="small">Aqui edita, desativa ou exclui os eventos que já estão cadastrados.</div></div><button class="secondary" onclick="loadEvents()">Recarregar eventos</button></div><div id="eventsEditor" style="display:flex;flex-direction:column;gap:12px;margin-top:14px"></div></section>
+<section class="card" style="margin-top:18px"><h2>Eventos especiais com consequências</h2><div class="scenario-help"><b>Exemplo:</b> “Um ET invade a arena”. Depois de criar, abra a seta do evento para cadastrar tudo o que pode acontecer por causa dessa invasão.</div><div class="small">A chave de mistura decide se os eventos decorrentes aparecem junto com os eventos normais. Desligada, enquanto esse evento especial estiver ativo, o jogo usa somente os eventos cadastrados dentro dele.</div>
+<input id="scName" style="margin-top:12px" placeholder="Nome do evento especial: Invasão alienígena"/>
+<div class="scenario-create-grid"><select id="scPhase"><option value="bloodbath">Cornucópia</option><option value="day">Dia</option><option value="night">Noite</option><option value="feast">Banquete</option><option value="arena" selected>Evento da arena</option></select><select id="scType"><option value="neutral">Neutro</option><option value="death">Morte</option><option value="item">Item</option><option value="alliance">Aliança</option><option value="adult">Adulto</option></select><input id="scPlayers" type="number" min="1" max="4" value="1"/><input id="scKills" placeholder="Mortes: p2"/><select id="scAdult"><option value="0">Normal</option><option value="1">+18</option></select></div>
+<textarea id="scText" placeholder="Um ET invade a arena e {p1} vê a nave pousar."></textarea>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px"><label class="switch-row"><input id="scMix" type="checkbox" checked/><span><b>Misturar com eventos normais</b><br><span class="small">Desligue para usar somente os eventos decorrentes.</span></span></label><label class="switch-row"><input id="scActive" type="checkbox" checked/><span><b>Evento especial ativo</b><br><span class="small">Desligue para impedir que ele seja sorteado.</span></span></label></div>
+<button style="margin-top:10px" onclick="addScenario()">Criar evento especial</button><hr style="border-color:var(--b);margin:24px 0"><div class="top"><div><h2>Editar eventos especiais</h2><div class="small">Clique na seta para expandir ou encolher e editar os eventos internos.</div></div><button class="secondary" onclick="loadScenarios()">Recarregar especiais</button></div><div id="scenariosEditor" style="display:flex;flex-direction:column;gap:12px;margin-top:14px"></div></section>` : ``}</div>
 <script>
 const params=new URLSearchParams(location.search),channel=params.get("channel")||"icarolinaporto",token=params.get("token")||"",admin=${admin?"true":"false"};
 const statusLabels={lobby:"AGUARDANDO",running:"EM ANDAMENTO",ended:"ENCERRADA",archived:"ARQUIVADA"};
-const phaseLabels={bloodbath:"Cornucópia",day:"Dia",night:"Noite",feast:"Banquete",arena:"Evento da arena",reaping:"Início da arena",winner:"Vencedor"};
+const phaseLabels={any:"Qualquer fase",bloodbath:"Cornucópia",day:"Dia",night:"Noite",feast:"Banquete",arena:"Evento da arena",reaping:"Início da arena",winner:"Vencedor"};
 const typeLabels={neutral:"Neutro",death:"Morte",item:"Item",alliance:"Aliança",adult:"Adulto"};
 function phaseLabel(phase,day){const p=phaseLabels[phase]||phase||"Arena";if(["day","night","feast"].includes(phase))return p+" "+(day||1);return p}
 function typeLabel(type){return typeLabels[type]||type||"Neutro"}
@@ -1314,7 +1655,7 @@ async function load(){
   if(loadInProgress){loadAgain=true;return}
   loadInProgress=true;
   try{
-    const st=await api("/hg/state"),g=st.game||{};document.body.classList.toggle("hg-running",!admin&&(g.status==="running"||g.status==="ended"));document.getElementById("statusPill").textContent=(statusLabels[g.status]||"AGUARDANDO")+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=phaseLabel(g.phase||"bloodbath",g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida rolando":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Aguardando participantes";const alive=st.players.filter(p=>p.alive).length;document.getElementById("counts").textContent=st.players.length+" participantes • "+alive+" vivos • "+st.eventCount+" eventos"+(st.autoRunning?" • automático ligado":"");
+    const st=await api("/hg/state"),g=st.game||{};document.body.classList.toggle("hg-running",!admin&&(g.status==="running"||g.status==="ended"));document.getElementById("statusPill").textContent=(statusLabels[g.status]||"AGUARDANDO")+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=phaseLabel(g.phase||"bloodbath",g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida rolando":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Aguardando participantes";const alive=st.players.filter(p=>p.alive).length;document.getElementById("counts").textContent=st.players.length+" participantes • "+alive+" vivos • "+st.eventCount+" eventos"+(st.activeScenario?" • Especial: "+st.activeScenario.name:"")+(st.autoRunning?" • automático ligado":"");
 const box=document.getElementById("participantsBox");if(box)box.classList.toggle("hidden",g.status==="running");
 document.getElementById("players").innerHTML=st.players.map(p=>{const av=avatarHtml(p);return '<div class="player '+(p.alive?'':'dead')+'">'+av+'<div><div class="district">Distrito '+p.district+'</div><div class="name">'+esc(p.display_name)+'</div><div class="kills">'+(p.kills||0)+' abate(s) '+(p.alive?'🟢':'💀')+'</div></div></div>'}).join("")||"<div class='small'>Ninguém entrou ainda.</div>";
 document.getElementById("logs").innerHTML=st.logs.map(l=>{const ps=mentionedPlayers(l.text,st.players);const avs=ps.length?'<div class="event-avatars">'+ps.map(p=>'<div class="event-person">'+avatarHtml(p,"avatar")+'</div>').join("")+'</div>':'';return '<div class="log '+(l.deaths?'death':'')+'"><div class="phase">'+esc(phaseLabel(l.phase,l.day_number))+'</div>'+avs+'<div class="event-text">'+esc(l.text)+'</div>'+(l.deaths?'<div class="small">Mortes: '+esc(l.deaths)+'</div>':'')+'</div>'}).join("")||"<div class='small'>Sem eventos ainda.</div>";document.querySelectorAll(".event-name").forEach(e=>e.remove())  }finally{
@@ -1331,7 +1672,20 @@ function eventRow(e){return '<div class="log" style="max-width:none;margin:0"><d
 async function loadEvents(){if(!admin)return;const box=document.getElementById("eventsEditor");if(!box)return;box.innerHTML="<div class='small'>Carregando eventos...</div>";const evs=await api("/hg/events");if(!Array.isArray(evs)){box.innerHTML="<div class='small'>Erro ao carregar eventos.</div>";return}box.innerHTML=evs.map(eventRow).join("")||"<div class='small'>Sem eventos cadastrados.</div>"}
 async function saveEvent(id){const body={action:"update_event",id,phase:document.getElementById("phase_"+id).value,type:document.getElementById("type_"+id).value,players:document.getElementById("players_"+id).value,kills:document.getElementById("kills_"+id).value,adult:document.getElementById("adult_"+id).value,active:document.getElementById("active_"+id).value,text:document.getElementById("text_"+id).value};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);loadEvents();load()}
 async function deleteEvent(id){if(!confirm("Excluir este evento?"))return;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"delete_event",id})});alert(t);loadEvents();load()}
-load();if(admin)loadEvents();setInterval(load,2500);
+const openScenarios=new Set();
+function phaseOptions(value,allowAny=false){const items=[];if(allowAny)items.push(["any","Qualquer fase"]);items.push(["bloodbath","Cornucópia"],["day","Dia"],["night","Noite"],["feast","Banquete"],["arena","Evento da arena"]);return items.map(x=>'<option value="'+x[0]+'" '+(value===x[0]?"selected":"")+'>'+x[1]+'</option>').join("")}
+function typeOptions(value){return [["neutral","Neutro"],["death","Morte"],["item","Item"],["alliance","Aliança"],["adult","Adulto"]].map(x=>'<option value="'+x[0]+'" '+(value===x[0]?"selected":"")+'>'+x[1]+'</option>').join("")}
+function toggleScenario(id){const body=document.getElementById("scenario_body_"+id),arrow=document.getElementById("scenario_arrow_"+id);if(!body)return;const opening=body.classList.contains("collapsed");body.classList.toggle("collapsed",!opening);arrow.textContent=opening?"▼":"▶";if(opening)openScenarios.add(id);else openScenarios.delete(id)}
+async function addScenario(){const g=id=>document.getElementById(id);const body={action:"add_scenario",name:g("scName").value,phase:g("scPhase").value,type:g("scType").value,players:g("scPlayers").value,kills:g("scKills").value,adult:g("scAdult").value,text:g("scText").value,mix_with_normal:g("scMix").checked?"1":"0",active:g("scActive").checked?"1":"0"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);if(String(t).startsWith("✅")){g("scName").value="";g("scText").value=""}await loadScenarios();load()}
+function scenarioChildRow(c,sid){return '<div class="child-card"><div class="phase">EVENTO DECORRENTE ID '+c.id+' • '+esc(phaseLabels[c.phase]||c.phase)+' • '+esc(typeLabel(c.type))+' • '+(c.active?"Ativo":"Desativado")+'</div><div class="child-edit-grid"><select id="sce_phase_'+c.id+'">'+phaseOptions(c.phase,true)+'</select><select id="sce_type_'+c.id+'">'+typeOptions(c.type)+'</select><input id="sce_players_'+c.id+'" type="number" min="1" max="4" value="'+esc(c.players)+'"><input id="sce_kills_'+c.id+'" placeholder="Mortes: p2" value="'+esc(c.kills||"")+'"><select id="sce_adult_'+c.id+'"><option value="0" '+(!c.adult?"selected":"")+'>Normal</option><option value="1" '+(c.adult?"selected":"")+'>+18</option></select></div><textarea id="sce_text_'+c.id+'">'+esc(c.text)+'</textarea><div class="wide-actions"><label class="switch-row"><input id="sce_active_'+c.id+'" type="checkbox" '+(c.active?"checked":"")+'><span>Evento decorrente ativo</span></label><button onclick="saveScenarioEvent('+c.id+','+sid+')">Salvar evento interno</button><button class="danger" onclick="deleteScenarioEvent('+c.id+','+sid+')">Excluir</button></div></div>'}
+function scenarioRow(s){const opened=openScenarios.has(Number(s.id));const children=(s.events||[]).map(c=>scenarioChildRow(c,s.id)).join("")||'<div class="small">Nenhum evento decorrente criado. Use o formulário abaixo.</div>';return '<div class="scenario-card"><div class="scenario-head" onclick="toggleScenario('+s.id+')"><button class="scenario-arrow" id="scenario_arrow_'+s.id+'">'+(opened?"▼":"▶")+'</button><div class="scenario-title"><div style="font-weight:950;font-size:17px">'+esc(s.name)+'</div><div class="scenario-flags"><span class="flag">ID '+s.id+'</span><span class="flag">'+esc(phaseLabels[s.phase]||s.phase)+'</span><span class="flag">'+(s.mix_with_normal?"Mistura com normais":"Somente este especial")+'</span><span class="flag">'+(s.active?"Ativo":"Desativado")+'</span><span class="flag">'+(s.events||[]).length+' decorrente(s)</span></div></div></div><div id="scenario_body_'+s.id+'" class="scenario-body '+(opened?"":"collapsed")+'"><input id="sc_name_'+s.id+'" value="'+esc(s.name)+'"><div class="scenario-edit-grid"><select id="sc_phase_'+s.id+'">'+phaseOptions(s.phase,false)+'</select><select id="sc_type_'+s.id+'">'+typeOptions(s.type)+'</select><input id="sc_players_'+s.id+'" type="number" min="1" max="4" value="'+esc(s.players)+'"><input id="sc_kills_'+s.id+'" placeholder="Mortes: p2" value="'+esc(s.kills||"")+'"><select id="sc_adult_'+s.id+'"><option value="0" '+(!s.adult?"selected":"")+'>Normal</option><option value="1" '+(s.adult?"selected":"")+'>+18</option></select></div><textarea id="sc_text_'+s.id+'">'+esc(s.text)+'</textarea><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><label class="switch-row"><input id="sc_mix_'+s.id+'" type="checkbox" '+(s.mix_with_normal?"checked":"")+'><span><b>Misturar com eventos normais</b><br><span class="small">Desligado: somente os eventos internos.</span></span></label><label class="switch-row"><input id="sc_active_'+s.id+'" type="checkbox" '+(s.active?"checked":"")+'><span><b>Evento especial ativo</b><br><span class="small">Controla se o início pode ser sorteado.</span></span></label></div><div class="wide-actions"><button onclick="saveScenario('+s.id+')">Salvar evento especial</button><button class="danger" onclick="deleteScenario('+s.id+')">Excluir tudo</button></div><hr style="border-color:var(--b);margin:18px 0"><h3>Adicionar evento decorrente</h3><div class="small">“Qualquer fase” é recomendado para a história continuar sem ficar esperando Dia ou Noite.</div><div class="child-edit-grid"><select id="new_sce_phase_'+s.id+'">'+phaseOptions("any",true)+'</select><select id="new_sce_type_'+s.id+'">'+typeOptions("neutral")+'</select><input id="new_sce_players_'+s.id+'" type="number" min="1" max="4" value="1"><input id="new_sce_kills_'+s.id+'" placeholder="Mortes: p2"><select id="new_sce_adult_'+s.id+'"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="new_sce_text_'+s.id+'" placeholder="{p1} tenta conversar com o ET."></textarea><button onclick="addScenarioEvent('+s.id+')">Adicionar dentro deste evento especial</button><hr style="border-color:var(--b);margin:18px 0"><h3>Eventos decorrentes cadastrados</h3><div class="child-list">'+children+'</div></div></div>'}
+async function loadScenarios(){if(!admin)return;const box=document.getElementById("scenariosEditor");if(!box)return;box.innerHTML="<div class='small'>Carregando eventos especiais...</div>";const rows=await api("/hg/scenarios");if(!Array.isArray(rows)){box.innerHTML="<div class='small'>Erro ao carregar eventos especiais.</div>";return}box.innerHTML=rows.map(scenarioRow).join("")||"<div class='small'>Nenhum evento especial criado.</div>"}
+async function saveScenario(id){const body={action:"update_scenario",id,name:document.getElementById("sc_name_"+id).value,phase:document.getElementById("sc_phase_"+id).value,type:document.getElementById("sc_type_"+id).value,players:document.getElementById("sc_players_"+id).value,kills:document.getElementById("sc_kills_"+id).value,adult:document.getElementById("sc_adult_"+id).value,text:document.getElementById("sc_text_"+id).value,mix_with_normal:document.getElementById("sc_mix_"+id).checked?"1":"0",active:document.getElementById("sc_active_"+id).checked?"1":"0"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);openScenarios.add(Number(id));loadScenarios();load()}
+async function deleteScenario(id){if(!confirm("Excluir este evento especial e TODOS os eventos que estão dentro dele?"))return;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"delete_scenario",id})});alert(t);openScenarios.delete(Number(id));loadScenarios();load()}
+async function addScenarioEvent(id){const body={action:"add_scenario_event",scenario_id:id,phase:document.getElementById("new_sce_phase_"+id).value,type:document.getElementById("new_sce_type_"+id).value,players:document.getElementById("new_sce_players_"+id).value,kills:document.getElementById("new_sce_kills_"+id).value,adult:document.getElementById("new_sce_adult_"+id).value,text:document.getElementById("new_sce_text_"+id).value,active:"1"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);openScenarios.add(Number(id));loadScenarios();load()}
+async function saveScenarioEvent(id,sid){const body={action:"update_scenario_event",id,phase:document.getElementById("sce_phase_"+id).value,type:document.getElementById("sce_type_"+id).value,players:document.getElementById("sce_players_"+id).value,kills:document.getElementById("sce_kills_"+id).value,adult:document.getElementById("sce_adult_"+id).value,text:document.getElementById("sce_text_"+id).value,active:document.getElementById("sce_active_"+id).checked?"1":"0"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);openScenarios.add(Number(sid));loadScenarios();load()}
+async function deleteScenarioEvent(id,sid){if(!confirm("Excluir este evento decorrente?"))return;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"delete_scenario_event",id})});alert(t);openScenarios.add(Number(sid));loadScenarios();load()}
+load();if(admin){loadEvents();loadScenarios()}setInterval(load,2500);
 </script></body></html>`;
 }
 
@@ -1351,6 +1705,28 @@ app.get("/hg/events", async (req, res) => {
     const db = await getPool();
     const [rows] = await db.query("SELECT * FROM hg_events ORDER BY phase ASC, adult ASC, id ASC");
     res.json(rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/hg/scenarios", async (req, res) => {
+  try {
+    if (!checkBase(req, res)) return;
+    await ensureTables();
+    const db = await getPool();
+    const [scenarios] = await db.query("SELECT * FROM hg_scenarios ORDER BY active DESC, id DESC");
+    const [children] = scenarios.length
+      ? await db.query("SELECT * FROM hg_scenario_events ORDER BY scenario_id ASC, sort_order ASC, id ASC")
+      : [[]];
+    const byScenario = new Map();
+    for (const child of children) {
+      const list = byScenario.get(Number(child.scenario_id)) || [];
+      list.push(child);
+      byScenario.set(Number(child.scenario_id), list);
+    }
+    res.json(scenarios.map(row => ({ ...row, events: byScenario.get(Number(row.id)) || [] })));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
