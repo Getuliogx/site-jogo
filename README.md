@@ -1,47 +1,85 @@
-# Hunger Games da Live — versão 4.0.0
+# Hunger Games da Live — versão 5.0.0
 
-Esta versão mantém o mesmo banco de dados e não apaga os eventos já cadastrados.
+Esta versão mantém o mesmo banco de dados. Ela não apaga os eventos normais, histórias, participantes ou configurações já cadastradas.
 
-## Novidade: eventos especiais com consequências
+## Modo História no início do painel
 
-O administrador pode criar um evento principal, por exemplo:
+O editor de histórias agora aparece logo abaixo da área principal do jogo, antes do editor de eventos normais.
+
+Cada história possui:
+
+- uma introdução;
+- vários eventos decorrentes dentro dela;
+- seta para expandir ou encolher;
+- chave para misturar com eventos normais;
+- chave para ativar ou desativar a história inteira;
+- ativação separada de cada evento interno.
+
+Exemplo de introdução:
 
 ```txt
-Um ET invade a arena e {p1} vê a nave pousar.
+Um ET invade a arena diante de {p}.
 ```
 
-Depois de salvar, clique na seta do evento especial para expandir e cadastrar os eventos decorrentes, como:
+## Opção Todos
+
+Na seleção de participantes existe agora a opção **Todos**, no lugar de precisar digitar um número especial.
+
+Ela está disponível em:
+
+- introdução da história;
+- eventos decorrentes;
+- eventos normais novos;
+- edição de eventos normais já existentes.
+
+Ao escolher **Todos**, use no texto:
 
 ```txt
-{p1} tenta conversar com o ET.
-{p1} encontra uma arma alienígena.
-O ET captura {p2}.
+{p}
 ```
 
-Cada evento especial tem duas chaves:
+ou:
 
-- **Misturar com eventos normais ligada:** os eventos decorrentes entram junto com os eventos normais enquanto o especial estiver ativo.
-- **Misturar com eventos normais desligada:** enquanto o especial estiver ativo, somente os eventos cadastrados dentro dele podem aparecer.
-- **Evento especial ativo:** permite ativar ou desativar todo o grupo sem apagar nada.
+```txt
+{todos}
+```
 
-Cada evento decorrente também pode ser ativado ou desativado separadamente. A opção **Qualquer fase** é recomendada para a história continuar em qualquer Dia, Noite, Banquete ou evento da arena.
+O jogo substitui pelo nome de todos os participantes vivos, por exemplo:
 
-Um evento especial é sorteado no máximo uma vez por partida. Os eventos decorrentes são usados uma vez nessa partida e, quando todos terminam, o jogo volta aos eventos normais.
+```txt
+Um ET aparece diante de Ana, Bruno, Carla e Diego.
+```
 
-## O que continua incluído
+Eventos com **Todos** não aceitam mortes pelo campo `p1`, `p2` etc. Para criar uma morte, escolha de 1 a 4 participantes.
 
-- Correção de dias e fases repetidos.
-- Correção de participantes mortos reaparecendo vivos.
-- Rodadas protegidas contra execução simultânea.
-- Interface traduzida.
-- Botão **Adicionar todos do chat**.
-- Comando `!hg todos` sem limite fixo de participantes.
-- Editor de eventos normais.
-- Modo +18 e eventos +18.
+## Narração automática
+
+A página pública e o painel administrativo possuem:
+
+- botão **Ativar narração**;
+- seletor de voz;
+- botão **Testar voz**.
+
+A narração usa a síntese de voz do próprio navegador. O sistema prioriza uma voz **Google Português do Brasil** quando ela estiver disponível e usa outra voz em português como alternativa.
+
+Por segurança do navegador, é necessário clicar em **Ativar narração** na página que deverá produzir o áudio. Depois disso, cada evento novo é narrado automaticamente.
+
+## Correções e recursos mantidos
+
+- correção de dias e fases repetidos;
+- correção de participantes mortos reaparecendo vivos;
+- proteção contra duas rodadas executadas ao mesmo tempo;
+- interface traduzida;
+- botão **Adicionar todos do chat**;
+- comando `!hg todos`;
+- participantes sem limite fixo;
+- eventos +18;
+- histórias encadeadas;
+- eventos antigos preservados.
 
 ## Atualização no Render
 
-Substitua estes arquivos na raiz do repositório:
+Substitua os arquivos na raiz do repositório:
 
 ```txt
 server.js
@@ -57,7 +95,7 @@ Depois use:
 Manual Deploy → Clear build cache & deploy
 ```
 
-Não altere nem apague `DATABASE_URL`. A primeira inicialização cria somente as novas tabelas e adiciona uma coluna de controle à tabela de partidas.
+Não altere nem apague `DATABASE_URL`.
 
 Confirme a versão em:
 
@@ -68,7 +106,7 @@ https://site-jogo-o9d1.onrender.com/version
 Resposta esperada:
 
 ```json
-{"version":"4.0.0"}
+{"version":"5.0.0"}
 ```
 
 ## Endereços
