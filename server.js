@@ -6,7 +6,7 @@ import tls from "node:tls";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = "5.2.0";
+const APP_VERSION = "5.3.0";
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
@@ -1071,6 +1071,10 @@ async function nextRound(channel) {
       let available = shuffle(alive);
       let activeScenarioId = Number(game.active_scenario_id || 0);
       let allowScenarioTrigger = activeScenarioId === 0;
+      // Quando a opção "Misturar com eventos normais" está desligada,
+      // nenhum evento normal pode entrar antes, durante ou depois da história
+      // na mesma rodada.
+      let exclusiveScenarioThisRound = false;
 
       while (available.length > 0) {
         const [aliveNow] = await conn.query(
@@ -1091,6 +1095,9 @@ async function nextRound(channel) {
             [activeScenarioId]
           );
           activeScenario = scenarioRows[0] || null;
+          if (activeScenario && !Number(activeScenario.mix_with_normal)) {
+            exclusiveScenarioThisRound = true;
+          }
 
           if (!activeScenario || !Number(activeScenario.active)) {
             await finishScenario(conn, game.id, activeScenarioId, channel, phase, day, activeScenario?.name || "");
@@ -1143,8 +1150,31 @@ async function nextRound(channel) {
           // nenhum evento normal entra no meio da história especial.
           if (!pool.length && !Number(activeScenario.mix_with_normal)) break;
         } else {
-          pool = [...normalEvents];
-          if (allowScenarioTrigger) pool.push(...scenarioTriggers);
+          // Se uma história exclusiva estiver disponível, a introdução dela
+          // tem prioridade e entra antes de qualquer evento normal. Isso evita
+          // a impressão de que a história está sendo misturada.
+          const exclusiveTriggers = allowScenarioTrigger
+            ? scenarioTriggers.filter(ev => {
+                if (Number(ev.mix_with_normal)) return false;
+                const needed = eventParticipantCount(ev, aliveIds.size);
+                if (eventUsesAllPlayers(ev)) {
+                  if (available.length !== aliveIds.size || needed === 0) return false;
+                } else if (needed > available.length) {
+                  return false;
+                }
+                if (String(ev.type || "").toLowerCase() === "death" && validEventKillIndexes(ev).length === 0) return false;
+                return true;
+              })
+            : [];
+          if (exclusiveTriggers.length) {
+            pool = exclusiveTriggers;
+          } else {
+            // Uma história exclusiva que terminou nesta rodada não libera
+            // eventos normais no mesmo bloco. Os normais voltam na próxima fase.
+            if (exclusiveScenarioThisRound) break;
+            pool = [...normalEvents];
+            if (allowScenarioTrigger) pool.push(...scenarioTriggers);
+          }
         }
 
         const possible = pool.filter(ev => {
@@ -1222,6 +1252,7 @@ async function nextRound(channel) {
 
         if (ev.event_source === "scenario_trigger") {
           const scenarioId = Number(ev.scenario_id || ev.id);
+          if (!Number(ev.mix_with_normal)) exclusiveScenarioThisRound = true;
           await conn.query(
             "INSERT IGNORE INTO hg_game_scenario_runs (game_id,scenario_id) VALUES (?,?)",
             [game.id, scenarioId]
@@ -1471,6 +1502,28 @@ async function adminAction(req, res) {
       return send(res, `✅ Evento especial criado. Abra a seta para adicionar os eventos decorrentes. ID ${result.insertId}.`);
     }
 
+    if (action === "update_scenario_options") {
+      await ensureTables();
+      const db = await getPool();
+      const id = Number(req.body?.id || 0);
+      const mixFlag = String(req.body?.mix_with_normal ?? "1") === "1" ? 1 : 0;
+      const activeFlag = String(req.body?.active ?? "1") === "1" ? 1 : 0;
+      if (!id) return send(res, "ID inválido.");
+      await db.query(
+        "UPDATE hg_scenarios SET mix_with_normal=?, active=? WHERE id=?",
+        [mixFlag, activeFlag, id]
+      );
+      if (!activeFlag) {
+        await db.query("UPDATE hg_games SET active_scenario_id=NULL WHERE active_scenario_id=?", [id]);
+      }
+      return send(
+        res,
+        mixFlag
+          ? "✅ Opções salvas: esta história pode misturar com eventos normais."
+          : "✅ Opções salvas: durante esta história serão usados somente os eventos internos."
+      );
+    }
+
     if (action === "update_scenario") {
       await ensureTables();
       const db = await getPool();
@@ -1706,8 +1759,11 @@ function avatarHtml(p,cls="avatar"){return p&&p.avatar_url?'<img class="'+cls+'"
 function mentionedPlayers(text,players){const found=[];const lower=String(text||"").toLowerCase();players.forEach(p=>{const nm=String(p.display_name||p.username||"").toLowerCase();if(nm&&lower.includes(nm)&&!found.some(x=>x.id===p.id))found.push(p)});return found}
 const NARRATION_ENABLED_KEY="hgNarrationEnabledV52",NARRATION_VOICE_KEY="hgNarrationVoiceNaturalV52",NARRATION_RATE_KEY="hgNarrationRate";
 let narrationEnabled=localStorage.getItem(NARRATION_ENABLED_KEY)==="1",narrationVoices=[];
-let narrationChannel=null;
-try{if("BroadcastChannel" in window){narrationChannel=new BroadcastChannel("hg-narration-sync-v52")}}catch{}
+let narrationChannel=null,narrationAdminLastSeen=0;
+const narrationTabId=Math.random().toString(36).slice(2)+Date.now().toString(36);
+try{if("BroadcastChannel" in window){narrationChannel=new BroadcastChannel("hg-narration-sync-v53")}}catch{}
+function sendNarrationHeartbeat(){if(!admin)return;try{narrationChannel?.postMessage({type:"admin-heartbeat",tabId:narrationTabId,at:Date.now()})}catch{}}
+function shouldNarrateHere(){return admin||Date.now()-narrationAdminLastSeen>2600}
 function availableNarrationVoices(){return (window.speechSynthesis?.getVoices?.()||[]).slice()}
 function narrationVoiceScore(v){const name=String(v?.name||"");const lang=String(v?.lang||"");let score=0;if(/^pt(-|_)?br/i.test(lang))score+=1000;else if(/^pt/i.test(lang))score+=700;if(/natural|neural|online|francisca|antonio|thalita/i.test(name))score+=350;if(/google/i.test(name))score+=120;if(v&&v.localService===false)score+=40;return score}
 function savedNarrationVoice(){return localStorage.getItem(NARRATION_VOICE_KEY)||localStorage.getItem("hgNarrationVoiceNaturalV51")||""}
@@ -1718,23 +1774,26 @@ function narrationRate(){const slider=document.getElementById("narrationRate");c
 function updateNarrationRate(shouldBroadcast=true){const slider=document.getElementById("narrationRate"),label=document.getElementById("narrationRateValue");if(!slider)return;const saved=Number(localStorage.getItem(NARRATION_RATE_KEY)||1.30);if(!slider.dataset.ready){slider.value=String(Math.max(.70,Math.min(2,Number.isFinite(saved)?saved:1.30)));slider.dataset.ready="1"}const rate=narrationRate();localStorage.setItem(NARRATION_RATE_KEY,String(rate));if(label)label.textContent=rate.toFixed(2).replace(".",",")+"x";if(shouldBroadcast===true)broadcastNarrationSettings()}
 function initNarrationControls(){const slider=document.getElementById("narrationRate");if(slider&&!slider.dataset.bound){slider.dataset.bound="1";slider.addEventListener("input",()=>updateNarrationRate(true));slider.addEventListener("change",()=>updateNarrationRate(true))}if(slider)updateNarrationRate(false);populateNarrationVoices();updateNarrationButton()}
 function updateNarrationButton(){const b=document.getElementById("narrationToggle");if(b)b.textContent=narrationEnabled?"🔇 Desativar narração":"🔊 Ativar narração"}
-function applyNarrationSettings(data={}){if(typeof data.voice==="string"&&data.voice)localStorage.setItem(NARRATION_VOICE_KEY,data.voice);if(Number.isFinite(Number(data.rate)))localStorage.setItem(NARRATION_RATE_KEY,String(data.rate));if(typeof data.enabled==="boolean"){narrationEnabled=data.enabled;localStorage.setItem(NARRATION_ENABLED_KEY,narrationEnabled?"1":"0")}else narrationEnabled=localStorage.getItem(NARRATION_ENABLED_KEY)==="1";if(!narrationEnabled&&"speechSynthesis" in window)window.speechSynthesis.cancel();const slider=document.getElementById("narrationRate");if(slider){slider.dataset.ready="";updateNarrationRate(false)}populateNarrationVoices();updateNarrationButton()}
-function toggleNarration(){if(!("speechSynthesis" in window)){alert("Este navegador não oferece narração de texto.");return}narrationEnabled=!narrationEnabled;localStorage.setItem(NARRATION_ENABLED_KEY,narrationEnabled?"1":"0");if(!narrationEnabled)window.speechSynthesis.cancel();initNarrationControls();updateNarrationButton();broadcastNarrationSettings()}
-async function testNarration(){if(!("speechSynthesis" in window)){alert("Este navegador não oferece narração de texto.");return}initNarrationControls();window.speechSynthesis.cancel();await speakNarration("Teste de narração do modo história. A arena está pronta, e a aventura vai começar.",true)}
+function stopNarrationSpeech(){if(!("speechSynthesis" in window))return;try{window.speechSynthesis.cancel();window.speechSynthesis.resume()}catch{}}
+function applyNarrationSettings(data={}){if(data&&data.type==="admin-heartbeat"){narrationAdminLastSeen=Date.now();return}if(typeof data.voice==="string"&&data.voice)localStorage.setItem(NARRATION_VOICE_KEY,data.voice);if(Number.isFinite(Number(data.rate)))localStorage.setItem(NARRATION_RATE_KEY,String(data.rate));if(typeof data.enabled==="boolean"){narrationEnabled=data.enabled;localStorage.setItem(NARRATION_ENABLED_KEY,narrationEnabled?"1":"0")}else narrationEnabled=localStorage.getItem(NARRATION_ENABLED_KEY)==="1";if(!narrationEnabled)stopNarrationSpeech();const slider=document.getElementById("narrationRate");if(slider){slider.dataset.ready="";updateNarrationRate(false)}populateNarrationVoices();updateNarrationButton()}
+async function toggleNarration(){if(!("speechSynthesis" in window)){alert("Este navegador não oferece narração de texto.");return}narrationEnabled=!narrationEnabled;localStorage.setItem(NARRATION_ENABLED_KEY,narrationEnabled?"1":"0");if(!narrationEnabled)stopNarrationSpeech();else{try{window.speechSynthesis.resume()}catch{}}initNarrationControls();updateNarrationButton();broadcastNarrationSettings();if(narrationEnabled)await speakNarration("Narração ativada.",true)}
+async function testNarration(){if(!("speechSynthesis" in window)){alert("Este navegador não oferece narração de texto.");return}initNarrationControls();stopNarrationSpeech();await speakNarration("Teste de narração do modo história. A arena está pronta, e a aventura vai começar.",true)}
 function narrationText(text){return String(text||"").replace(/[📍🎲🔥💀🔞✅⛔🗑️]/g," ").replace(/\s*•\s*/g,", ").replace(/\s+/g," ").trim()}
-function speakNarration(text,force=false){return new Promise(resolve=>{const clean=narrationText(text);if((!narrationEnabled&&!force)||!("speechSynthesis" in window)||!clean){resolve(false);return}const u=new SpeechSynthesisUtterance(clean);u.lang="pt-BR";u.rate=narrationRate();u.pitch=1.04;u.volume=1;const v=selectedNarrationVoice();if(v){u.voice=v;u.lang=v.lang||"pt-BR"}let finished=false;const finish=()=>{if(finished)return;finished=true;clearTimeout(timer);resolve(true)};u.onend=finish;u.onerror=finish;const estimate=Math.max(1800,Math.min(30000,Math.round((clean.length*52)/Math.max(.7,u.rate)+900)));const timer=setTimeout(finish,estimate);try{window.speechSynthesis.speak(u)}catch{finish()}})}
+function speakNarrationOnce(clean){return new Promise(resolve=>{const synth=window.speechSynthesis;const u=new SpeechSynthesisUtterance(clean);u.lang="pt-BR";u.rate=narrationRate();u.pitch=1.04;u.volume=1;const v=selectedNarrationVoice();if(v){u.voice=v;u.lang=v.lang||"pt-BR"}let finished=false,started=false;const finish=ok=>{if(finished)return;finished=true;clearTimeout(startTimer);clearTimeout(endTimer);clearInterval(keepAlive);resolve(ok)};u.onstart=()=>{started=true;clearTimeout(startTimer)};u.onend=()=>finish(true);u.onerror=()=>finish(false);const startTimer=setTimeout(()=>{if(!started){try{synth.cancel();synth.resume()}catch{}finish(false)}},3200);const estimate=Math.max(5000,Math.min(120000,Math.round((clean.length*78)/Math.max(.7,u.rate)+2200)));const endTimer=setTimeout(()=>{try{synth.cancel();synth.resume()}catch{}finish(false)},estimate);const keepAlive=setInterval(()=>{try{if(synth.paused)synth.resume()}catch{}},3500);try{synth.resume();synth.speak(u)}catch{finish(false)}})}
+async function speakNarration(text,force=false){const clean=narrationText(text);if((!narrationEnabled&&!force)||!("speechSynthesis" in window)||!clean)return false;for(let attempt=0;attempt<2;attempt++){stopNarrationSpeech();await clientSleep(attempt?180:110);const ok=await speakNarrationOnce(clean);if(ok)return true}return false}
 window.addEventListener("storage",e=>{if([NARRATION_ENABLED_KEY,NARRATION_VOICE_KEY,NARRATION_RATE_KEY,"hgNarrationVoiceNaturalV51"].includes(e.key))applyNarrationSettings()});
 if(narrationChannel)narrationChannel.onmessage=e=>applyNarrationSettings(e.data||{});
+if(admin){sendNarrationHeartbeat();setInterval(sendNarrationHeartbeat,1000)}
 if("speechSynthesis" in window){initNarrationControls();window.speechSynthesis.onvoiceschanged=populateNarrationVoices}
 const clientSleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 let timelineGameId=null,timelineInitialized=false,timelinePlayers=[],timelineQueue=[],timelineQueueRunning=false,timelineGeneration=0;
 const timelineKnownIds=new Set(),timelineQueuedIds=new Set();
 function eventCardHtml(l,players,extra=""){const ps=mentionedPlayers(l.text,players);const avs=ps.length?'<div class="event-avatars">'+ps.map(p=>'<div class="event-person">'+avatarHtml(p,"avatar")+'</div>').join("")+'</div>':'';return '<div class="log '+(l.deaths?'death ':'')+extra+'" data-log-id="'+Number(l.id||0)+'"><div class="phase">'+esc(phaseLabel(l.phase,l.day_number))+'</div>'+avs+'<div class="event-text">'+esc(l.text)+'</div>'+(l.deaths?'<div class="small">Mortes: '+esc(l.deaths)+'</div>':'')+'</div>'}
-function clearTimelinePlayback(){timelineGeneration++;timelineQueue=[];timelineQueuedIds.clear();timelineQueueRunning=false;if(!admin&&"speechSynthesis" in window)window.speechSynthesis.cancel()}
+function clearTimelinePlayback(){timelineGeneration++;timelineQueue=[];timelineQueuedIds.clear();timelineQueueRunning=false;stopNarrationSpeech()}
 function renderTimelineHistory(logs,players,status){const box=document.getElementById("logs");const list=(Array.isArray(logs)?logs:[]).slice().sort((a,b)=>Number(a.id)-Number(b.id));box.innerHTML=list.map(l=>eventCardHtml(l,players)).join("")||"<div class='small' id='timelineEmpty'>Sem eventos ainda.</div>";document.querySelectorAll(".event-name").forEach(e=>e.remove());timelineKnownIds.clear();for(const l of list)timelineKnownIds.add(Number(l.id));if(list.length&&status==="running")requestAnimationFrame(()=>{const last=box.querySelector("[data-log-id]:last-child");if(last)scrollEventIntoView(last,false)})}
 function scrollEventIntoView(el,smooth=true){if(!el)return;const behavior=smooth?"smooth":"auto";if(admin){const box=document.getElementById("logs");const top=Math.max(0,el.offsetTop-box.offsetTop-18);try{box.scrollTo({top,behavior})}catch{box.scrollTop=top}}else{try{el.scrollIntoView({behavior,block:"center",inline:"nearest"})}catch{el.scrollIntoView(false)}}}
 function appendTimelineEvent(log){const box=document.getElementById("logs");document.getElementById("timelineEmpty")?.remove();box.insertAdjacentHTML("beforeend",eventCardHtml(log,timelinePlayers,"event-sync-enter"));document.querySelectorAll(".event-name").forEach(e=>e.remove());return box.querySelector('[data-log-id="'+Number(log.id||0)+'"]')}
-async function runTimelineQueue(){if(timelineQueueRunning)return;const generation=timelineGeneration;timelineQueueRunning=true;try{while(timelineQueue.length&&generation===timelineGeneration){const log=timelineQueue.shift();timelineQueuedIds.delete(Number(log.id));const el=appendTimelineEvent(log);await clientSleep(40);if(generation!==timelineGeneration)break;if(el){el.classList.add("event-sync-active");scrollEventIntoView(el,true)}await clientSleep(220);if(generation!==timelineGeneration)break;const silent=String(log.text||"").startsWith("📍");if(!admin&&narrationEnabled&&!silent)await speakNarration(log.text);else await clientSleep(silent?160:70);if(el)el.classList.remove("event-sync-active","event-sync-enter");await clientSleep(50)}}finally{if(generation===timelineGeneration){timelineQueueRunning=false;if(timelineQueue.length)queueMicrotask(runTimelineQueue)}}}
+async function runTimelineQueue(){if(timelineQueueRunning)return;const generation=timelineGeneration;timelineQueueRunning=true;try{while(timelineQueue.length&&generation===timelineGeneration){const log=timelineQueue.shift();timelineQueuedIds.delete(Number(log.id));const el=appendTimelineEvent(log);await clientSleep(40);if(generation!==timelineGeneration)break;if(el){el.classList.add("event-sync-active");scrollEventIntoView(el,true)}await clientSleep(220);if(generation!==timelineGeneration)break;const silent=String(log.text||"").startsWith("📍");if(narrationEnabled&&!silent&&shouldNarrateHere())await speakNarration(log.text);else await clientSleep(silent?160:70);if(el)el.classList.remove("event-sync-active","event-sync-enter");await clientSleep(50)}}finally{if(generation===timelineGeneration){timelineQueueRunning=false;if(timelineQueue.length)queueMicrotask(runTimelineQueue)}}}
 function syncEventTimeline(gameId,logs,players,status){const id=Number(gameId||0),list=(Array.isArray(logs)?logs:[]).slice().sort((a,b)=>Number(a.id)-Number(b.id));timelinePlayers=Array.isArray(players)?players:[];if(!timelineInitialized||timelineGameId!==id){clearTimelinePlayback();timelineGameId=id;timelineInitialized=true;renderTimelineHistory(list,timelinePlayers,status);return}for(const log of list){const logId=Number(log.id||0);if(!logId||timelineKnownIds.has(logId)||timelineQueuedIds.has(logId))continue;timelineKnownIds.add(logId);timelineQueuedIds.add(logId);timelineQueue.push(log)}runTimelineQueue()}
 let loadInProgress=false,loadAgain=false;
 async function load(){
@@ -1764,7 +1823,8 @@ function typeOptions(value){return [["neutral","Neutro"],["death","Morte"],["ite
 function toggleScenario(id){const body=document.getElementById("scenario_body_"+id),arrow=document.getElementById("scenario_arrow_"+id);if(!body)return;const opening=body.classList.contains("collapsed");body.classList.toggle("collapsed",!opening);arrow.textContent=opening?"▼":"▶";if(opening)openScenarios.add(id);else openScenarios.delete(id)}
 async function addScenario(){const g=id=>document.getElementById(id);const body={action:"add_scenario",name:g("scName").value,phase:g("scPhase").value,type:g("scType").value,players:g("scPlayers").value,kills:g("scKills").value,adult:g("scAdult").value,text:g("scText").value,mix_with_normal:g("scMix").checked?"1":"0",active:g("scActive").checked?"1":"0"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);if(String(t).startsWith("✅")){g("scName").value="";g("scText").value=""}await loadScenarios();load()}
 function scenarioChildRow(c,sid){return '<div class="child-card"><div class="phase">EVENTO DA HISTÓRIA ID '+c.id+' • '+esc(phaseLabels[c.phase]||c.phase)+' • '+esc(typeLabel(c.type))+' • '+esc(playerLabel(c.players))+' • '+(c.active?"Ativo":"Desativado")+'</div><div class="child-edit-grid"><select id="sce_phase_'+c.id+'">'+phaseOptions(c.phase,true)+'</select><select id="sce_type_'+c.id+'">'+typeOptions(c.type)+'</select>'+playerInput("sce_players_"+c.id,c.players)+'<input id="sce_kills_'+c.id+'" placeholder="Mortes: p2" value="'+esc(c.kills||"")+'"><select id="sce_adult_'+c.id+'"><option value="0" '+(!c.adult?"selected":"")+'>Normal</option><option value="1" '+(c.adult?"selected":"")+'>+18</option></select></div><textarea id="sce_text_'+c.id+'">'+esc(c.text)+'</textarea><div class="wide-actions"><label class="switch-row"><input id="sce_active_'+c.id+'" type="checkbox" '+(c.active?"checked":"")+'><span>Evento decorrente ativo</span></label><button onclick="saveScenarioEvent('+c.id+','+sid+')">Salvar evento interno</button><button class="danger" onclick="deleteScenarioEvent('+c.id+','+sid+')">Excluir</button></div></div>'}
-function scenarioRow(s){const opened=openScenarios.has(Number(s.id));const children=(s.events||[]).map(c=>scenarioChildRow(c,s.id)).join("")||'<div class="small">Nenhum evento decorrente criado. Use o formulário abaixo.</div>';return '<div class="scenario-card"><div class="scenario-head" onclick="toggleScenario('+s.id+')"><button class="scenario-arrow" id="scenario_arrow_'+s.id+'">'+(opened?"▼":"▶")+'</button><div class="scenario-title"><div style="font-weight:950;font-size:17px">'+esc(s.name)+'</div><div class="scenario-flags"><span class="flag">ID '+s.id+'</span><span class="flag">'+esc(phaseLabels[s.phase]||s.phase)+'</span><span class="flag">'+(s.mix_with_normal?"Mistura com normais":"Somente esta história")+'</span><span class="flag">'+(s.active?"Ativo":"Desativado")+'</span><span class="flag">'+esc(playerLabel(s.players))+'</span><span class="flag">'+(s.events||[]).length+' decorrente(s)</span></div></div></div><div id="scenario_body_'+s.id+'" class="scenario-body '+(opened?"":"collapsed")+'"><input id="sc_name_'+s.id+'" value="'+esc(s.name)+'"><div class="scenario-edit-grid"><select id="sc_phase_'+s.id+'">'+phaseOptions(s.phase,false)+'</select><select id="sc_type_'+s.id+'">'+typeOptions(s.type)+'</select>'+playerInput("sc_players_"+s.id,s.players)+'<input id="sc_kills_'+s.id+'" placeholder="Mortes: p2" value="'+esc(s.kills||"")+'"><select id="sc_adult_'+s.id+'"><option value="0" '+(!s.adult?"selected":"")+'>Normal</option><option value="1" '+(s.adult?"selected":"")+'>+18</option></select></div><textarea id="sc_text_'+s.id+'">'+esc(s.text)+'</textarea><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><label class="switch-row"><input id="sc_mix_'+s.id+'" type="checkbox" '+(s.mix_with_normal?"checked":"")+'><span><b>Misturar com eventos normais</b><br><span class="small">Desligado: somente os eventos internos.</span></span></label><label class="switch-row"><input id="sc_active_'+s.id+'" type="checkbox" '+(s.active?"checked":"")+'><span><b>História ativa</b><br><span class="small">Controla se o início pode ser sorteado.</span></span></label></div><div class="wide-actions"><button onclick="saveScenario('+s.id+')">Salvar história</button><button class="danger" onclick="deleteScenario('+s.id+')">Excluir tudo</button></div><hr style="border-color:var(--b);margin:18px 0"><h3>Adicionar evento decorrente</h3><div class="small">“Qualquer fase” é recomendado para a história continuar sem ficar esperando Dia ou Noite.</div><div class="child-edit-grid"><select id="new_sce_phase_'+s.id+'">'+phaseOptions("any",true)+'</select><select id="new_sce_type_'+s.id+'">'+typeOptions("neutral")+'</select>'+playerInput("new_sce_players_"+s.id,1)+'<input id="new_sce_kills_'+s.id+'" placeholder="Mortes: p2"><select id="new_sce_adult_'+s.id+'"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="new_sce_text_'+s.id+'" placeholder="{p1} tenta conversar com o ET. Use {p} para Todos."></textarea><span class="small player-count-note">Digite qualquer número ou escreva Todos. Use {p} ou {todos} para colocar todos os vivos nesta cena.</span><button onclick="addScenarioEvent('+s.id+')">Adicionar dentro desta história</button><hr style="border-color:var(--b);margin:18px 0"><h3>Eventos decorrentes cadastrados</h3><div class="child-list">'+children+'</div></div></div>'}
+async function saveScenarioOptions(id){const mix=document.getElementById("sc_mix_"+id),active=document.getElementById("sc_active_"+id),status=document.getElementById("sc_options_status_"+id);if(!mix||!active)return;if(status)status.textContent="Salvando opções...";mix.disabled=true;active.disabled=true;try{const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"update_scenario_options",id,mix_with_normal:mix.checked?"1":"0",active:active.checked?"1":"0"})});if(status)status.textContent=String(t);openScenarios.add(Number(id));await load()}catch(e){if(status)status.textContent="Erro ao salvar as opções."}finally{mix.disabled=false;active.disabled=false}}
+function scenarioRow(s){const opened=openScenarios.has(Number(s.id));const children=(s.events||[]).map(c=>scenarioChildRow(c,s.id)).join("")||'<div class="small">Nenhum evento decorrente criado. Use o formulário abaixo.</div>';return '<div class="scenario-card"><div class="scenario-head" onclick="toggleScenario('+s.id+')"><button class="scenario-arrow" id="scenario_arrow_'+s.id+'">'+(opened?"▼":"▶")+'</button><div class="scenario-title"><div style="font-weight:950;font-size:17px">'+esc(s.name)+'</div><div class="scenario-flags"><span class="flag">ID '+s.id+'</span><span class="flag">'+esc(phaseLabels[s.phase]||s.phase)+'</span><span class="flag">'+(s.mix_with_normal?"Mistura com normais":"Somente esta história")+'</span><span class="flag">'+(s.active?"Ativo":"Desativado")+'</span><span class="flag">'+esc(playerLabel(s.players))+'</span><span class="flag">'+(s.events||[]).length+' decorrente(s)</span></div></div></div><div id="scenario_body_'+s.id+'" class="scenario-body '+(opened?"":"collapsed")+'"><input id="sc_name_'+s.id+'" value="'+esc(s.name)+'"><div class="scenario-edit-grid"><select id="sc_phase_'+s.id+'">'+phaseOptions(s.phase,false)+'</select><select id="sc_type_'+s.id+'">'+typeOptions(s.type)+'</select>'+playerInput("sc_players_"+s.id,s.players)+'<input id="sc_kills_'+s.id+'" placeholder="Mortes: p2" value="'+esc(s.kills||"")+'"><select id="sc_adult_'+s.id+'"><option value="0" '+(!s.adult?"selected":"")+'>Normal</option><option value="1" '+(s.adult?"selected":"")+'>+18</option></select></div><textarea id="sc_text_'+s.id+'">'+esc(s.text)+'</textarea><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><label class="switch-row"><input id="sc_mix_'+s.id+'" type="checkbox" onchange="saveScenarioOptions('+s.id+')" '+(s.mix_with_normal?"checked":"")+'><span><b>Misturar com eventos normais</b><br><span class="small">Desligado: somente os eventos internos.</span></span></label><label class="switch-row"><input id="sc_active_'+s.id+'" type="checkbox" onchange="saveScenarioOptions('+s.id+')" '+(s.active?"checked":"")+'><span><b>História ativa</b><br><span class="small">Controla se o início pode ser sorteado.</span></span></label></div><div id="sc_options_status_'+s.id+'" class="small" style="margin-top:8px;color:#c4b5fd">As duas chaves são salvas automaticamente.</div><div class="wide-actions"><button onclick="saveScenario('+s.id+')">Salvar história</button><button class="danger" onclick="deleteScenario('+s.id+')">Excluir tudo</button></div><hr style="border-color:var(--b);margin:18px 0"><h3>Adicionar evento decorrente</h3><div class="small">“Qualquer fase” é recomendado para a história continuar sem ficar esperando Dia ou Noite.</div><div class="child-edit-grid"><select id="new_sce_phase_'+s.id+'">'+phaseOptions("any",true)+'</select><select id="new_sce_type_'+s.id+'">'+typeOptions("neutral")+'</select>'+playerInput("new_sce_players_"+s.id,1)+'<input id="new_sce_kills_'+s.id+'" placeholder="Mortes: p2"><select id="new_sce_adult_'+s.id+'"><option value="0">Normal</option><option value="1">+18</option></select></div><textarea id="new_sce_text_'+s.id+'" placeholder="{p1} tenta conversar com o ET. Use {p} para Todos."></textarea><span class="small player-count-note">Digite qualquer número ou escreva Todos. Use {p} ou {todos} para colocar todos os vivos nesta cena.</span><button onclick="addScenarioEvent('+s.id+')">Adicionar dentro desta história</button><hr style="border-color:var(--b);margin:18px 0"><h3>Eventos decorrentes cadastrados</h3><div class="child-list">'+children+'</div></div></div>'}
 async function loadScenarios(){if(!admin)return;const box=document.getElementById("scenariosEditor");if(!box)return;box.innerHTML="<div class='small'>Carregando histórias...</div>";const rows=await api("/hg/scenarios");if(!Array.isArray(rows)){box.innerHTML="<div class='small'>Erro ao carregar histórias.</div>";return}box.innerHTML=rows.map(scenarioRow).join("")||"<div class='small'>Nenhuma história criada.</div>"}
 async function saveScenario(id){const body={action:"update_scenario",id,name:document.getElementById("sc_name_"+id).value,phase:document.getElementById("sc_phase_"+id).value,type:document.getElementById("sc_type_"+id).value,players:document.getElementById("sc_players_"+id).value,kills:document.getElementById("sc_kills_"+id).value,adult:document.getElementById("sc_adult_"+id).value,text:document.getElementById("sc_text_"+id).value,mix_with_normal:document.getElementById("sc_mix_"+id).checked?"1":"0",active:document.getElementById("sc_active_"+id).checked?"1":"0"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);openScenarios.add(Number(id));loadScenarios();load()}
 async function deleteScenario(id){if(!confirm("Excluir esta história e TODOS os eventos que estão dentro dela?"))return;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"delete_scenario",id})});alert(t);openScenarios.delete(Number(id));loadScenarios();load()}

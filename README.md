@@ -1,68 +1,48 @@
-# Hunger Games da Live — versão 5.2.0
+# Hunger Games da Live — versão 5.3.0
 
-Esta versão mantém o mesmo banco de dados e **não apaga** eventos normais, histórias, participantes ou configurações já cadastradas.
+Esta versão mantém o mesmo banco de dados e **não apaga** eventos normais, histórias ou participantes já cadastrados.
 
-## Eventos, voz e rolagem sincronizados
+## Correções desta versão
 
-A página consulta novos acontecimentos aproximadamente a cada `0,8 segundo`.
+### História exclusiva sem mistura
 
-Quando chegam eventos novos, eles entram em uma fila e são apresentados nesta ordem:
+Quando **Misturar com eventos normais** estiver desligado:
 
-1. o cartão do evento aparece;
-2. a página rola automaticamente até esse cartão;
-3. o cartão fica destacado;
-4. a voz começa a narrar o mesmo texto;
-5. somente quando a fala termina o próximo evento é exibido.
+- a introdução da história tem prioridade;
+- nenhum evento normal entra antes da introdução na mesma rodada;
+- enquanto a história estiver ativa, somente os eventos internos dela são usados;
+- ao terminar, os eventos normais voltam apenas na próxima fase.
 
-Quando a narração estiver desligada, os eventos continuam aparecendo e rolando rapidamente, sem esperar uma fala.
+As chaves **Misturar com eventos normais** e **História ativa** agora são salvas automaticamente ao marcar ou desmarcar.
 
-## Controles somente no painel administrativo
+### Narração corrigida
 
-Os controles abaixo aparecem apenas em:
+- A narração agora funciona também na tela administrativa.
+- Ao ativar, o navegador é desbloqueado com a mensagem “Narração ativada”.
+- Cada fala é reiniciada de forma segura antes do próximo evento.
+- Se a voz travar ao iniciar, o sistema tenta novamente uma vez.
+- A fala usa um temporizador maior e mantém o mecanismo de voz acordado.
+- Se a tela administrativa e a pública estiverem abertas no mesmo navegador, a administrativa tem prioridade para evitar duas vozes ao mesmo tempo.
+- Os controles de voz continuam aparecendo somente na tela administrativa.
 
-```txt
-/admin/hungergames
-```
+## Atualização
 
-- Ativar ou desativar narração;
-- escolher a voz;
-- ajustar a velocidade;
-- testar a voz.
-
-Eles não aparecem nas páginas públicas:
+Substitua os arquivos na raiz do repositório e use no Render:
 
 ```txt
-/hungergames
-/jogos/hunger
+Manual Deploy → Clear build cache & deploy
 ```
 
-A página pública usa automaticamente a configuração feita no painel administrativo no mesmo navegador. Alterações são enviadas para a página pública aberta por armazenamento compartilhado e `BroadcastChannel`.
+Mantenha a mesma `DATABASE_URL`.
 
-## Recursos mantidos
+Depois confirme:
 
-- campo de pessoas com qualquer número inteiro ou `Todos`;
-- marcadores `{p1}`, `{p2}`, `{p10}` e superiores;
-- `{p}` ou `{todos}` para todos os participantes vivos;
-- correção de dias e fases repetidos;
-- correção de participantes mortos reaparecendo vivos;
-- botão **Adicionar todos do chat**;
-- comando `!hg todos`;
-- participantes sem limite fixo;
-- Modo História e eventos decorrentes;
-- chave para misturar histórias com eventos normais;
-- eventos +18;
-- interface traduzida.
+```txt
+/version
+```
 
-## Atualização no Render
-
-1. Extraia o ZIP.
-2. Substitua os arquivos na raiz do repositório do GitHub.
-3. Não altere nem apague `DATABASE_URL`.
-4. No Render, use **Manual Deploy → Clear build cache & deploy**.
-5. Abra `/version` e confirme:
+O retorno deve ser:
 
 ```json
-{"version":"5.2.0"}
+{"version":"5.3.0"}
 ```
-
-Depois, abra o painel administrativo e pressione `Ctrl + F5`.
