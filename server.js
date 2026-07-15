@@ -6,7 +6,7 @@ import tls from "node:tls";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = "5.5.0";
+const APP_VERSION = "5.6.0";
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
@@ -28,15 +28,17 @@ const autoTimers = new Map();
 const chatTrackers = new Map();
 const channelQueues = new Map();
 const ttsCache = new Map();
+const playbackAcked = new Map();
+const playbackWaiters = new Map();
 
 const DEFAULT_IGNORED_CHATTERS = new Set([
   "streamelements", "nightbot", "moobot", "streamlabs", "soundalerts",
   "sery_bot", "commanderroot", "wizebot", "fossabot"
 ]);
 
-function getAutoIntervalMs() {
-  const ms = Number(process.env.HG_AUTO_INTERVAL_MS || 5000);
-  return Math.max(2000, Math.min(120000, Number.isFinite(ms) ? ms : 5000));
+function getAutoIntervalMs(game = null) {
+  const ms = Number(game?.event_delay_ms ?? process.env.HG_AUTO_INTERVAL_MS ?? 9000);
+  return Math.max(4000, Math.min(60000, Number.isFinite(ms) ? ms : 9000));
 }
 
 function stopAuto(channel) {
@@ -55,6 +57,53 @@ function isAutoRunning(channel) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function playbackKey(channel, gameId, logId) {
+  return `${nick(channel || "")}:${Number(gameId || 0)}:${Number(logId || 0)}`;
+}
+
+function acknowledgePlayback(channel, gameId, logId) {
+  const key = playbackKey(channel, gameId, logId);
+  playbackAcked.set(key, Date.now());
+  const waiters = playbackWaiters.get(key) || [];
+  playbackWaiters.delete(key);
+  for (const resolve of waiters) {
+    try { resolve(true); } catch {}
+  }
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [storedKey, at] of playbackAcked) {
+    if (at < cutoff) playbackAcked.delete(storedKey);
+  }
+}
+
+function waitForPlaybackAck(channel, gameId, logId, timeoutMs = 25000) {
+  const key = playbackKey(channel, gameId, logId);
+  if (playbackAcked.has(key)) return Promise.resolve(true);
+  return new Promise(resolve => {
+    const list = playbackWaiters.get(key) || [];
+    let done = false;
+    const finish = value => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      const current = playbackWaiters.get(key) || [];
+      const next = current.filter(fn => fn !== finish);
+      if (next.length) playbackWaiters.set(key, next);
+      else playbackWaiters.delete(key);
+      resolve(value);
+    };
+    list.push(finish);
+    playbackWaiters.set(key, list);
+    const timer = setTimeout(() => finish(false), Math.max(5000, timeoutMs));
+  });
+}
+
+async function latestLogId(gameId) {
+  if (!gameId) return 0;
+  const db = await getPool();
+  const [rows] = await db.query("SELECT COALESCE(MAX(id),0) AS id FROM hg_logs WHERE game_id=?", [gameId]);
+  return Number(rows?.[0]?.id || 0);
 }
 
 function ignoredChatters() {
@@ -444,6 +493,10 @@ async function ensureTables() {
           day_number INT NOT NULL DEFAULT 1,
           adult_mode TINYINT(1) NOT NULL DEFAULT 0,
           normal_events_enabled TINYINT(1) NOT NULL DEFAULT 1,
+          narration_enabled TINYINT(1) NOT NULL DEFAULT 1,
+          narration_voice VARCHAR(160) NOT NULL DEFAULT 'google-online',
+          narration_rate DECIMAL(4,2) NOT NULL DEFAULT 1.15,
+          event_delay_ms INT NOT NULL DEFAULT 9000,
           winner VARCHAR(120) NULL,
           created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -510,6 +563,18 @@ async function ensureTables() {
       } catch (e) {
         if (e?.code !== "ER_DUP_FIELDNAME") throw e;
       }
+      for (const migration of [
+        "ALTER TABLE hg_games ADD COLUMN narration_enabled TINYINT(1) NOT NULL DEFAULT 1 AFTER normal_events_enabled",
+        "ALTER TABLE hg_games ADD COLUMN narration_voice VARCHAR(160) NOT NULL DEFAULT 'google-online' AFTER narration_enabled",
+        "ALTER TABLE hg_games ADD COLUMN narration_rate DECIMAL(4,2) NOT NULL DEFAULT 1.15 AFTER narration_voice",
+        "ALTER TABLE hg_games ADD COLUMN event_delay_ms INT NOT NULL DEFAULT 9000 AFTER narration_rate"
+      ]) {
+        try {
+          await db.query(migration);
+        } catch (e) {
+          if (e?.code !== "ER_DUP_FIELDNAME") throw e;
+        }
+      }
 
       await db.query(`
         CREATE TABLE IF NOT EXISTS hg_scenarios (
@@ -572,6 +637,18 @@ async function ensureTables() {
           used_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
           PRIMARY KEY (game_id, event_id),
           INDEX idx_scenario_usage (game_id, scenario_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
+
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS hg_phase_usage (
+          game_id INT NOT NULL,
+          phase VARCHAR(30) NOT NULL,
+          day_number INT NOT NULL,
+          player_id INT NOT NULL,
+          used_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (game_id, phase, day_number, player_id),
+          INDEX idx_phase_usage (game_id, phase, day_number)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
       `);
 
@@ -724,11 +801,18 @@ async function currentGame(channel, create = true) {
   return created[0];
 }
 
-async function newLobby(channel, adult = 0, normalEventsEnabled = 1) {
+async function newLobby(channel, adult = 0, normalEventsEnabled = 1, narration = {}) {
   await ensureTables();
   const db = await getPool();
   await db.query("UPDATE hg_games SET status='archived' WHERE channel=? AND status IN ('lobby','running','ended')", [channel]);
-  const [r] = await db.query("INSERT INTO hg_games (channel,status,phase,day_number,adult_mode,normal_events_enabled) VALUES (?, 'lobby', 'bloodbath', 1, ?, ?)", [channel, adult ? 1 : 0, normalEventsEnabled ? 1 : 0]);
+  const narrationEnabled = Number(narration.enabled ?? 1) ? 1 : 0;
+  const narrationVoice = String(narration.voice || "google-online").slice(0, 160);
+  const narrationRate = Math.max(0.70, Math.min(2, Number(narration.rate || 1.15)));
+  const eventDelayMs = Math.max(4000, Math.min(60000, Number(narration.eventDelayMs || 9000)));
+  const [r] = await db.query(
+    "INSERT INTO hg_games (channel,status,phase,day_number,adult_mode,normal_events_enabled,narration_enabled,narration_voice,narration_rate,event_delay_ms) VALUES (?, 'lobby', 'bloodbath', 1, ?, ?, ?, ?, ?, ?)",
+    [channel, adult ? 1 : 0, normalEventsEnabled ? 1 : 0, narrationEnabled, narrationVoice, narrationRate, eventDelayMs]
+  );
   return r.insertId;
 }
 
@@ -882,7 +966,17 @@ async function reset(channel) {
   stopAuto(channel);
   return withChannelLock(channel, async () => {
     const old = await currentGame(channel, false);
-    await newLobby(channel, old?.adult_mode || (process.env.HG_ADULT_DEFAULT === "1" ? 1 : 0), Number(old?.normal_events_enabled ?? 1));
+    await newLobby(
+      channel,
+      old?.adult_mode || (process.env.HG_ADULT_DEFAULT === "1" ? 1 : 0),
+      Number(old?.normal_events_enabled ?? 1),
+      {
+        enabled: Number(old?.narration_enabled ?? 1),
+        voice: old?.narration_voice || "google-online",
+        rate: Number(old?.narration_rate || 1.15),
+        eventDelayMs: Number(old?.event_delay_ms || 9000)
+      }
+    );
     return "✅ Arena resetada. Use !hg entrar ou !hg todos.";
   });
 }
@@ -998,14 +1092,16 @@ async function alivePlayers(gameId) {
 }
 
 async function finishScenario(conn, gameId, scenarioId, channel, phase, day, scenarioName) {
-  await conn.query("UPDATE hg_games SET active_scenario_id=NULL WHERE id=? AND active_scenario_id=?", [gameId, scenarioId]);
-  await conn.query("UPDATE hg_game_scenario_runs SET completed_at=COALESCE(completed_at,CURRENT_TIMESTAMP) WHERE game_id=? AND scenario_id=?", [gameId, scenarioId]);
-  if (scenarioName) {
-    await conn.query(
-      "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,?,?,?,'')",
-      [gameId, channel, phase, day, `✅ A história “${scenarioName}” terminou.`]
-    );
-  }
+  // A conclusão é salva no estado da história, mas não cria um segundo cartão
+  // público. Assim, cada clique/comando produz no máximo um evento visível.
+  await conn.query(
+    "UPDATE hg_games SET active_scenario_id=NULL WHERE id=? AND active_scenario_id=?",
+    [gameId, scenarioId]
+  );
+  await conn.query(
+    "UPDATE hg_game_scenario_runs SET completed_at=COALESCE(completed_at,CURRENT_TIMESTAMP) WHERE game_id=? AND scenario_id=?",
+    [gameId, scenarioId]
+  );
 }
 
 // Executa exatamente um trecho de uma história exclusiva por rodada.
@@ -1166,10 +1262,11 @@ async function runExclusiveStoryBeat(conn, game, alive, channel, adultAllowed, f
   );
   if (survivors.length <= 1) {
     const winner = survivors[0]?.display_name || null;
-    await conn.query("UPDATE hg_games SET status='ended',winner=?,active_scenario_id=NULL WHERE id=?", [winner, game.id]);
+    // O último acontecimento já é o evento desta chamada. O vencedor aparece
+    // no estado da partida, sem criar um segundo evento na página pública.
     await conn.query(
-      "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,'winner',?,?, '')",
-      [game.id, channel, day, winner ? `🏆 ${winner} venceu a arena!` : "A partida acabou sem vencedor."]
+      "UPDATE hg_games SET status='ended',winner=?,active_scenario_id=NULL WHERE id=?",
+      [winner, game.id]
     );
     return { handled: true, message: winner ? `🏆 ${winner} venceu a arena!` : "A partida acabou sem vencedor." };
   }
@@ -1184,8 +1281,6 @@ async function runExclusiveStoryBeat(conn, game, alive, channel, adultAllowed, f
 
 async function nextRound(channel) {
   return withChannelLock(channel, async (conn) => {
-    // A rodada inteira usa uma transação e um bloqueio por canal. Mortes,
-    // eventos normais e eventos encadeados ficam sempre no mesmo estado.
     await conn.beginTransaction();
     try {
       const [games] = await conn.query(
@@ -1212,23 +1307,19 @@ async function nextRound(channel) {
       );
       if (alive.length <= 1) {
         const winner = alive[0]?.display_name || null;
-        await conn.query("UPDATE hg_games SET status='ended',winner=? WHERE id=?", [winner, game.id]);
+        await conn.query(
+          "UPDATE hg_games SET status='ended',winner=?,active_scenario_id=NULL WHERE id=?",
+          [winner, game.id]
+        );
         await conn.commit();
         return winner ? `🏆 ${winner} venceu a arena!` : "A partida acabou sem vencedor.";
       }
 
-      const phase = game.phase || "bloodbath";
-      const day = Number(game.day_number || 1);
-      const title = phaseName(phase, day);
-      const phases = (phase === "day" || phase === "night") ? [phase, "arena"] : [phase];
-      const phaseMarks = phases.map(() => "?").join(",");
       const adultAllowed = Number(game.adult_mode) === 1 ? 1 : 0;
-
       const normalEventsEnabled = Number(game.normal_events_enabled ?? 1) === 1;
 
-      // Quando os eventos normais/antigos estão desligados, o Modo História
-      // vira a única fonte possível. A introdução e cada evento decorrente são
-      // executados em ordem, um por chamada, sem qualquer consulta a hg_events.
+      // Histórias exclusivas sempre têm prioridade. Esta função cria somente
+      // a introdução OU somente um evento interno a cada chamada.
       const exclusiveStory = await runExclusiveStoryBeat(
         conn,
         game,
@@ -1241,259 +1332,266 @@ async function nextRound(channel) {
         await conn.commit();
         return exclusiveStory.message;
       }
+
       if (!normalEventsEnabled) {
         await conn.rollback();
         return "⛔ Eventos normais/antigos estão desativados e não há nenhuma história ativa pendente. Ative ou reinicie uma história.";
       }
 
-      const [normalEvents] = await conn.query(
-        `SELECT e.*, 'normal' AS event_source, NULL AS scenario_id, NULL AS scenario_name
-         FROM hg_events e
-         WHERE e.active=1 AND e.phase IN (${phaseMarks}) AND (e.adult=0 OR ?=1)
-         ORDER BY RAND()`,
-        [...phases, adultAllowed]
-      );
-
-      // Um evento especial só pode começar uma vez em cada partida.
-      let scenarioTriggers = [];
-      if (!Number(game.active_scenario_id || 0)) {
-        const [rows] = await conn.query(
-          `SELECT s.id, s.phase, s.type, s.players, s.text, s.kills, s.adult,
-                  'scenario_trigger' AS event_source, s.id AS scenario_id,
-                  s.name AS scenario_name, s.mix_with_normal
-           FROM hg_scenarios s
-           LEFT JOIN hg_game_scenario_runs r
-             ON r.game_id=? AND r.scenario_id=s.id
-           WHERE s.active=1 AND s.mix_with_normal=1 AND r.scenario_id IS NULL
-             AND s.phase IN (${phaseMarks}) AND (s.adult=0 OR ?=1)
-           ORDER BY RAND()`,
-          [game.id, ...phases, adultAllowed]
-        );
-        scenarioTriggers = rows;
-      }
-
-      if (!normalEvents.length && !scenarioTriggers.length && !Number(game.active_scenario_id || 0)) {
-        await conn.rollback();
-        return "Sem eventos para essa fase.";
-      }
-
-      await conn.query(
-        "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,?,?,?,'')",
-        [game.id, channel, phase, day, `📍 ${title}`]
-      );
-
-      let available = shuffle(alive);
+      let phase = game.phase || "bloodbath";
+      let day = Number(game.day_number || 1);
       let activeScenarioId = Number(game.active_scenario_id || 0);
-      let allowScenarioTrigger = activeScenarioId === 0;
-      // Quando a opção "Misturar com eventos normais" está desligada,
-      // nenhum evento normal pode entrar antes, durante ou depois da história
-      // na mesma rodada.
-      let exclusiveScenarioThisRound = false;
+      let selectedEvent = null;
+      let selectedGroup = [];
+      let selectedPhase = phase;
+      let selectedDay = day;
+      let selectedScenario = null;
 
-      while (available.length > 0) {
-        const [aliveNow] = await conn.query(
-          "SELECT id FROM hg_players WHERE game_id=? AND alive=1 FOR UPDATE",
-          [game.id]
+      // Pode pular uma fase sem evento utilizável, mas nunca cria mais de um
+      // evento. O limite evita laço infinito caso o banco esteja mal configurado.
+      for (let attempt = 0; attempt < 8 && !selectedEvent; attempt++) {
+        const phases = (phase === "day" || phase === "night") ? [phase, "arena"] : [phase];
+        const marks = phases.map(() => "?").join(",");
+
+        const [usedRows] = await conn.query(
+          "SELECT player_id FROM hg_phase_usage WHERE game_id=? AND phase=? AND day_number=?",
+          [game.id, phase, day]
         );
-        const aliveIds = new Set(aliveNow.map(p => Number(p.id)));
-        available = available.filter(p => aliveIds.has(Number(p.id)));
-        if (aliveIds.size <= 1 || available.length === 0) break;
+        const usedIds = new Set(usedRows.map(row => Number(row.player_id)));
+        const available = shuffle(alive.filter(player => !usedIds.has(Number(player.id))));
 
-        let pool = [];
+        if (!available.length) {
+          const next = nextPhase(phase, day);
+          phase = next.phase;
+          day = next.day;
+          await conn.query(
+            "UPDATE hg_games SET phase=?,day_number=? WHERE id=? AND status='running'",
+            [phase, day, game.id]
+          );
+          continue;
+        }
+
+        const [normalEvents] = await conn.query(
+          `SELECT e.*, 'normal' AS event_source, NULL AS scenario_id,
+                  NULL AS scenario_name, 1 AS mix_with_normal
+           FROM hg_events e
+           WHERE e.active=1 AND e.phase IN (${marks}) AND (e.adult=0 OR ?=1)
+           ORDER BY RAND()`,
+          [...phases, adultAllowed]
+        );
+
         let activeScenario = null;
-        let childEvents = [];
+        const storyCandidates = [];
 
         if (activeScenarioId) {
           const [scenarioRows] = await conn.query(
-            "SELECT * FROM hg_scenarios WHERE id=? LIMIT 1",
+            "SELECT * FROM hg_scenarios WHERE id=? AND active=1 LIMIT 1",
             [activeScenarioId]
           );
           activeScenario = scenarioRows[0] || null;
-          if (activeScenario && !Number(activeScenario.mix_with_normal)) {
-            exclusiveScenarioThisRound = true;
-          }
 
-          if (!activeScenario || !Number(activeScenario.active)) {
-            await finishScenario(conn, game.id, activeScenarioId, channel, phase, day, activeScenario?.name || "");
+          if (!activeScenario) {
+            await finishScenario(conn, game.id, activeScenarioId, channel, phase, day, "");
             activeScenarioId = 0;
-            activeScenario = null;
-            allowScenarioTrigger = false;
+          } else if (!Number(activeScenario.mix_with_normal)) {
+            await conn.rollback();
+            return `⛔ A história “${activeScenario.name}” está em modo exclusivo. Reinicie a história ou confira os eventos internos ativos.`;
           } else {
             const [children] = await conn.query(
               `SELECT se.*, 'scenario_child' AS event_source, se.scenario_id,
-                      ? AS scenario_name
+                      ? AS scenario_name, 1 AS mix_with_normal
                FROM hg_scenario_events se
                LEFT JOIN hg_scenario_usage u
                  ON u.game_id=? AND u.event_id=se.id
                WHERE se.scenario_id=? AND se.active=1 AND u.event_id IS NULL
-                 AND (se.phase='any' OR se.phase IN (${phaseMarks}))
+                 AND (se.phase='any' OR se.phase IN (${marks}))
                  AND (se.adult=0 OR ?=1)
-               ORDER BY se.sort_order ASC, RAND()`,
+               ORDER BY se.sort_order ASC, se.id ASC
+               LIMIT 1`,
               [activeScenario.name, game.id, activeScenarioId, ...phases, adultAllowed]
             );
-            childEvents = children;
-
-            const [remainingRows] = await conn.query(
-              `SELECT COUNT(*) AS total,
-                      SUM(CASE WHEN se.players=0 OR se.players<=? THEN 1 ELSE 0 END) AS usable
-               FROM hg_scenario_events se
-               LEFT JOIN hg_scenario_usage u
-                 ON u.game_id=? AND u.event_id=se.id
-               WHERE se.scenario_id=? AND se.active=1 AND u.event_id IS NULL
-                 AND (se.adult=0 OR ?=1)`,
-              [aliveIds.size, game.id, activeScenarioId, adultAllowed]
-            );
-            const remainingTotal = Number(remainingRows?.[0]?.total || 0);
-            const usableRemaining = Number(remainingRows?.[0]?.usable || 0);
-
-            if (remainingTotal === 0 || usableRemaining === 0) {
-              await finishScenario(conn, game.id, activeScenarioId, channel, phase, day, activeScenario.name);
-              activeScenarioId = 0;
-              activeScenario = null;
-              allowScenarioTrigger = false;
+            if (children[0]) {
+              storyCandidates.push(children[0]);
+            } else {
+              const [remainingRows] = await conn.query(
+                `SELECT COUNT(*) AS total
+                 FROM hg_scenario_events se
+                 LEFT JOIN hg_scenario_usage u
+                   ON u.game_id=? AND u.event_id=se.id
+                 WHERE se.scenario_id=? AND se.active=1 AND u.event_id IS NULL
+                   AND (se.adult=0 OR ?=1)`,
+                [game.id, activeScenarioId, adultAllowed]
+              );
+              if (Number(remainingRows?.[0]?.total || 0) === 0) {
+                await finishScenario(
+                  conn,
+                  game.id,
+                  activeScenarioId,
+                  channel,
+                  phase,
+                  day,
+                  activeScenario.name
+                );
+                activeScenarioId = 0;
+                activeScenario = null;
+              }
             }
           }
         }
 
-        if (activeScenario) {
-          pool = Number(activeScenario.mix_with_normal)
-            ? [...normalEvents, ...childEvents]
-            : [...childEvents];
-
-          // No modo exclusivo, uma fase sem evento decorrente é pulada. Assim
-          // nenhum evento normal entra no meio da história especial.
-          if (!pool.length && !Number(activeScenario.mix_with_normal)) break;
-        } else {
-          // Se uma história exclusiva estiver disponível, a introdução dela
-          // tem prioridade e entra antes de qualquer evento normal. Isso evita
-          // a impressão de que a história está sendo misturada.
-          const exclusiveTriggers = allowScenarioTrigger
-            ? scenarioTriggers.filter(ev => {
-                if (Number(ev.mix_with_normal)) return false;
-                const needed = eventParticipantCount(ev, aliveIds.size);
-                if (eventUsesAllPlayers(ev)) {
-                  if (available.length !== aliveIds.size || needed === 0) return false;
-                } else if (needed > available.length) {
-                  return false;
-                }
-                if (String(ev.type || "").toLowerCase() === "death" && validEventKillIndexes(ev).length === 0) return false;
-                return true;
-              })
-            : [];
-          if (exclusiveTriggers.length) {
-            pool = exclusiveTriggers;
-          } else {
-            // Uma história exclusiva que terminou nesta rodada não libera
-            // eventos normais no mesmo bloco. Os normais voltam na próxima fase.
-            if (exclusiveScenarioThisRound) break;
-            pool = [...normalEvents];
-            if (allowScenarioTrigger) pool.push(...scenarioTriggers);
-          }
+        if (!activeScenarioId) {
+          const [triggers] = await conn.query(
+            `SELECT s.id, s.phase, s.type, s.players, s.text, s.kills, s.adult,
+                    'scenario_trigger' AS event_source, s.id AS scenario_id,
+                    s.name AS scenario_name, s.mix_with_normal
+             FROM hg_scenarios s
+             LEFT JOIN hg_game_scenario_runs r
+               ON r.game_id=? AND r.scenario_id=s.id
+             WHERE s.active=1 AND s.mix_with_normal=1 AND r.scenario_id IS NULL
+               AND s.phase IN (${marks}) AND (s.adult=0 OR ?=1)
+             ORDER BY s.updated_at DESC, s.id DESC`,
+            [game.id, ...phases, adultAllowed]
+          );
+          storyCandidates.push(...triggers);
         }
 
-        const possible = pool.filter(ev => {
-          const participantCount = eventParticipantCount(ev, aliveIds.size);
-          if (eventUsesAllPlayers(ev)) {
-            // "Todos" pega todos os participantes vivos e só pode acontecer
-            // antes de alguém já ter sido usado em outro evento desta rodada.
-            if (available.length !== aliveIds.size || participantCount === 0) return false;
-          } else if (participantCount > available.length) {
+        const pool = [...normalEvents, ...storyCandidates];
+        const possible = pool.filter(event => {
+          const count = eventParticipantCount(event, alive.length);
+          if (eventUsesAllPlayers(event)) {
+            return usedIds.size === 0 && available.length === alive.length && alive.length > 0;
+          }
+          if (count > available.length) return false;
+          if (String(event.type || "").toLowerCase() === "death" && validEventKillIndexes(event).length === 0) {
             return false;
           }
-          const configuredDeaths = validEventKillIndexes(ev);
-          if (String(ev.type || "").toLowerCase() === "death" && configuredDeaths.length === 0) return false;
           return true;
         });
-        if (!possible.length) break;
 
-        // Uma introdução para Todos tem prioridade no começo da rodada, para
-        // garantir que nenhum participante fique de fora da cena de abertura.
-        const allPlayerEvents = possible.filter(ev => eventUsesAllPlayers(ev) && ev.event_source !== "normal");
-        let eventPool;
-        if (allPlayerEvents.length) {
-          eventPool = allPlayerEvents;
-        } else {
-          const deathEvents = possible.filter(ev => validEventKillIndexes(ev).length > 0);
-          eventPool = aliveIds.size > 2 && deathEvents.length && Math.random() < 0.38
-            ? deathEvents
-            : possible;
-        }
-        const ev = random(eventPool);
-        const count = eventParticipantCount(ev, aliveIds.size);
-        const group = eventUsesAllPlayers(ev)
-          ? available.splice(0, available.length)
-          : available.splice(0, Math.min(count, available.length));
-
-        const deathMap = new Map();
-        for (const idx of validEventKillIndexes(ev)) {
-          const person = group[idx];
-          if (person && aliveIds.has(Number(person.id))) deathMap.set(Number(person.id), person);
-        }
-        let deaths = [...deathMap.values()];
-        if (aliveIds.size - deaths.length < 1) {
-          deaths = deaths.slice(0, Math.max(0, aliveIds.size - 1));
-        }
-
-        const confirmedDeaths = [];
-        for (const dead of deaths) {
-          const [deadUpdate] = await conn.query(
-            "UPDATE hg_players SET alive=0 WHERE id=? AND game_id=? AND alive=1",
-            [dead.id, game.id]
-          );
-          if (deadUpdate.affectedRows === 1) confirmedDeaths.push(dead);
-        }
-
-        const expectedDeath = validEventKillIndexes(ev).length > 0;
-        if (expectedDeath && deaths.length > 0 && confirmedDeaths.length !== deaths.length) {
-          throw new Error("A morte do evento não pôde ser confirmada; a rodada foi cancelada para evitar reviver participante.");
-        }
-
-        const deadIds = new Set(confirmedDeaths.map(p => Number(p.id)));
-        const killer = group.find(p => !deadIds.has(Number(p.id)) && aliveIds.has(Number(p.id)));
-        if (killer && confirmedDeaths.length) {
+        if (!possible.length) {
+          const next = nextPhase(phase, day);
+          phase = next.phase;
+          day = next.day;
           await conn.query(
-            "UPDATE hg_players SET kills=kills+? WHERE id=? AND game_id=? AND alive=1",
-            [confirmedDeaths.length, killer.id, game.id]
+            "UPDATE hg_games SET phase=?,day_number=? WHERE id=? AND status='running'",
+            [phase, day, game.id]
           );
+          continue;
         }
 
-        const text = fill(ev.text, group);
-        const confirmedDeathNames = confirmedDeaths.map(p => p.display_name || p.username);
+        const storyPossible = possible.filter(event => event.event_source !== "normal");
+        const deathPossible = possible.filter(event => validEventKillIndexes(event).length > 0);
+
+        let eventPool = possible;
+        if (storyPossible.length && Math.random() < 0.72) {
+          eventPool = storyPossible;
+        } else if (alive.length > 2 && deathPossible.length && Math.random() < 0.38) {
+          eventPool = deathPossible;
+        }
+
+        selectedEvent = random(eventPool);
+        const count = eventParticipantCount(selectedEvent, alive.length);
+        selectedGroup = eventUsesAllPlayers(selectedEvent)
+          ? shuffle(alive)
+          : available.slice(0, Math.min(count, available.length));
+        selectedPhase = phase;
+        selectedDay = day;
+        selectedScenario = activeScenario;
+      }
+
+      if (!selectedEvent || !selectedGroup.length) {
+        await conn.rollback();
+        return "Sem eventos utilizáveis para as fases atuais.";
+      }
+
+      const aliveIds = new Set(alive.map(player => Number(player.id)));
+      const deathMap = new Map();
+      for (const index of validEventKillIndexes(selectedEvent)) {
+        const person = selectedGroup[index];
+        if (person && aliveIds.has(Number(person.id))) {
+          deathMap.set(Number(person.id), person);
+        }
+      }
+
+      let deaths = [...deathMap.values()];
+      if (aliveIds.size - deaths.length < 1) {
+        deaths = deaths.slice(0, Math.max(0, aliveIds.size - 1));
+      }
+
+      const confirmedDeaths = [];
+      for (const dead of deaths) {
+        const [updated] = await conn.query(
+          "UPDATE hg_players SET alive=0 WHERE id=? AND game_id=? AND alive=1",
+          [dead.id, game.id]
+        );
+        if (updated.affectedRows === 1) confirmedDeaths.push(dead);
+      }
+
+      if (deaths.length && confirmedDeaths.length !== deaths.length) {
+        throw new Error("A morte do evento não pôde ser confirmada; o evento foi cancelado para impedir que alguém morto volte a aparecer.");
+      }
+
+      const deadIds = new Set(confirmedDeaths.map(player => Number(player.id)));
+      const killer = selectedGroup.find(
+        player => !deadIds.has(Number(player.id)) && aliveIds.has(Number(player.id))
+      );
+      if (killer && confirmedDeaths.length) {
         await conn.query(
-          "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,?,?,?,?)",
-          [game.id, channel, phase, day, text, confirmedDeathNames.join(", ")]
+          "UPDATE hg_players SET kills=kills+? WHERE id=? AND game_id=? AND alive=1",
+          [confirmedDeaths.length, killer.id, game.id]
+        );
+      }
+
+      const text = fill(selectedEvent.text, selectedGroup);
+      const deathNames = confirmedDeaths.map(player => player.display_name || player.username);
+      await conn.query(
+        "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,?,?,?,?)",
+        [game.id, channel, selectedPhase, selectedDay, text, deathNames.join(", ")]
+      );
+
+      await conn.query(
+        "INSERT IGNORE INTO hg_phase_usage (game_id,phase,day_number,player_id) VALUES ?",
+        [selectedGroup.map(player => [game.id, selectedPhase, selectedDay, player.id])]
+      );
+
+      if (selectedEvent.event_source === "scenario_trigger") {
+        const scenarioId = Number(selectedEvent.scenario_id || selectedEvent.id);
+        await conn.query(
+          "INSERT IGNORE INTO hg_game_scenario_runs (game_id,scenario_id) VALUES (?,?)",
+          [game.id, scenarioId]
+        );
+        await conn.query(
+          "UPDATE hg_games SET active_scenario_id=? WHERE id=?",
+          [scenarioId, game.id]
+        );
+        activeScenarioId = scenarioId;
+      } else if (selectedEvent.event_source === "scenario_child") {
+        const scenarioId = Number(selectedEvent.scenario_id);
+        await conn.query(
+          "INSERT IGNORE INTO hg_scenario_usage (game_id,scenario_id,event_id) VALUES (?,?,?)",
+          [game.id, scenarioId, Number(selectedEvent.id)]
         );
 
-        if (ev.event_source === "scenario_trigger") {
-          const scenarioId = Number(ev.scenario_id || ev.id);
-          if (!Number(ev.mix_with_normal)) exclusiveScenarioThisRound = true;
-          await conn.query(
-            "INSERT IGNORE INTO hg_game_scenario_runs (game_id,scenario_id) VALUES (?,?)",
-            [game.id, scenarioId]
+        const [remaining] = await conn.query(
+          `SELECT COUNT(*) AS total
+           FROM hg_scenario_events se
+           LEFT JOIN hg_scenario_usage u
+             ON u.game_id=? AND u.event_id=se.id
+           WHERE se.scenario_id=? AND se.active=1 AND u.event_id IS NULL
+             AND (se.adult=0 OR ?=1)`,
+          [game.id, scenarioId, adultAllowed]
+        );
+        if (Number(remaining?.[0]?.total || 0) === 0) {
+          await finishScenario(
+            conn,
+            game.id,
+            scenarioId,
+            channel,
+            selectedPhase,
+            selectedDay,
+            selectedEvent.scenario_name || selectedScenario?.name || ""
           );
-          await conn.query("UPDATE hg_games SET active_scenario_id=? WHERE id=?", [scenarioId, game.id]);
-          activeScenarioId = scenarioId;
-          allowScenarioTrigger = false;
-        } else if (ev.event_source === "scenario_child") {
-          await conn.query(
-            "INSERT IGNORE INTO hg_scenario_usage (game_id,scenario_id,event_id) VALUES (?,?,?)",
-            [game.id, Number(ev.scenario_id), Number(ev.id)]
-          );
-
-          const [remaining] = await conn.query(
-            `SELECT COUNT(*) AS total
-             FROM hg_scenario_events se
-             LEFT JOIN hg_scenario_usage u
-               ON u.game_id=? AND u.event_id=se.id
-             WHERE se.scenario_id=? AND se.active=1 AND u.event_id IS NULL
-               AND (se.adult=0 OR ?=1)`,
-            [game.id, Number(ev.scenario_id), adultAllowed]
-          );
-          if (Number(remaining?.[0]?.total || 0) === 0) {
-            await finishScenario(conn, game.id, Number(ev.scenario_id), channel, phase, day, ev.scenario_name || "");
-            activeScenarioId = 0;
-            allowScenarioTrigger = false;
-          }
+          activeScenarioId = 0;
         }
       }
 
@@ -1501,24 +1599,39 @@ async function nextRound(channel) {
         "SELECT * FROM hg_players WHERE game_id=? AND alive=1 ORDER BY RAND() FOR UPDATE",
         [game.id]
       );
+
       if (alive.length <= 1) {
         const winner = alive[0]?.display_name || null;
-        await conn.query("UPDATE hg_games SET status='ended',winner=? WHERE id=?", [winner, game.id]);
         await conn.query(
-          "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,'winner',?,?, '')",
-          [game.id, channel, day, winner ? `🏆 ${winner} venceu a arena!` : "A partida acabou sem vencedor."]
+          "UPDATE hg_games SET status='ended',winner=?,active_scenario_id=NULL WHERE id=?",
+          [winner, game.id]
         );
         await conn.commit();
-        return winner ? `🏆 ${winner} venceu a arena!` : "A partida acabou sem vencedor.";
+        return winner
+          ? `🏆 Um evento foi gerado. ${winner} venceu a arena!`
+          : "Um evento foi gerado. A partida acabou sem vencedor.";
       }
 
-      const np = nextPhase(phase, day);
-      await conn.query(
-        "UPDATE hg_games SET phase=?,day_number=? WHERE id=? AND status='running'",
-        [np.phase, np.day, game.id]
+      const [remainingForPhase] = await conn.query(
+        `SELECT p.id
+         FROM hg_players p
+         LEFT JOIN hg_phase_usage u
+           ON u.game_id=p.game_id AND u.player_id=p.id
+          AND u.phase=? AND u.day_number=?
+         WHERE p.game_id=? AND p.alive=1 AND u.player_id IS NULL`,
+        [selectedPhase, selectedDay, game.id]
       );
+
+      if (!remainingForPhase.length) {
+        const next = nextPhase(selectedPhase, selectedDay);
+        await conn.query(
+          "UPDATE hg_games SET phase=?,day_number=? WHERE id=? AND status='running'",
+          [next.phase, next.day, game.id]
+        );
+      }
+
       await conn.commit();
-      return `✅ ${title} gerado. Restam ${alive.length} vivos.`;
+      return `✅ 1 evento gerado em ${phaseName(selectedPhase, selectedDay)}. Restam ${alive.length} vivos.`;
     } catch (error) {
       try { await conn.rollback(); } catch {}
       throw error;
@@ -1526,15 +1639,13 @@ async function nextRound(channel) {
   });
 }
 
-
 async function startAuto(channel) {
   const ch = nick(channel || "icarolinaporto");
   stopAuto(ch);
   const game = await currentGame(ch, false);
   if (!game || game.status !== "running") return "A partida precisa estar rodando. Clique em Iniciar primeiro.";
-  const intervalMs = getAutoIntervalMs();
 
-  const scheduleNext = () => {
+  const scheduleNext = (delayMs = 1200) => {
     const timer = setTimeout(async () => {
       if (!autoTimers.has(ch)) return;
       try {
@@ -1543,22 +1654,31 @@ async function startAuto(channel) {
           stopAuto(ch);
           return;
         }
+        const beforeLogId = await latestLogId(g.id);
         const result = await nextRound(ch);
         if (/venceu|acabou|já acabou|não há nenhuma história ativa pendente/i.test(String(result))) {
           stopAuto(ch);
           return;
         }
-        if (autoTimers.has(ch)) scheduleNext();
+        const after = await currentGame(ch, false);
+        const afterLogId = await latestLogId(after?.id || g.id);
+        if (afterLogId > beforeLogId) {
+          const fallbackMs = Math.max(35000, getAutoIntervalMs(after) + 25000);
+          await waitForPlaybackAck(ch, after?.id || g.id, afterLogId, fallbackMs);
+        } else {
+          await sleep(getAutoIntervalMs(after));
+        }
+        if (autoTimers.has(ch)) scheduleNext(1100);
       } catch (e) {
         console.error("Erro no auto HG:", e);
         stopAuto(ch);
       }
-    }, intervalMs);
+    }, Math.max(500, delayMs));
     autoTimers.set(ch, timer);
   };
 
-  scheduleNext();
-  return `▶️ Automático ligado. Rodada a cada ${Math.round(intervalMs / 1000)}s, sem sobrepor rodadas.`;
+  scheduleNext(1000);
+  return `▶️ Automático ligado. O próximo evento só é criado depois que a página pública termina a exibição e a narração.`;
 }
 
 function parseCommand(raw) {
@@ -1637,6 +1757,22 @@ async function adminAction(req, res) {
     if (action === "adult_off") return send(res, await adult(ch, false));
     if (action === "normal_events_on") return send(res, await setNormalEvents(ch, true));
     if (action === "normal_events_off") return send(res, await setNormalEvents(ch, false));
+    if (action === "set_narration") {
+      await ensureTables();
+      const game = await currentGame(ch, true);
+      const db = await getPool();
+      const enabled = String(req.body?.enabled ?? req.query.enabled ?? "1") === "1" ? 1 : 0;
+      const voice = String(req.body?.voice || req.query.voice || "google-online").trim().slice(0, 160) || "google-online";
+      const rateRaw = Number(req.body?.rate ?? req.query.rate ?? 1.15);
+      const rate = Math.max(0.70, Math.min(2, Number.isFinite(rateRaw) ? rateRaw : 1.15));
+      const delayRaw = Number(req.body?.event_delay_ms ?? req.query.event_delay_ms ?? 9000);
+      const eventDelayMs = Math.max(4000, Math.min(60000, Number.isFinite(delayRaw) ? Math.round(delayRaw) : 9000));
+      await db.query(
+        "UPDATE hg_games SET narration_enabled=?,narration_voice=?,narration_rate=?,event_delay_ms=? WHERE id=?",
+        [enabled, voice, rate, eventDelayMs, game.id]
+      );
+      return send(res, `✅ Narração pública ${enabled ? "ativada" : "desativada"}. Cada evento ficará visível por no mínimo ${(eventDelayMs / 1000).toFixed(1).replace(".", ",")}s.`);
+    }
     if (action === "add_player") return send(res, await addManual(ch, req.query.name || req.body?.name, req.query.district || req.body?.district));
     if (action === "add_all_chat") return send(res, await addAllChatters(ch));
     if (action === "seed_adult_heavy") return send(res, await seedHeavyAdultEvents());
@@ -1963,7 +2099,13 @@ async function state(req, res) {
         : Number(events?.[0]?.storyAdultTotal || 0),
       activeScenario: activeScenarioRows?.[0] || null,
       autoRunning: isAutoRunning(ch),
-      autoIntervalMs: getAutoIntervalMs()
+      autoIntervalMs: getAutoIntervalMs(game),
+      narration: {
+        enabled: Number(game?.narration_enabled ?? 1) === 1,
+        voice: String(game?.narration_voice || "google-online"),
+        rate: Number(game?.narration_rate || 1.15),
+        eventDelayMs: getAutoIntervalMs(game)
+      }
     });
   } catch (e) {
     if (conn) {
@@ -2011,11 +2153,12 @@ body.hg-running .event-person .event-name,
 .event-person{font-size:0!important;line-height:0!important}
 .event-person img,.event-person .avatar,.event-person .fake{font-size:16px!important;line-height:normal!important}
 
-.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{display:grid;grid-template-columns:1.25fr 1fr .7fr 1.4fr .8fr;gap:8px;margin-top:12px}.scenario-card{border:1px solid var(--b);background:#10101a;border-radius:20px;overflow:hidden}.scenario-head{display:flex;align-items:center;gap:10px;padding:14px;cursor:pointer;background:#171726}.scenario-arrow{width:42px;min-width:42px;padding:9px;background:#303044}.scenario-title{flex:1}.scenario-body{padding:14px;border-top:1px solid var(--b)}.scenario-body.collapsed{display:none}.scenario-flags{display:flex;gap:8px;flex-wrap:wrap}.flag{font-size:11px;font-weight:950;border:1px solid var(--b);border-radius:999px;padding:5px 8px;color:#ddd6fe}.switch-row{display:flex;align-items:center;gap:10px;border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:10px 12px}.switch-row input{width:20px;height:20px;accent-color:var(--p)}.child-list{display:flex;flex-direction:column;gap:10px;margin-top:12px}.child-card{border:1px solid var(--b);border-radius:16px;padding:12px;background:#0d0d16}.scenario-help{border-left:4px solid var(--p);padding:10px 12px;background:#1b1026;border-radius:10px;margin:10px 0}.wide-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.narration-bar{display:grid;grid-template-columns:auto minmax(210px,1fr) minmax(180px,.75fr) auto;gap:8px;margin:0 0 8px;align-items:center}.narration-bar button{white-space:nowrap}.narration-speed{border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:7px 10px}.narration-speed label{display:flex;justify-content:space-between;gap:8px;font-size:12px;font-weight:900;color:#ddd6fe}.narration-speed input{padding:0;height:18px;accent-color:var(--p)}.narration-help{margin:0 0 14px}.story-card{border-color:#6b21a8;box-shadow:0 18px 60px #581c8730}.player-count-note{display:block;margin-top:6px;color:#c4b5fd}.player-count-input{font-weight:900}.log.event-sync-active{outline:3px solid #a855f7;box-shadow:0 0 0 6px #a855f720,0 18px 45px #0008;transform:scale(1.012);transition:outline-color .18s,box-shadow .18s,transform .18s}.log.event-sync-enter{animation:eventSyncEnter .22s ease-out}@keyframes eventSyncEnter{from{opacity:.15;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}@media(max-width:900px){.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{grid-template-columns:1fr 1fr}.scenario-create-grid textarea,.scenario-edit-grid textarea,.child-edit-grid textarea,.span-all{grid-column:1/-1}.narration-bar{grid-template-columns:1fr}.admin-event-grid{grid-template-columns:1fr 1fr!important}}
-</style></head><body><div class="wrap"><div class="top"><div><h1>Hunger Games da Live</h1><div class="sub">Participantes do chat, distritos, eventos, mortes e vencedor final.</div></div><div class="pill" id="statusPill">Carregando...</div></div>
+.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{display:grid;grid-template-columns:1.25fr 1fr .7fr 1.4fr .8fr;gap:8px;margin-top:12px}.scenario-card{border:1px solid var(--b);background:#10101a;border-radius:20px;overflow:hidden}.scenario-head{display:flex;align-items:center;gap:10px;padding:14px;cursor:pointer;background:#171726}.scenario-arrow{width:42px;min-width:42px;padding:9px;background:#303044}.scenario-title{flex:1}.scenario-body{padding:14px;border-top:1px solid var(--b)}.scenario-body.collapsed{display:none}.scenario-flags{display:flex;gap:8px;flex-wrap:wrap}.flag{font-size:11px;font-weight:950;border:1px solid var(--b);border-radius:999px;padding:5px 8px;color:#ddd6fe}.switch-row{display:flex;align-items:center;gap:10px;border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:10px 12px}.switch-row input{width:20px;height:20px;accent-color:var(--p)}.child-list{display:flex;flex-direction:column;gap:10px;margin-top:12px}.child-card{border:1px solid var(--b);border-radius:16px;padding:12px;background:#0d0d16}.scenario-help{border-left:4px solid var(--p);padding:10px 12px;background:#1b1026;border-radius:10px;margin:10px 0}.wide-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.narration-bar{display:grid;grid-template-columns:auto minmax(210px,1fr) minmax(180px,.75fr) minmax(180px,.75fr) auto;gap:8px;margin:0 0 8px;align-items:center}.narration-bar button{white-space:nowrap}.narration-speed{border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:7px 10px}.narration-speed label{display:flex;justify-content:space-between;gap:8px;font-size:12px;font-weight:900;color:#ddd6fe}.narration-speed input{padding:0;height:18px;accent-color:var(--p)}.narration-help{margin:0 0 14px}.story-card{border-color:#6b21a8;box-shadow:0 18px 60px #581c8730}.player-count-note{display:block;margin-top:6px;color:#c4b5fd}.player-count-input{font-weight:900}.log.event-sync-active{outline:3px solid #a855f7;box-shadow:0 0 0 6px #a855f720,0 18px 45px #0008;transform:scale(1.012);transition:outline-color .18s,box-shadow .18s,transform .18s}.log.event-sync-enter{animation:eventSyncEnter .22s ease-out}@keyframes eventSyncEnter{from{opacity:.15;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}.audio-unlock{position:fixed;right:18px;bottom:18px;z-index:9999;background:#22c55e;color:#061208;box-shadow:0 12px 35px #000a;border:2px solid #86efac;display:none}.audio-unlock.show{display:block}
+@media(max-width:900px){.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{grid-template-columns:1fr 1fr}.scenario-create-grid textarea,.scenario-edit-grid textarea,.child-edit-grid textarea,.span-all{grid-column:1/-1}.narration-bar{grid-template-columns:1fr}.admin-event-grid{grid-template-columns:1fr 1fr!important}}
+</style></head><body>${admin ? `` : `<button id="audioUnlock" class="audio-unlock" onclick="unlockPublicAudio()">🔊 Clique uma vez para liberar a narração</button>`}<div class="wrap"><div class="top"><div><h1>Hunger Games da Live</h1><div class="sub">Participantes do chat, distritos, eventos, mortes e vencedor final.</div></div><div class="pill" id="statusPill">Carregando...</div></div>
 <div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div>${admin ? `<div id="normalEventsStatus" class="small" style="margin-top:7px;font-weight:950"></div>` : ``}</div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar automático</button><button class="danger" onclick="act('reset')">Resetar</button><button id="normalEventsToggle" class="danger" onclick="toggleNormalEvents()">Desativar eventos antigos</button><button class="secondary" onclick="act('adult_on')">Ligar +18</button><button class="secondary" onclick="act('adult_off')">Desligar +18</button><button class="secondary" onclick="act('add_all_chat')">Adicionar todos do chat</button><button class="secondary" onclick="seedAdultHeavy()">Adicionar +18 pesado</button></div>` : ``}</div>
 ${admin ? `<div class="two" style="margin:16px 0"><input id="manualName" placeholder="Adicionar participante manual"/><input id="manualDistrict" placeholder="Distrito" type="number" min="1" max="12"/><button style="grid-column:1/-1" onclick="addPlayer()">Adicionar participante</button></div>` : ``}
-<div id="participantsBox" class="lobby-only"><h2>Participantes</h2><div class="players" id="players"></div></div></section><aside class="card events-card"><h2 class="events-title">Eventos</h2>${admin ? `<div class="narration-bar"><button id="narrationToggle" class="secondary" onclick="toggleNarration()">🔊 Ativar narração</button><select id="narrationVoice" aria-label="Voz da narração"></select><div class="narration-speed"><label><span>Velocidade</span><span id="narrationRateValue">1,30x</span></label><input id="narrationRate" type="range" min="0.70" max="2.00" step="0.05" value="1.30" aria-label="Velocidade da narração"></div><button class="secondary" onclick="testNarration()">▶ Testar voz</button></div><div class="small narration-help">Esses controles aparecem somente no painel administrativo. A página pública usa a voz, a velocidade e o estado definidos aqui.</div>` : ``}<div class="logs" id="logs"></div></aside></div>
+<div id="participantsBox" class="lobby-only"><h2>Participantes</h2><div class="players" id="players"></div></div></section><aside class="card events-card"><h2 class="events-title">Eventos</h2>${admin ? `<div class="narration-bar"><button id="narrationToggle" class="secondary" onclick="toggleNarration()">🔊 Ativar narração pública</button><select id="narrationVoice" aria-label="Voz da narração"></select><div class="narration-speed"><label><span>Velocidade da voz</span><span id="narrationRateValue">1,15x</span></label><input id="narrationRate" type="range" min="0.70" max="2.00" step="0.05" value="1.15" aria-label="Velocidade da narração"></div><div class="narration-speed"><label><span>Tempo mínimo por evento</span><span id="eventDelayValue">9,0s</span></label><input id="eventDelay" type="range" min="4" max="30" step="1" value="9" aria-label="Tempo mínimo de exibição de cada evento"></div><button class="secondary" onclick="testNarration()">▶ Testar voz</button></div><div id="narrationSaveStatus" class="small narration-help">Esses controles aparecem somente no painel administrativo. O áudio toca na página pública, e o próximo evento espera a narração terminar.</div>` : ``}<div class="logs" id="logs"></div></aside></div>
 ${admin ? `<section class="card story-card" style="margin-top:18px"><h2>Modo História</h2><div class="scenario-help"><b>Exemplo:</b> “Um ET invade a arena”. Crie a introdução e depois abra a seta para cadastrar os acontecimentos decorrentes.</div><div class="small">Na seleção de pessoas, escolha <b>Todos</b> para colocar todos os participantes vivos na mesma cena. No texto, use <b>{p}</b> ou <b>{todos}</b> para mostrar todos os nomes.</div>
 <input id="scName" style="margin-top:12px" placeholder="Nome da história: Invasão alienígena"/>
 <div class="scenario-create-grid"><select id="scPhase"><option value="bloodbath">Cornucópia</option><option value="day">Dia</option><option value="night">Noite</option><option value="feast">Banquete</option><option value="arena" selected>Evento da arena</option></select><select id="scType"><option value="neutral">Neutro</option><option value="death">Morte</option><option value="item">Item</option><option value="alliance">Aliança</option><option value="adult">Adulto</option></select><input id="scPlayers" class="player-count-input" type="text" value="Todos" placeholder="Número ou Todos" title="Digite qualquer número inteiro ou Todos" autocomplete="off"/><input id="scKills" placeholder="Mortes: p2"/><select id="scAdult"><option value="0">Normal</option><option value="1">+18</option></select></div>
@@ -2036,37 +2179,44 @@ function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&l
 async function api(path,opt={}){const sep=path.includes("?")?"&":"?";const url=path+sep+"channel="+encodeURIComponent(channel)+(token?"&token="+encodeURIComponent(token):"");const r=await fetch(url,{cache:"no-store",...opt}),ct=r.headers.get("content-type")||"";return ct.includes("json")?r.json():r.text()}
 function avatarHtml(p,cls="avatar"){return p&&p.avatar_url?'<img class="'+cls+'" src="'+esc(p.avatar_url)+'">':'<div class="'+cls+' fake">'+esc(((p&&p.display_name)||"?").slice(0,1).toUpperCase())+'</div>'}
 function mentionedPlayers(text,players){const found=[];const lower=String(text||"").toLowerCase();players.forEach(p=>{const nm=String(p.display_name||p.username||"").toLowerCase();if(nm&&lower.includes(nm)&&!found.some(x=>x.id===p.id))found.push(p)});return found}
-const NARRATION_ENABLED_KEY="hgNarrationEnabledV54",NARRATION_VOICE_KEY="hgNarrationVoiceNaturalV54",NARRATION_RATE_KEY="hgNarrationRate";
-let narrationEnabled=(localStorage.getItem(NARRATION_ENABLED_KEY)||localStorage.getItem("hgNarrationEnabledV52"))==="1",narrationVoices=[];
-let narrationChannel=null,narrationAdminLastSeen=0,currentNarrationAudio=null,currentNarrationUtterance=null,narrationStopToken=0;
-const narrationTabId=Math.random().toString(36).slice(2)+Date.now().toString(36);
-try{if("BroadcastChannel" in window){narrationChannel=new BroadcastChannel("hg-narration-sync-v54")}}catch{}
-function sendNarrationHeartbeat(){if(!admin)return;try{narrationChannel?.postMessage({type:"admin-heartbeat",tabId:narrationTabId,at:Date.now()})}catch{}}
-function shouldNarrateHere(){return admin||Date.now()-narrationAdminLastSeen>2600}
+const NARRATION_ENABLED_KEY="hgNarrationEnabledV56",NARRATION_VOICE_KEY="hgNarrationVoiceNaturalV56",NARRATION_RATE_KEY="hgNarrationRateV56",NARRATION_DELAY_KEY="hgNarrationDelayV56";
+let narrationEnabled=true,narrationVoices=[],narrationEventDelayMs=9000,narrationServerSignature="";
+let narrationChannel=null,currentNarrationAudio=null,currentNarrationUtterance=null,narrationStopToken=0,narrationSaveTimer=null,audioUnlockNeeded=false,pendingNarrationText="",audioUnlockWaiters=[];
+try{if("BroadcastChannel" in window){narrationChannel=new BroadcastChannel("hg-narration-sync-v56")}}catch{}
+function shouldNarrateHere(){return !admin}
 function availableNarrationVoices(){return (window.speechSynthesis?.getVoices?.()||[]).slice()}
 function narrationVoiceScore(v){const name=String(v?.name||"");const lang=String(v?.lang||"");let score=0;if(/^pt(-|_)?br/i.test(lang))score+=1000;else if(/^pt/i.test(lang))score+=700;if(/natural|neural|online|francisca|antonio|thalita/i.test(name))score+=350;if(/google/i.test(name))score+=120;if(v&&v.localService===false)score+=40;return score}
 function savedNarrationVoice(){return localStorage.getItem(NARRATION_VOICE_KEY)||"google-online"}
-function broadcastNarrationSettings(){try{narrationChannel?.postMessage({enabled:narrationEnabled,voice:savedNarrationVoice(),rate:narrationRate()})}catch{}}
-function populateNarrationVoices(){narrationVoices=availableNarrationVoices();narrationVoices.sort((a,b)=>narrationVoiceScore(b)-narrationVoiceScore(a)||a.name.localeCompare(b.name));const select=document.getElementById("narrationVoice");if(!select)return;const saved=savedNarrationVoice();select.innerHTML='<option value="google-online">Google online — português do Brasil</option>'+narrationVoices.map((v,i)=>'<option value="voice-'+i+'">'+esc(v.name+' — '+v.lang)+'</option>').join("");if(saved==="google-online")select.value="google-online";else{const chosen=narrationVoices.findIndex(v=>v.name===saved);select.value=chosen>=0?"voice-"+chosen:"google-online"}select.onchange=()=>{const value=String(select.value||"google-online");if(value==="google-online")localStorage.setItem(NARRATION_VOICE_KEY,"google-online");else{const v=narrationVoices[Number(value.replace("voice-",""))];localStorage.setItem(NARRATION_VOICE_KEY,v?.name||"google-online")}broadcastNarrationSettings()}}
+function broadcastNarrationSettings(){try{narrationChannel?.postMessage({enabled:narrationEnabled,voice:savedNarrationVoice(),rate:narrationRate(),eventDelayMs:narrationEventDelayMs})}catch{}}
+function eventDisplayDelayMs(){return Math.max(4000,Math.min(60000,Number(narrationEventDelayMs||9000)))}
+function showAudioUnlock(){if(admin)return;audioUnlockNeeded=true;document.getElementById("audioUnlock")?.classList.add("show")}
+function waitForPublicAudioUnlock(timeoutMs=30000){if(admin||!audioUnlockNeeded)return Promise.resolve(true);return new Promise(resolve=>{let done=false;const finish=value=>{if(done)return;done=true;clearTimeout(timer);audioUnlockWaiters=audioUnlockWaiters.filter(fn=>fn!==finish);resolve(value)};audioUnlockWaiters.push(finish);const timer=setTimeout(()=>finish(false),Math.max(5000,timeoutMs))})}
+function resolvePublicAudioUnlock(value=true){const waiters=audioUnlockWaiters.slice();audioUnlockWaiters=[];for(const finish of waiters){try{finish(value)}catch{}}}
+async function unlockPublicAudio(){if(admin)return;const button=document.getElementById("audioUnlock");try{const audio=new Audio("/hg/tts?text="+encodeURIComponent("Som ativado."));audio.preload="auto";audio.volume=.08;await audio.play();await new Promise(resolve=>{let done=false;const finish=()=>{if(done)return;done=true;resolve()};audio.onended=finish;audio.onerror=finish;setTimeout(finish,1800)});audioUnlockNeeded=false;sessionStorage.setItem("hgPublicAudioUnlockedV56","1");button?.classList.remove("show");if("speechSynthesis" in window){try{window.speechSynthesis.resume()}catch{}}const pending=pendingNarrationText;pendingNarrationText="";let narrated=true;if(pending)narrated=await speakNarration(pending,true);resolvePublicAudioUnlock(narrated)}catch(e){resolvePublicAudioUnlock(false);if(button){button.textContent="🔊 Clique novamente para liberar a narração";button.classList.add("show")}}}
+function scheduleNarrationSave(){if(!admin)return;clearTimeout(narrationSaveTimer);const status=document.getElementById("narrationSaveStatus");if(status)status.textContent="Salvando narração e tempo dos eventos...";narrationSaveTimer=setTimeout(saveNarrationSettings,250)}
+async function saveNarrationSettings(){if(!admin)return;const status=document.getElementById("narrationSaveStatus");try{const body={action:"set_narration",enabled:narrationEnabled?"1":"0",voice:savedNarrationVoice(),rate:narrationRate(),event_delay_ms:eventDisplayDelayMs()};const result=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});if(status)status.textContent=String(result);broadcastNarrationSettings()}catch(e){if(status)status.textContent="Erro ao salvar a narração."}}
+function applyServerNarrationSettings(settings={}){const enabled=typeof settings.enabled==="boolean"?settings.enabled:true;const voice=String(settings.voice||"google-online");const rate=Math.max(.70,Math.min(2,Number(settings.rate||1.15)));const delay=Math.max(4000,Math.min(60000,Number(settings.eventDelayMs||9000)));const signature=[enabled,voice,rate,delay].join("|");if(signature===narrationServerSignature)return;const wasEnabled=narrationEnabled;narrationServerSignature=signature;narrationEnabled=enabled;narrationEventDelayMs=delay;localStorage.setItem(NARRATION_ENABLED_KEY,enabled?"1":"0");localStorage.setItem(NARRATION_VOICE_KEY,voice);localStorage.setItem(NARRATION_RATE_KEY,String(rate));localStorage.setItem(NARRATION_DELAY_KEY,String(delay));if(wasEnabled&&!enabled)stopNarrationSpeech();const slider=document.getElementById("narrationRate");if(slider){slider.value=String(rate);slider.dataset.ready="1"}const delaySlider=document.getElementById("eventDelay");if(delaySlider){delaySlider.value=String(delay/1000);delaySlider.dataset.ready="1"}updateNarrationRate(false);updateEventDelay(false);populateNarrationVoices();updateNarrationButton()}
+function populateNarrationVoices(){narrationVoices=availableNarrationVoices();narrationVoices.sort((a,b)=>narrationVoiceScore(b)-narrationVoiceScore(a)||a.name.localeCompare(b.name));const select=document.getElementById("narrationVoice");if(!select)return;const saved=savedNarrationVoice();select.innerHTML='<option value="google-online">Google online — português do Brasil</option>'+narrationVoices.map((v,i)=>'<option value="voice-'+i+'">'+esc(v.name+' — '+v.lang)+'</option>').join("");if(saved==="google-online")select.value="google-online";else{const chosen=narrationVoices.findIndex(v=>v.name===saved);select.value=chosen>=0?"voice-"+chosen:"google-online"}select.onchange=()=>{const value=String(select.value||"google-online");if(value==="google-online")localStorage.setItem(NARRATION_VOICE_KEY,"google-online");else{const v=narrationVoices[Number(value.replace("voice-",""))];localStorage.setItem(NARRATION_VOICE_KEY,v?.name||"google-online")}broadcastNarrationSettings();scheduleNarrationSave()}}
 function selectedNarrationMode(){const select=document.getElementById("narrationVoice");if(select)return String(select.value||"google-online")==="google-online"?"google":"browser";return savedNarrationVoice()==="google-online"?"google":"browser"}
 function selectedNarrationVoice(){const select=document.getElementById("narrationVoice");if(select&&String(select.value).startsWith("voice-"))return narrationVoices[Number(String(select.value).replace("voice-",""))]||null;const saved=savedNarrationVoice();if(saved==="google-online")return narrationVoices.find(v=>narrationVoiceScore(v)>=1000)||narrationVoices.find(v=>/^pt/i.test(v.lang))||null;return narrationVoices.find(v=>v.name===saved)||narrationVoices.find(v=>narrationVoiceScore(v)>=1000)||narrationVoices.find(v=>/^pt/i.test(v.lang))||null}
-function narrationRate(){const slider=document.getElementById("narrationRate");const n=Number(slider?.value||localStorage.getItem(NARRATION_RATE_KEY)||1.30);return Math.max(.70,Math.min(2,Number.isFinite(n)?n:1.30))}
-function updateNarrationRate(shouldBroadcast=true){const slider=document.getElementById("narrationRate"),label=document.getElementById("narrationRateValue");if(!slider)return;const saved=Number(localStorage.getItem(NARRATION_RATE_KEY)||1.30);if(!slider.dataset.ready){slider.value=String(Math.max(.70,Math.min(2,Number.isFinite(saved)?saved:1.30)));slider.dataset.ready="1"}const rate=narrationRate();localStorage.setItem(NARRATION_RATE_KEY,String(rate));if(label)label.textContent=rate.toFixed(2).replace(".",",")+"x";if(shouldBroadcast===true)broadcastNarrationSettings()}
-function initNarrationControls(){const slider=document.getElementById("narrationRate");if(slider&&!slider.dataset.bound){slider.dataset.bound="1";slider.addEventListener("input",()=>updateNarrationRate(true));slider.addEventListener("change",()=>updateNarrationRate(true))}if(slider)updateNarrationRate(false);populateNarrationVoices();updateNarrationButton()}
-function updateNarrationButton(){const b=document.getElementById("narrationToggle");if(b)b.textContent=narrationEnabled?"🔇 Desativar narração":"🔊 Ativar narração"}
+function narrationRate(){const slider=document.getElementById("narrationRate");const n=Number(slider?.value||localStorage.getItem(NARRATION_RATE_KEY)||1.15);return Math.max(.70,Math.min(2,Number.isFinite(n)?n:1.15))}
+function updateNarrationRate(shouldBroadcast=true){const slider=document.getElementById("narrationRate"),label=document.getElementById("narrationRateValue");if(!slider)return;const saved=Number(localStorage.getItem(NARRATION_RATE_KEY)||1.15);if(!slider.dataset.ready){slider.value=String(Math.max(.70,Math.min(2,Number.isFinite(saved)?saved:1.15)));slider.dataset.ready="1"}const rate=narrationRate();localStorage.setItem(NARRATION_RATE_KEY,String(rate));if(label)label.textContent=rate.toFixed(2).replace(".",",")+"x";if(shouldBroadcast===true){broadcastNarrationSettings();scheduleNarrationSave()}}
+function updateEventDelay(shouldSave=true){const slider=document.getElementById("eventDelay"),label=document.getElementById("eventDelayValue");if(slider){const seconds=Math.max(4,Math.min(30,Number(slider.value||9)));narrationEventDelayMs=Math.round(seconds*1000);localStorage.setItem(NARRATION_DELAY_KEY,String(narrationEventDelayMs));if(label)label.textContent=seconds.toFixed(1).replace(".",",")+"s"}if(shouldSave){broadcastNarrationSettings();scheduleNarrationSave()}}
+function initNarrationControls(){const slider=document.getElementById("narrationRate");if(slider&&!slider.dataset.bound){slider.dataset.bound="1";slider.addEventListener("input",()=>updateNarrationRate(true));slider.addEventListener("change",()=>updateNarrationRate(true))}const delay=document.getElementById("eventDelay");if(delay&&!delay.dataset.bound){delay.dataset.bound="1";delay.addEventListener("input",()=>updateEventDelay(true));delay.addEventListener("change",()=>updateEventDelay(true))}if(slider)updateNarrationRate(false);if(delay)updateEventDelay(false);populateNarrationVoices();updateNarrationButton()}
+function updateNarrationButton(){const b=document.getElementById("narrationToggle");if(b)b.textContent=narrationEnabled?"🔇 Desativar narração pública":"🔊 Ativar narração pública"}
 function stopNarrationSpeech(){narrationStopToken++;if(currentNarrationAudio){try{currentNarrationAudio.pause();currentNarrationAudio.removeAttribute("src");currentNarrationAudio.load()}catch{}currentNarrationAudio=null}currentNarrationUtterance=null;if("speechSynthesis" in window){try{window.speechSynthesis.cancel();window.speechSynthesis.resume()}catch{}}}
-function applyNarrationSettings(data={}){if(data&&data.type==="admin-heartbeat"){narrationAdminLastSeen=Date.now();return}if(typeof data.voice==="string"&&data.voice)localStorage.setItem(NARRATION_VOICE_KEY,data.voice);if(Number.isFinite(Number(data.rate)))localStorage.setItem(NARRATION_RATE_KEY,String(data.rate));if(typeof data.enabled==="boolean"){narrationEnabled=data.enabled;localStorage.setItem(NARRATION_ENABLED_KEY,narrationEnabled?"1":"0")}else narrationEnabled=(localStorage.getItem(NARRATION_ENABLED_KEY)||localStorage.getItem("hgNarrationEnabledV52"))==="1";if(!narrationEnabled)stopNarrationSpeech();const slider=document.getElementById("narrationRate");if(slider){slider.dataset.ready="";updateNarrationRate(false)}populateNarrationVoices();updateNarrationButton()}
-async function toggleNarration(){narrationEnabled=!narrationEnabled;localStorage.setItem(NARRATION_ENABLED_KEY,narrationEnabled?"1":"0");if(!narrationEnabled)stopNarrationSpeech();initNarrationControls();updateNarrationButton();broadcastNarrationSettings();if(narrationEnabled)await speakNarration("Narração ativada.",true)}
+function applyNarrationSettings(data={}){if(typeof data.voice==="string"&&data.voice)localStorage.setItem(NARRATION_VOICE_KEY,data.voice);if(Number.isFinite(Number(data.rate)))localStorage.setItem(NARRATION_RATE_KEY,String(data.rate));if(Number.isFinite(Number(data.eventDelayMs)))narrationEventDelayMs=Math.max(4000,Math.min(60000,Number(data.eventDelayMs)));if(typeof data.enabled==="boolean"){narrationEnabled=data.enabled;localStorage.setItem(NARRATION_ENABLED_KEY,narrationEnabled?"1":"0")}if(!narrationEnabled)stopNarrationSpeech();const slider=document.getElementById("narrationRate");if(slider){slider.dataset.ready="";updateNarrationRate(false)}const delay=document.getElementById("eventDelay");if(delay){delay.value=String(narrationEventDelayMs/1000);updateEventDelay(false)}populateNarrationVoices();updateNarrationButton()}
+async function toggleNarration(){narrationEnabled=!narrationEnabled;localStorage.setItem(NARRATION_ENABLED_KEY,narrationEnabled?"1":"0");if(!narrationEnabled)stopNarrationSpeech();initNarrationControls();updateNarrationButton();broadcastNarrationSettings();await saveNarrationSettings();if(narrationEnabled)await speakNarration("Narração pública ativada.",true)}
 async function testNarration(){initNarrationControls();stopNarrationSpeech();await speakNarration("Teste de narração do modo história. A arena está pronta, e a aventura vai começar.",true)}
 function narrationText(text){return String(text||"").replace(/[📍🎲🔥💀🔞✅⛔🗑️]/g," ").replace(/\s*•\s*/g,", ").replace(/\s+/g," ").trim()}
 function narrationChunks(text,max=180){const clean=narrationText(text);if(!clean)return[];const parts=clean.match(/[^.!?;:]+[.!?;:]?|[^.!?;:]+$/g)||[clean];const chunks=[];let current="";for(const raw of parts){const part=raw.trim();if(!part)continue;if((current+" "+part).trim().length<=max){current=(current+" "+part).trim();continue}if(current)chunks.push(current);if(part.length<=max){current=part;continue}const words=part.split(/\s+/);current="";for(const word of words){if((current+" "+word).trim().length>max){if(current)chunks.push(current);current=word}else current=(current+" "+word).trim()}}if(current)chunks.push(current);return chunks}
-function playGoogleNarrationChunk(chunk,token){return new Promise(resolve=>{if(token!==narrationStopToken)return resolve(false);const audio=new Audio("/hg/tts?text="+encodeURIComponent(chunk));currentNarrationAudio=audio;audio.preload="auto";audio.playbackRate=narrationRate();let done=false;const finish=ok=>{if(done)return;done=true;clearTimeout(timer);audio.onended=null;audio.onerror=null;audio.onabort=null;if(currentNarrationAudio===audio)currentNarrationAudio=null;resolve(ok)};audio.onended=()=>finish(true);audio.onerror=()=>finish(false);audio.onabort=()=>finish(false);const timer=setTimeout(()=>{try{audio.pause()}catch{}finish(false)},Math.max(12000,Math.min(90000,chunk.length*180)));audio.play().catch(()=>finish(false))})}
-function playBrowserNarrationChunk(chunk,token){return new Promise(resolve=>{if(token!==narrationStopToken||!("speechSynthesis" in window))return resolve(false);const synth=window.speechSynthesis;const u=new SpeechSynthesisUtterance(chunk);currentNarrationUtterance=u;u.lang="pt-BR";u.rate=narrationRate();u.pitch=1.03;u.volume=1;const v=selectedNarrationVoice();if(v){u.voice=v;u.lang=v.lang||"pt-BR"}let done=false,started=false;const finish=ok=>{if(done)return;done=true;clearTimeout(startTimer);clearTimeout(endTimer);clearInterval(keepAlive);if(currentNarrationUtterance===u)currentNarrationUtterance=null;resolve(ok)};u.onstart=()=>{started=true};u.onend=()=>finish(true);u.onerror=e=>finish(e?.error==="interrupted"||e?.error==="canceled"?false:false);const startTimer=setTimeout(()=>{if(!started){try{synth.cancel()}catch{}finish(false)}},10000);const endTimer=setTimeout(()=>{try{synth.cancel()}catch{}finish(false)},Math.max(15000,Math.min(120000,chunk.length*220)));const keepAlive=setInterval(()=>{try{if(synth.paused)synth.resume()}catch{}},2500);try{synth.resume();synth.speak(u)}catch{finish(false)}})}
-async function speakNarration(text,force=false){const chunks=narrationChunks(text);if((!narrationEnabled&&!force)||!chunks.length)return false;stopNarrationSpeech();const token=narrationStopToken;let allOk=true;for(const chunk of chunks){if(token!==narrationStopToken)return false;let ok=false;if(selectedNarrationMode()==="google")ok=await playGoogleNarrationChunk(chunk,token);if(!ok)ok=await playBrowserNarrationChunk(chunk,token);if(!ok){allOk=false;await clientSleep(80)}}return allOk}
-window.addEventListener("storage",e=>{if([NARRATION_ENABLED_KEY,NARRATION_VOICE_KEY,NARRATION_RATE_KEY,"hgNarrationEnabledV52","hgNarrationVoiceNaturalV52","hgNarrationVoiceNaturalV51"].includes(e.key))applyNarrationSettings()});
+function playGoogleNarrationChunk(chunk,token){return new Promise(resolve=>{if(token!==narrationStopToken)return resolve(false);const audio=new Audio("/hg/tts?text="+encodeURIComponent(chunk));currentNarrationAudio=audio;audio.preload="auto";audio.playbackRate=narrationRate();audio.volume=1;let done=false;const finish=ok=>{if(done)return;done=true;clearTimeout(timer);audio.onended=null;audio.onerror=null;audio.onabort=null;if(currentNarrationAudio===audio)currentNarrationAudio=null;resolve(ok)};audio.onended=()=>finish(true);audio.onerror=()=>finish(false);audio.onabort=()=>finish(false);const timer=setTimeout(()=>{try{audio.pause()}catch{}finish(false)},Math.max(14000,Math.min(90000,chunk.length*210)));audio.play().catch(error=>{const name=String(error?.name||"").toLowerCase();if(name.includes("notallowed")||name.includes("security"))showAudioUnlock();finish(false)})})}
+function playBrowserNarrationChunk(chunk,token){return new Promise(resolve=>{if(token!==narrationStopToken||!("speechSynthesis" in window))return resolve(false);const synth=window.speechSynthesis;const u=new SpeechSynthesisUtterance(chunk);currentNarrationUtterance=u;u.lang="pt-BR";u.rate=narrationRate();u.pitch=1.03;u.volume=1;const v=selectedNarrationVoice();if(v){u.voice=v;u.lang=v.lang||"pt-BR"}let done=false,started=false;const finish=ok=>{if(done)return;done=true;clearTimeout(startTimer);clearTimeout(endTimer);clearInterval(keepAlive);if(currentNarrationUtterance===u)currentNarrationUtterance=null;resolve(ok)};u.onstart=()=>{started=true};u.onend=()=>finish(true);u.onerror=e=>{const reason=String(e?.error||"").toLowerCase();if(reason.includes("not-allowed")||reason.includes("notallowed"))showAudioUnlock();finish(false)};const startTimer=setTimeout(()=>{if(!started){try{synth.cancel()}catch{}finish(false)}},10000);const endTimer=setTimeout(()=>{try{synth.cancel()}catch{}finish(false)},Math.max(15000,Math.min(120000,chunk.length*240)));const keepAlive=setInterval(()=>{try{if(synth.paused)synth.resume()}catch{}},2000);try{synth.resume();synth.speak(u)}catch{finish(false)}})}
+async function speakNarration(text,force=false){const chunks=narrationChunks(text);if((!narrationEnabled&&!force)||!chunks.length)return false;stopNarrationSpeech();const token=narrationStopToken;for(const chunk of chunks){if(token!==narrationStopToken)return false;let ok=false;if(selectedNarrationMode()==="google"){ok=await playGoogleNarrationChunk(chunk,token);if(!ok&&token===narrationStopToken){await clientSleep(220);ok=await playGoogleNarrationChunk(chunk,token)}}if(!ok)ok=await playBrowserNarrationChunk(chunk,token);if(!ok){if(!admin){pendingNarrationText=chunk;showAudioUnlock()}return false}}pendingNarrationText="";return true}
+window.addEventListener("storage",e=>{if([NARRATION_ENABLED_KEY,NARRATION_VOICE_KEY,NARRATION_RATE_KEY,NARRATION_DELAY_KEY].includes(e.key))applyNarrationSettings()});
 if(narrationChannel)narrationChannel.onmessage=e=>applyNarrationSettings(e.data||{});
-if(admin){sendNarrationHeartbeat();setInterval(sendNarrationHeartbeat,1000)}
 initNarrationControls();if("speechSynthesis" in window){window.speechSynthesis.onvoiceschanged=populateNarrationVoices}
+if(!admin){document.addEventListener("pointerdown",()=>{if(audioUnlockNeeded)unlockPublicAudio()},{passive:true})}
 const clientSleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 let timelineGameId=null,timelineInitialized=false,timelinePlayers=[],timelineQueue=[],timelineQueueRunning=false,timelineGeneration=0;
 const timelineKnownIds=new Set(),timelineQueuedIds=new Set();
@@ -2074,15 +2224,16 @@ function eventCardHtml(l,players,extra=""){const ps=mentionedPlayers(l.text,play
 function clearTimelinePlayback(){timelineGeneration++;timelineQueue=[];timelineQueuedIds.clear();timelineQueueRunning=false;stopNarrationSpeech()}
 function renderTimelineHistory(logs,players,status){const box=document.getElementById("logs");const list=(Array.isArray(logs)?logs:[]).slice().sort((a,b)=>Number(a.id)-Number(b.id));box.innerHTML=list.map(l=>eventCardHtml(l,players)).join("")||"<div class='small' id='timelineEmpty'>Sem eventos ainda.</div>";document.querySelectorAll(".event-name").forEach(e=>e.remove());timelineKnownIds.clear();for(const l of list)timelineKnownIds.add(Number(l.id));if(list.length&&status==="running")requestAnimationFrame(()=>{const last=box.querySelector("[data-log-id]:last-child");if(last)scrollEventIntoView(last,false)})}
 function scrollEventIntoView(el,smooth=true){if(!el)return;const behavior=smooth?"smooth":"auto";if(admin){const box=document.getElementById("logs");const top=Math.max(0,el.offsetTop-box.offsetTop-18);try{box.scrollTo({top,behavior})}catch{box.scrollTop=top}}else{try{el.scrollIntoView({behavior,block:"center",inline:"nearest"})}catch{el.scrollIntoView(false)}}}
-function appendTimelineEvent(log){const box=document.getElementById("logs");document.getElementById("timelineEmpty")?.remove();box.insertAdjacentHTML("beforeend",eventCardHtml(log,timelinePlayers,"event-sync-enter"));document.querySelectorAll(".event-name").forEach(e=>e.remove());return box.querySelector('[data-log-id="'+Number(log.id||0)+'"]')}
-async function runTimelineQueue(){if(timelineQueueRunning)return;const generation=timelineGeneration;timelineQueueRunning=true;try{while(timelineQueue.length&&generation===timelineGeneration){const log=timelineQueue.shift();timelineQueuedIds.delete(Number(log.id));const el=appendTimelineEvent(log);await clientSleep(40);if(generation!==timelineGeneration)break;if(el){el.classList.add("event-sync-active");scrollEventIntoView(el,true)}await clientSleep(220);if(generation!==timelineGeneration)break;const silent=String(log.text||"").startsWith("📍");if(narrationEnabled&&!silent&&shouldNarrateHere())await speakNarration(log.text);else await clientSleep(silent?160:70);if(el)el.classList.remove("event-sync-active","event-sync-enter");await clientSleep(50)}}finally{if(generation===timelineGeneration){timelineQueueRunning=false;if(timelineQueue.length)queueMicrotask(runTimelineQueue)}}}
-function syncEventTimeline(gameId,logs,players,status){const id=Number(gameId||0),list=(Array.isArray(logs)?logs:[]).slice().sort((a,b)=>Number(a.id)-Number(b.id));timelinePlayers=Array.isArray(players)?players:[];if(!timelineInitialized||timelineGameId!==id){clearTimelinePlayback();timelineGameId=id;timelineInitialized=true;renderTimelineHistory(list,timelinePlayers,status);return}for(const log of list){const logId=Number(log.id||0);if(!logId||timelineKnownIds.has(logId)||timelineQueuedIds.has(logId))continue;timelineKnownIds.add(logId);timelineQueuedIds.add(logId);timelineQueue.push(log)}runTimelineQueue()}
+function appendTimelineEvent(log){const box=document.getElementById("logs");const selector='[data-log-id="'+Number(log.id||0)+'"]';const existing=box.querySelector(selector);if(existing)return existing;document.getElementById("timelineEmpty")?.remove();box.insertAdjacentHTML("beforeend",eventCardHtml(log,timelinePlayers,"event-sync-enter"));document.querySelectorAll(".event-name").forEach(e=>e.remove());return box.querySelector(selector)}
+async function acknowledgeTimelineEvent(log){if(admin||!log?.id||!timelineGameId)return;try{localStorage.setItem("hgPublicPlayed:"+channel+":"+timelineGameId,String(log.id))}catch{}try{await fetch("/hg/playback/ack?channel="+encodeURIComponent(channel)+"&game_id="+encodeURIComponent(timelineGameId)+"&log_id="+encodeURIComponent(log.id),{method:"POST",cache:"no-store"})}catch{}}
+async function runTimelineQueue(){if(timelineQueueRunning)return;const generation=timelineGeneration;timelineQueueRunning=true;try{while(timelineQueue.length&&generation===timelineGeneration){const log=timelineQueue.shift();timelineQueuedIds.delete(Number(log.id));const startedAt=Date.now();const el=appendTimelineEvent(log);await clientSleep(120);if(generation!==timelineGeneration)break;if(el){el.classList.add("event-sync-active");scrollEventIntoView(el,true)}await clientSleep(650);if(generation!==timelineGeneration)break;const silent=String(log.text||"").startsWith("📍");if(narrationEnabled&&!silent&&shouldNarrateHere()){const narrated=await speakNarration(log.text);if(!narrated&&audioUnlockNeeded)await waitForPublicAudioUnlock(Math.max(30000,eventDisplayDelayMs()+15000))}const elapsed=Date.now()-startedAt;const minimum=silent?Math.min(3000,eventDisplayDelayMs()):eventDisplayDelayMs();if(elapsed<minimum)await clientSleep(minimum-elapsed);if(generation!==timelineGeneration)break;if(el)el.classList.remove("event-sync-active","event-sync-enter");await acknowledgeTimelineEvent(log);await clientSleep(900)}}finally{if(generation===timelineGeneration){timelineQueueRunning=false;if(timelineQueue.length)queueMicrotask(runTimelineQueue)}}}
+function syncEventTimeline(gameId,logs,players,status){const id=Number(gameId||0),list=(Array.isArray(logs)?logs:[]).slice().sort((a,b)=>Number(a.id)-Number(b.id));timelinePlayers=Array.isArray(players)?players:[];if(!timelineInitialized||timelineGameId!==id){clearTimelinePlayback();timelineGameId=id;timelineInitialized=true;renderTimelineHistory(list,timelinePlayers,status);if(!admin&&status==="running"&&list.length){const latest=list[list.length-1],logId=Number(latest.id||0),created=Date.parse(latest.created_at||"");let played=0;try{played=Number(localStorage.getItem("hgPublicPlayed:"+channel+":"+id)||0)}catch{}const recent=!Number.isFinite(created)||Date.now()-created<180000;if(logId>played&&recent&&!String(latest.text||"").startsWith("📍")){timelineQueuedIds.add(logId);timelineQueue.push(latest);runTimelineQueue()}}return}for(const log of list){const logId=Number(log.id||0);if(!logId||timelineKnownIds.has(logId)||timelineQueuedIds.has(logId))continue;timelineKnownIds.add(logId);timelineQueuedIds.add(logId);timelineQueue.push(log)}runTimelineQueue()}
 let loadInProgress=false,loadAgain=false;
 async function load(){
   if(loadInProgress){loadAgain=true;return}
   loadInProgress=true;
   try{
-    const st=await api("/hg/state"),g=st.game||{};document.body.classList.toggle("hg-running",!admin&&(g.status==="running"||g.status==="ended"));document.getElementById("statusPill").textContent=(statusLabels[g.status]||"AGUARDANDO")+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=phaseLabel(g.phase||"bloodbath",g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida rolando":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Aguardando participantes";const alive=st.players.filter(p=>p.alive).length;document.getElementById("counts").textContent=st.players.length+" participantes • "+alive+" vivos • "+st.eventCount+(Number(g.normal_events_enabled??1)===1?" eventos ativos":" eventos de história")+(st.activeScenario?" • História: "+st.activeScenario.name:"")+(st.autoRunning?" • automático ligado":"");normalEventsCurrentlyEnabled=Number(g.normal_events_enabled??1)===1;if(admin){const toggle=document.getElementById("normalEventsToggle"),label=document.getElementById("normalEventsStatus");if(toggle){toggle.textContent=normalEventsCurrentlyEnabled?"Desativar eventos antigos":"Ativar eventos antigos";toggle.className=normalEventsCurrentlyEnabled?"danger":"ok"}if(label){label.textContent=normalEventsCurrentlyEnabled?"⚠️ Eventos normais/antigos: ATIVADOS":"✅ Modo História exclusivo: eventos normais/antigos DESATIVADOS";label.style.color=normalEventsCurrentlyEnabled?"#fca5a5":"#86efac"}}
+    const st=await api("/hg/state"),g=st.game||{};applyServerNarrationSettings(st.narration||{});document.body.classList.toggle("hg-running",!admin&&(g.status==="running"||g.status==="ended"));document.getElementById("statusPill").textContent=(statusLabels[g.status]||"AGUARDANDO")+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=phaseLabel(g.phase||"bloodbath",g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida rolando":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Aguardando participantes";const alive=st.players.filter(p=>p.alive).length;document.getElementById("counts").textContent=st.players.length+" participantes • "+alive+" vivos • "+st.eventCount+(Number(g.normal_events_enabled??1)===1?" eventos ativos":" eventos de história")+(st.activeScenario?" • História: "+st.activeScenario.name:"")+(st.autoRunning?" • automático ligado":"");normalEventsCurrentlyEnabled=Number(g.normal_events_enabled??1)===1;if(admin){const toggle=document.getElementById("normalEventsToggle"),label=document.getElementById("normalEventsStatus");if(toggle){toggle.textContent=normalEventsCurrentlyEnabled?"Desativar eventos antigos":"Ativar eventos antigos";toggle.className=normalEventsCurrentlyEnabled?"danger":"ok"}if(label){label.textContent=normalEventsCurrentlyEnabled?"⚠️ Eventos normais/antigos: ATIVADOS":"✅ Modo História exclusivo: eventos normais/antigos DESATIVADOS";label.style.color=normalEventsCurrentlyEnabled?"#fca5a5":"#86efac"}}
 const box=document.getElementById("participantsBox");if(box)box.classList.toggle("hidden",g.status==="running");
 document.getElementById("players").innerHTML=st.players.map(p=>{const av=avatarHtml(p);return '<div class="player '+(p.alive?'':'dead')+'">'+av+'<div><div class="district">Distrito '+p.district+'</div><div class="name">'+esc(p.display_name)+'</div><div class="kills">'+(p.kills||0)+' abate(s) '+(p.alive?'🟢':'💀')+'</div></div></div>'}).join("")||"<div class='small'>Ninguém entrou ainda.</div>";
 syncEventTimeline(g.id||0,st.logs,st.players,g.status)  }finally{
@@ -2176,6 +2327,27 @@ app.get("/hg/tts", async (req, res) => {
     return res.status(502).type("text/plain").send("Voz Google indisponível temporariamente.");
   } finally {
     clearTimeout(timeout);
+  }
+});
+
+app.all("/hg/playback/ack", async (req, res) => {
+  try {
+    const ch = channelFrom(req);
+    const gameId = Number(req.query.game_id || req.body?.game_id || 0);
+    const logId = Number(req.query.log_id || req.body?.log_id || 0);
+    if (!gameId || !logId) return res.status(400).json({ ok: false });
+    const db = await getPool();
+    const [rows] = await db.query(
+      "SELECT l.id FROM hg_logs l JOIN hg_games g ON g.id=l.game_id WHERE l.id=? AND l.game_id=? AND g.channel=? LIMIT 1",
+      [logId, gameId, ch]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false });
+    acknowledgePlayback(ch, gameId, logId);
+    res.set("Cache-Control", "no-store");
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("Erro ao confirmar reprodução pública:", e);
+    return res.status(500).json({ ok: false });
   }
 });
 
