@@ -6,8 +6,8 @@ import tls from "node:tls";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = "5.9.2";
-const DEFAULT_WINNER_PRIZE_TEXT = "🏆 {winner}, você ganhou! O seu prêmio é: {premio}";
+const APP_VERSION = "5.9.3";
+const DEFAULT_WINNER_PRIZE_TEXT = "🏆 {vencedor}, você ganhou! O seu prêmio é: {premio}";
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
@@ -441,7 +441,7 @@ const DEFAULT_EVENTS = [
   ["feast","adult",2,"{p1} distrai {p2} com charme e sai do banquete com os melhores suprimentos.","",1],
   ["day","adult",2,"{p1} chama {p2} para uma aliança com benefícios. Ninguém sabe se é estratégia ou safadeza.","",1],
   ["night","adult",1,"{p1} passa a noite lembrando coisas que definitivamente não deveriam ser narradas na live.","",1],
-  ["day","adult",2,"{p1} flerta tanto com {p2} que os patrocinadores ficam confusos se isso é guerra ou date.","",1]
+  ["day","adult",2,"{p1} flerta tanto com {p2} que os patrocinadores ficam confusos se isso é guerra ou encontro.","",1]
 ];
 
 
@@ -625,6 +625,15 @@ async function ensureTables() {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
       `);
 
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS hg_prize_settings (
+          channel VARCHAR(80) NOT NULL PRIMARY KEY,
+          enabled TINYINT(1) NOT NULL DEFAULT 1,
+          text_template TEXT NOT NULL,
+          updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
+
       for (const migration of [
         "ALTER TABLE hg_games ADD COLUMN winner_trophy_enabled TINYINT(1) NOT NULL DEFAULT 1 AFTER event_delay_ms",
         "ALTER TABLE hg_games ADD COLUMN winner_trophy_text TEXT NULL AFTER winner_trophy_enabled",
@@ -640,6 +649,8 @@ async function ensureTables() {
       }
 
       await db.query("UPDATE hg_games SET winner_trophy_text=COALESCE(NULLIF(winner_trophy_text,''), ?) WHERE winner_trophy_text IS NULL OR winner_trophy_text=''", [DEFAULT_WINNER_PRIZE_TEXT]);
+      await db.query("UPDATE hg_games SET winner_trophy_text=REPLACE(winner_trophy_text,'{winner}','{vencedor}') WHERE winner_trophy_text LIKE '%{winner}%'");
+      await db.query("UPDATE hg_prize_settings SET text_template=REPLACE(text_template,'{winner}','{vencedor}') WHERE text_template LIKE '%{winner}%'");
 
       // Migração segura para permitir listas grandes, como p1,p2,...,p25.
       // MODIFY preserva todo o conteúdo já cadastrado.
@@ -819,13 +830,46 @@ async function currentChatters(channel) {
   return trackedChatters(channel);
 }
 
+async function getWinnerPrizeSettings(db, channel) {
+  const ch = nick(channel);
+  await db.query(
+    "INSERT IGNORE INTO hg_prize_settings (channel,enabled,text_template) VALUES (?,1,?)",
+    [ch, DEFAULT_WINNER_PRIZE_TEXT]
+  );
+  const [rows] = await db.query(
+    "SELECT enabled,text_template FROM hg_prize_settings WHERE channel=? LIMIT 1",
+    [ch]
+  );
+  const row = rows[0] || {};
+  return {
+    enabled: Number(row.enabled ?? 1) === 1,
+    text: String(row.text_template || DEFAULT_WINNER_PRIZE_TEXT)
+  };
+}
+
+async function saveWinnerPrizeSettings(db, channel, enabled, text) {
+  const ch = nick(channel);
+  const safeText = String(text || DEFAULT_WINNER_PRIZE_TEXT)
+    .replace(/\{winner\}/gi, "{vencedor}")
+    .trim()
+    .slice(0, 1000) || DEFAULT_WINNER_PRIZE_TEXT;
+  await db.query(
+    `INSERT INTO hg_prize_settings (channel,enabled,text_template)
+     VALUES (?,?,?)
+     ON DUPLICATE KEY UPDATE enabled=VALUES(enabled),text_template=VALUES(text_template)`,
+    [ch, enabled ? 1 : 0, safeText]
+  );
+  return { enabled: Boolean(enabled), text: safeText };
+}
+
 async function currentGame(channel, create = true) {
   await ensureTables();
   const db = await getPool();
   const [rows] = await db.query("SELECT * FROM hg_games WHERE channel=? AND status IN ('lobby','running','ended') ORDER BY id DESC LIMIT 1", [channel]);
   if (rows.length) return rows[0];
   if (!create) return null;
-  const [r] = await db.query("INSERT INTO hg_games (channel,status,phase,day_number,adult_mode,normal_events_enabled,winner_trophy_enabled,winner_trophy_text) VALUES (?, 'lobby', 'bloodbath', 1, ?, ?, 1, ?)", [channel, process.env.HG_ADULT_DEFAULT === "1" ? 1 : 0, process.env.HG_NORMAL_EVENTS_DEFAULT === "0" ? 0 : 1, DEFAULT_WINNER_PRIZE_TEXT]);
+  const prizeSettings = await getWinnerPrizeSettings(db, channel);
+  const [r] = await db.query("INSERT INTO hg_games (channel,status,phase,day_number,adult_mode,normal_events_enabled,winner_trophy_enabled,winner_trophy_text) VALUES (?, 'lobby', 'bloodbath', 1, ?, ?, ?, ?)", [channel, process.env.HG_ADULT_DEFAULT === "1" ? 1 : 0, process.env.HG_NORMAL_EVENTS_DEFAULT === "0" ? 0 : 1, prizeSettings.enabled ? 1 : 0, prizeSettings.text]);
   const [created] = await db.query("SELECT * FROM hg_games WHERE id=?", [r.insertId]);
   return created[0];
 }
@@ -838,8 +882,9 @@ async function newLobby(channel, adult = 0, normalEventsEnabled = 1, narration =
   const narrationVoice = String(narration.voice || "google-online").slice(0, 160);
   const narrationRate = Math.max(0.70, Math.min(2, Number(narration.rate || 1.15)));
   const eventDelayMs = Math.max(4000, Math.min(60000, Number(narration.eventDelayMs || 9000)));
-  const winnerPrizeEnabled = Number(winnerPrize.enabled ?? 1) ? 1 : 0;
-  const winnerPrizeText = String(winnerPrize.text || DEFAULT_WINNER_PRIZE_TEXT);
+  const globalPrizeSettings = await getWinnerPrizeSettings(db, channel);
+  const winnerPrizeEnabled = globalPrizeSettings.enabled ? 1 : 0;
+  const winnerPrizeText = globalPrizeSettings.text;
   const [r] = await db.query(
     "INSERT INTO hg_games (channel,status,phase,day_number,adult_mode,normal_events_enabled,narration_enabled,narration_voice,narration_rate,event_delay_ms,winner_trophy_enabled,winner_trophy_text) VALUES (?, 'lobby', 'bloodbath', 1, ?, ?, ?, ?, ?, ?, ?, ?)",
     [channel, adult ? 1 : 0, normalEventsEnabled ? 1 : 0, narrationEnabled, narrationVoice, narrationRate, eventDelayMs, winnerPrizeEnabled, winnerPrizeText]
@@ -1006,10 +1051,6 @@ async function reset(channel) {
         voice: old?.narration_voice || "google-online",
         rate: Number(old?.narration_rate || 1.15),
         eventDelayMs: Number(old?.event_delay_ms || 9000)
-      },
-      {
-        enabled: Number(old?.winner_trophy_enabled ?? 1),
-        text: old?.winner_trophy_text || DEFAULT_WINNER_PRIZE_TEXT
       }
     );
     return "✅ Arena resetada. Use !hg entrar ou !hg todos.";
@@ -1045,9 +1086,10 @@ function shuffle(a) {
 function random(a) { return a[Math.floor(Math.random()*a.length)]; }
 
 async function assignWinnerPrize(conn, gameId, winner) {
-  const [games] = await conn.query("SELECT winner_trophy_enabled, winner_trophy_text FROM hg_games WHERE id=? LIMIT 1 FOR UPDATE", [gameId]);
+  const [games] = await conn.query("SELECT channel FROM hg_games WHERE id=? LIMIT 1 FOR UPDATE", [gameId]);
   const game = games[0] || {};
-  const enabled = Number(game.winner_trophy_enabled ?? 1) === 1;
+  const settings = await getWinnerPrizeSettings(conn, game.channel || "");
+  const enabled = settings.enabled;
   let trophyId = null, trophyTitle = null, trophyImage = null;
   if (enabled) {
     const [trophies] = await conn.query("SELECT id,title,image_data FROM hg_trophies WHERE active=1 ORDER BY RAND() LIMIT 1");
@@ -1062,7 +1104,7 @@ async function assignWinnerPrize(conn, gameId, winner) {
     "UPDATE hg_games SET status='ended',winner=?,active_scenario_id=NULL,winner_trophy_id=?,winner_trophy_title=?,winner_trophy_image=? WHERE id=?",
     [winner || null, trophyId, trophyTitle, trophyImage, gameId]
   );
-  return { enabled, trophyId, trophyTitle, trophyImage, text: String(game.winner_trophy_text || DEFAULT_WINNER_PRIZE_TEXT) };
+  return { enabled, trophyId, trophyTitle, trophyImage, text: settings.text };
 }
 
 function formatParticipantNames(players) {
@@ -1826,9 +1868,9 @@ async function adminAction(req, res) {
       const game = await currentGame(ch, true);
       const db = await getPool();
       const enabled = String(req.body?.enabled ?? req.query.enabled ?? "1") === "1" ? 1 : 0;
-      const text = String(req.body?.text || req.query.text || DEFAULT_WINNER_PRIZE_TEXT).trim().slice(0, 1000) || DEFAULT_WINNER_PRIZE_TEXT;
-      await db.query("UPDATE hg_games SET winner_trophy_enabled=?, winner_trophy_text=? WHERE id=?", [enabled, text, game.id]);
-      return send(res, enabled ? "✅ Prêmio do vencedor ativado." : "⛔ Prêmio do vencedor desativado.");
+      const saved = await saveWinnerPrizeSettings(db, ch, enabled, req.body?.text || req.query.text || DEFAULT_WINNER_PRIZE_TEXT);
+      await db.query("UPDATE hg_games SET winner_trophy_enabled=?, winner_trophy_text=? WHERE id=?", [saved.enabled ? 1 : 0, saved.text, game.id]);
+      return send(res, saved.enabled ? "✅ Prêmio do vencedor ativado e salvo." : "⛔ Prêmio do vencedor desativado e salvo.");
     }
 
     if (action === "add_trophy") {
@@ -1839,7 +1881,7 @@ async function adminAction(req, res) {
       const activeFlag = String(req.body?.active ?? req.query.active ?? "1") === "1" ? 1 : 0;
       if (!title) return send(res, "Faltou o nome do prêmio.");
       if (!/^data:image\//i.test(imageData)) return send(res, "Envie uma imagem válida do prêmio.");
-      if (imageData.length > 7_000_000) return send(res, "A imagem ficou grande demais. Tente uma JPG, PNG ou WEBP menor.");
+      if (imageData.length > 3_500_000) return send(res, "A imagem ficou grande demais. Escolha uma imagem menor.");
       await db.query("INSERT INTO hg_trophies (title,image_data,active) VALUES (?,?,?)", [title, imageData, activeFlag]);
       return send(res, "✅ Prêmio adicionado.");
     }
@@ -1857,7 +1899,7 @@ async function adminAction(req, res) {
       let sql = "UPDATE hg_trophies SET title=?, active=?";
       if (imageData) {
         if (!/^data:image\//i.test(imageData)) return send(res, "Imagem inválida.");
-        if (imageData.length > 7_000_000) return send(res, "A imagem ficou grande demais. Tente uma JPG, PNG ou WEBP menor.");
+        if (imageData.length > 3_500_000) return send(res, "A imagem ficou grande demais. Escolha uma imagem menor.");
         sql += ", image_data=?";
         params.push(imageData);
       }
@@ -2185,6 +2227,7 @@ async function state(req, res) {
     const [activeScenarioRows] = game?.active_scenario_id
       ? await conn.query("SELECT id,name,mix_with_normal FROM hg_scenarios WHERE id=? LIMIT 1", [game.active_scenario_id])
       : [[]];
+    const prizeSettings = await getWinnerPrizeSettings(conn, ch);
     await conn.commit();
 
     res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
@@ -2211,8 +2254,8 @@ async function state(req, res) {
         eventDelayMs: getAutoIntervalMs(game)
       },
       winnerPrize: {
-        enabled: Number(game?.winner_trophy_enabled ?? 1) === 1,
-        text: String(game?.winner_trophy_text || DEFAULT_WINNER_PRIZE_TEXT),
+        enabled: prizeSettings.enabled,
+        text: prizeSettings.text,
         trophyId: Number(game?.winner_trophy_id || 0),
         trophyTitle: String(game?.winner_trophy_title || ""),
         trophyImage: String(game?.winner_trophy_image || "")
@@ -2264,13 +2307,13 @@ body.hg-running .event-person .event-name,
 .event-person{font-size:0!important;line-height:0!important}
 .event-person img,.event-person .avatar,.event-person .fake{font-size:16px!important;line-height:normal!important}
 
-.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{display:grid;grid-template-columns:1.25fr 1fr .7fr 1.4fr .8fr;gap:8px;margin-top:12px}.scenario-card{border:1px solid var(--b);background:#10101a;border-radius:20px;overflow:hidden}.scenario-head{display:flex;align-items:center;gap:10px;padding:14px;cursor:pointer;background:#171726}.scenario-arrow{width:42px;min-width:42px;padding:9px;background:#303044}.scenario-title{flex:1}.scenario-body{padding:14px;border-top:1px solid var(--b)}.scenario-body.collapsed{display:none}.scenario-flags{display:flex;gap:8px;flex-wrap:wrap}.flag{font-size:11px;font-weight:950;border:1px solid var(--b);border-radius:999px;padding:5px 8px;color:#ddd6fe}.switch-row{display:flex;align-items:center;gap:10px;border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:10px 12px}.switch-row input{width:20px;height:20px;accent-color:var(--p)}.child-list{display:flex;flex-direction:column;gap:10px;margin-top:12px}.child-card{border:1px solid var(--b);border-radius:16px;padding:12px;background:#0d0d16}.scenario-help{border-left:4px solid var(--p);padding:10px 12px;background:#1b1026;border-radius:10px;margin:10px 0}.wide-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.narration-bar{display:grid;grid-template-columns:auto minmax(210px,1fr) minmax(180px,.75fr) minmax(180px,.75fr) auto;gap:8px;margin:0 0 8px;align-items:center}.narration-bar button{white-space:nowrap}.narration-speed{border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:7px 10px}.narration-speed label{display:flex;justify-content:space-between;gap:8px;font-size:12px;font-weight:900;color:#ddd6fe}.narration-speed input{padding:0;height:18px;accent-color:var(--p)}.narration-help{margin:0 0 14px}.story-card{border-color:#6b21a8;box-shadow:0 18px 60px #581c8730}.player-count-note{display:block;margin-top:6px;color:#c4b5fd}.player-count-input{font-weight:900}.log.event-sync-active{outline:3px solid #a855f7;box-shadow:0 0 0 6px #a855f720,0 18px 45px #0008;transform:scale(1.012);transition:outline-color .18s,box-shadow .18s,transform .18s}.log.event-sync-enter{animation:eventSyncEnter .22s ease-out}@keyframes eventSyncEnter{from{opacity:.15;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}.audio-unlock{position:fixed;right:18px;bottom:18px;z-index:9999;background:#22c55e;color:#061208;box-shadow:0 12px 35px #000a;border:2px solid #86efac;display:none}.audio-unlock.show{display:block}.winner-prize{margin-top:16px;padding:16px;border:1px solid #6b21a8;background:linear-gradient(180deg,#241032,#120a1b);border-radius:22px;text-align:center}.winner-prize img{max-width:100%;max-height:360px;object-fit:contain;border-radius:18px;border:1px solid var(--b);background:#09090f;padding:8px}.winner-prize-title{font-size:20px;font-weight:950;margin:10px 0 6px}.winner-prize-text{font-size:18px;font-weight:900;line-height:1.4;color:#f5d0fe;margin-bottom:12px}.winner-prize-sub{font-size:13px;color:#c4b5fd}.trophy-admin-grid{display:grid;grid-template-columns:1.1fr .9fr auto;gap:8px;margin-top:12px;align-items:start}.trophy-preview{border:1px dashed var(--b);background:#0d0d16;border-radius:18px;min-height:150px;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:10px;color:var(--muted)}.trophy-preview img{max-width:100%;max-height:210px;object-fit:contain;border-radius:14px}.trophy-row{display:grid;grid-template-columns:170px 1fr;gap:14px;padding:12px;border:1px solid var(--b);background:#10101a;border-radius:18px}.trophy-row .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.trophy-row .preview{display:flex;align-items:center;justify-content:center;min-height:120px;border:1px solid var(--b);border-radius:16px;background:#0d0d16;overflow:hidden;padding:8px}.trophy-row .preview img{max-width:100%;max-height:150px;object-fit:contain;border-radius:12px}.winner-prize.hidden{display:none!important}
-@media(max-width:900px){.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{grid-template-columns:1fr 1fr}.scenario-create-grid textarea,.scenario-edit-grid textarea,.child-edit-grid textarea,.span-all{grid-column:1/-1}.narration-bar{grid-template-columns:1fr}.admin-event-grid{grid-template-columns:1fr 1fr!important}}
+.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{display:grid;grid-template-columns:1.25fr 1fr .7fr 1.4fr .8fr;gap:8px;margin-top:12px}.scenario-card{border:1px solid var(--b);background:#10101a;border-radius:20px;overflow:hidden}.scenario-head{display:flex;align-items:center;gap:10px;padding:14px;cursor:pointer;background:#171726}.scenario-arrow{width:42px;min-width:42px;padding:9px;background:#303044}.scenario-title{flex:1}.scenario-body{padding:14px;border-top:1px solid var(--b)}.scenario-body.collapsed{display:none}.scenario-flags{display:flex;gap:8px;flex-wrap:wrap}.flag{font-size:11px;font-weight:950;border:1px solid var(--b);border-radius:999px;padding:5px 8px;color:#ddd6fe}.switch-row{display:flex;align-items:center;gap:10px;border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:10px 12px}.switch-row input{width:20px;height:20px;accent-color:var(--p)}.child-list{display:flex;flex-direction:column;gap:10px;margin-top:12px}.child-card{border:1px solid var(--b);border-radius:16px;padding:12px;background:#0d0d16}.scenario-help{border-left:4px solid var(--p);padding:10px 12px;background:#1b1026;border-radius:10px;margin:10px 0}.wide-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.narration-bar{display:grid;grid-template-columns:auto minmax(210px,1fr) minmax(180px,.75fr) minmax(180px,.75fr) auto;gap:8px;margin:0 0 8px;align-items:center}.narration-bar button{white-space:nowrap}.narration-speed{border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:7px 10px}.narration-speed label{display:flex;justify-content:space-between;gap:8px;font-size:12px;font-weight:900;color:#ddd6fe}.narration-speed input{padding:0;height:18px;accent-color:var(--p)}.narration-help{margin:0 0 14px}.story-card{border-color:#6b21a8;box-shadow:0 18px 60px #581c8730}.player-count-note{display:block;margin-top:6px;color:#c4b5fd}.player-count-input{font-weight:900}.log.event-sync-active{outline:3px solid #a855f7;box-shadow:0 0 0 6px #a855f720,0 18px 45px #0008;transform:scale(1.012);transition:outline-color .18s,box-shadow .18s,transform .18s}.log.event-sync-enter{animation:eventSyncEnter .22s ease-out}@keyframes eventSyncEnter{from{opacity:.15;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}.audio-unlock{position:fixed;right:18px;bottom:18px;z-index:9999;background:#22c55e;color:#061208;box-shadow:0 12px 35px #000a;border:2px solid #86efac;display:none}.audio-unlock.show{display:block}.winner-prize{margin-top:16px;padding:16px;border:1px solid #6b21a8;background:linear-gradient(180deg,#241032,#120a1b);border-radius:22px;text-align:center}.winner-prize img{max-width:100%;max-height:360px;object-fit:contain;border-radius:18px;border:1px solid var(--b);background:#09090f;padding:8px}.winner-prize-title{font-size:20px;font-weight:950;margin:10px 0 6px}.winner-prize-text{font-size:18px;font-weight:900;line-height:1.4;color:#f5d0fe;margin-bottom:12px}.winner-prize-sub{font-size:13px;color:#c4b5fd}.trophy-admin-grid{display:grid;grid-template-columns:1.1fr .9fr auto;gap:8px;margin-top:12px;align-items:start}.trophy-preview{border:1px dashed var(--b);background:#0d0d16;border-radius:18px;min-height:150px;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:10px;color:var(--muted)}.trophy-preview img{max-width:100%;max-height:210px;object-fit:contain;border-radius:14px}.trophy-row{display:grid;grid-template-columns:170px 1fr;gap:14px;padding:12px;border:1px solid var(--b);background:#10101a;border-radius:18px}.trophy-row .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.trophy-row .preview{display:flex;align-items:center;justify-content:center;min-height:120px;border:1px solid var(--b);border-radius:16px;background:#0d0d16;overflow:hidden;padding:8px}.trophy-row .preview img{max-width:100%;max-height:150px;object-fit:contain;border-radius:12px}.winner-prize.hidden{display:none!important}.admin-participants-visible{display:block!important}.prize-save-status{margin-top:8px;font-weight:900;color:#c4b5fd}
+@media(max-width:900px){.trophy-admin-grid,.trophy-row{grid-template-columns:1fr}.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{grid-template-columns:1fr 1fr}.scenario-create-grid textarea,.scenario-edit-grid textarea,.child-edit-grid textarea,.span-all{grid-column:1/-1}.narration-bar{grid-template-columns:1fr}.admin-event-grid{grid-template-columns:1fr 1fr!important}}
 </style></head><body>${admin ? `` : `<button id="audioUnlock" class="audio-unlock" onclick="unlockPublicAudio()">🔊 Clique uma vez para liberar a narração</button>`}<div class="wrap"><div class="top"><div><h1>Hunger Games da Live</h1><div class="sub">Participantes do chat, distritos, eventos, mortes e vencedor final.</div></div><div class="pill" id="statusPill">Carregando...</div></div>
 <div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div><div id="winnerPrizeBox" class="winner-prize hidden"></div>${admin ? `<div id="normalEventsStatus" class="small" style="margin-top:7px;font-weight:950"></div>` : ``}</div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar automático</button><button class="danger" onclick="act('reset')">Resetar</button><button id="normalEventsToggle" class="danger" onclick="toggleNormalEvents()">Desativar eventos antigos</button><button class="secondary" onclick="act('adult_on')">Ligar +18</button><button class="secondary" onclick="act('adult_off')">Desligar +18</button><button class="secondary" onclick="act('add_all_chat')">Adicionar todos do chat</button><button class="secondary" onclick="openWinnerPrizePanel()">🏆 Prêmios</button><button class="secondary" onclick="seedAdultHeavy()">Adicionar +18 pesado</button></div>` : ``}</div>
 ${admin ? `<div class="two" style="margin:16px 0"><input id="manualName" placeholder="Adicionar participante manual"/><input id="manualDistrict" placeholder="Distrito" type="number" min="1" max="12"/><button style="grid-column:1/-1" onclick="addPlayer()">Adicionar participante</button></div>` : ``}
-<div id="participantsBox" class="lobby-only"><h2>Participantes</h2><div class="players" id="players"></div></div></section><aside class="card events-card"><h2 class="events-title">Eventos</h2>${admin ? `<div class="narration-bar"><button id="narrationToggle" class="secondary" onclick="toggleNarration()">🔊 Ativar narração pública</button><select id="narrationVoice" aria-label="Voz da narração"></select><div class="narration-speed"><label><span>Velocidade da voz</span><span id="narrationRateValue">1,15x</span></label><input id="narrationRate" type="range" min="0.70" max="2.00" step="0.05" value="1.15" aria-label="Velocidade da narração"></div><div class="narration-speed"><label><span>Tempo mínimo por evento</span><span id="eventDelayValue">9,0s</span></label><input id="eventDelay" type="range" min="4" max="30" step="1" value="9" aria-label="Tempo mínimo de exibição de cada evento"></div><button class="secondary" onclick="testNarration()">▶ Testar voz</button></div><div id="narrationSaveStatus" class="small narration-help">Esses controles aparecem somente no painel administrativo. O áudio toca na página pública somente quando o evento entrar na área visível da tela. A página nunca rola sozinha.</div>` : ``}<div class="logs" id="logs"></div></aside></div>
-${admin ? `<section id="winnerPrizeAdminCard" class="card" style="margin-top:18px;border-color:#7e22ce;box-shadow:0 18px 60px #581c8730"><div class="phase">NOVO • CONFIGURAÇÃO</div><h2 style="margin-top:6px">🏆 Prêmio do vencedor</h2><div class="small">Envie suas imagens de prêmio. Quando a partida terminar, o jogo escolhe uma delas aleatoriamente e mostra na tela pública para o vencedor.</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px"><label class="switch-row"><input id="winnerPrizeEnabled" type="checkbox"><span><b>Ativar prêmio do vencedor</b><br><span class="small">Desative se não quiser usar imagens de prêmio nesta arena.</span></span></label><div class="small" style="display:flex;align-items:center;justify-content:center;border:1px solid var(--b);border-radius:14px;padding:10px;background:#0d0d16">Use <b style="margin:0 4px">{winner}</b> para o nome do vencedor e <b style="margin:0 4px">{premio}</b> para o nome do prêmio.</div></div><textarea id="winnerPrizeText" placeholder="🏆 {winner}, você ganhou! O seu prêmio é: {premio}" style="margin-top:10px"></textarea><div class="wide-actions"><button onclick="saveWinnerPrizeSettings()">Salvar texto do prêmio</button></div><hr style="border-color:var(--b);margin:24px 0"><h3>Adicionar novo prêmio</h3><div class="trophy-admin-grid"><input id="trophyTitle" placeholder="Nome do prêmio, ex: Nave alienígena dourada"><div><input id="trophyImageFile" type="file" accept="image/png,image/jpeg,image/webp,image/gif" onchange="readTrophyImage(this,'trophyImageData','trophyImagePreview')"><input id="trophyImageData" type="hidden"></div><button onclick="addTrophy()">Adicionar prêmio</button></div><div id="trophyImagePreview" class="trophy-preview" style="margin-top:10px">Prévia da imagem</div><hr style="border-color:var(--b);margin:24px 0"><div class="top"><div><h2>Prêmios cadastrados</h2><div class="small">Você pode deixar vários ativos; o jogo sorteia um aleatoriamente quando houver vencedor.</div></div><button class="secondary" onclick="loadTrophies()">Recarregar prêmios</button></div><div id="trophiesEditor" style="display:flex;flex-direction:column;gap:12px;margin-top:14px"></div></section>` : ``}
+<div id="participantsBox" class="lobby-only admin-participants-visible"><h2>Participantes da partida</h2><div class="players" id="players"></div></div></section><aside class="card events-card"><h2 class="events-title">Eventos</h2>${admin ? `<div class="narration-bar"><button id="narrationToggle" class="secondary" onclick="toggleNarration()">🔊 Ativar narração pública</button><select id="narrationVoice" aria-label="Voz da narração"></select><div class="narration-speed"><label><span>Velocidade da voz</span><span id="narrationRateValue">1,15x</span></label><input id="narrationRate" type="range" min="0.70" max="2.00" step="0.05" value="1.15" aria-label="Velocidade da narração"></div><div class="narration-speed"><label><span>Tempo mínimo por evento</span><span id="eventDelayValue">9,0s</span></label><input id="eventDelay" type="range" min="4" max="30" step="1" value="9" aria-label="Tempo mínimo de exibição de cada evento"></div><button class="secondary" onclick="testNarration()">▶ Testar voz</button></div><div id="narrationSaveStatus" class="small narration-help">Esses controles aparecem somente no painel administrativo. O áudio toca na página pública somente quando o evento entrar na área visível da tela. A página nunca rola sozinha.</div>` : ``}<div class="logs" id="logs"></div></aside></div>
+${admin ? `<section id="winnerPrizeAdminCard" class="card" style="margin-top:18px;border-color:#7e22ce;box-shadow:0 18px 60px #581c8730"><div class="phase">NOVA CONFIGURAÇÃO</div><h2 style="margin-top:6px">🏆 Prêmio do vencedor</h2><div class="small">Envie suas imagens de prêmio. Quando a partida terminar, o jogo escolhe uma delas aleatoriamente e mostra na tela pública para o vencedor.</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px"><label class="switch-row"><input id="winnerPrizeEnabled" type="checkbox" onchange="saveWinnerPrizeSettings(true)"><span><b>Ativar prêmio do vencedor</b><br><span class="small">Desative se não quiser usar imagens de prêmio nesta arena.</span></span></label><div class="small" style="display:flex;align-items:center;justify-content:center;border:1px solid var(--b);border-radius:14px;padding:10px;background:#0d0d16">Use <b style="margin:0 4px">{vencedor}</b> para o nome do vencedor e <b style="margin:0 4px">{premio}</b> para o nome do prêmio.</div></div><textarea id="winnerPrizeText" placeholder="🏆 {vencedor}, você ganhou! O seu prêmio é: {premio}" style="margin-top:10px"></textarea><div class="wide-actions"><button onclick="saveWinnerPrizeSettings(false)">Salvar texto e ativação</button></div><div id="winnerPrizeSaveStatus" class="prize-save-status">Configuração salva no canal e mantida nas próximas partidas.</div><hr style="border-color:var(--b);margin:24px 0"><h3>Adicionar novo prêmio</h3><div class="trophy-admin-grid"><input id="trophyTitle" placeholder="Nome do prêmio, ex: Nave alienígena dourada"><div><input id="trophyImageFile" type="file" accept="image/png,image/jpeg,image/webp,image/gif" onchange="readTrophyImage(this,'trophyImageData','trophyImagePreview')"><input id="trophyImageData" type="hidden"></div><button onclick="addTrophy()">Adicionar prêmio</button></div><div id="trophyImagePreview" class="trophy-preview" style="margin-top:10px">Prévia da imagem</div><hr style="border-color:var(--b);margin:24px 0"><div class="top"><div><h2>Prêmios cadastrados</h2><div class="small">Você pode deixar vários ativos; o jogo sorteia um aleatoriamente quando houver vencedor.</div></div><button class="secondary" onclick="loadTrophies()">Recarregar prêmios</button></div><div id="trophiesEditor" style="display:flex;flex-direction:column;gap:12px;margin-top:14px"></div></section>` : ``}
 ${admin ? `<section class="card story-card" style="margin-top:18px"><h2>Modo História</h2><div class="scenario-help"><b>Exemplo:</b> “Um ET invade a arena”. Crie a introdução e depois abra a seta para cadastrar os acontecimentos decorrentes.</div><div class="small">Na seleção de pessoas, escolha <b>Todos</b> para colocar todos os participantes vivos na mesma cena. No texto, use <b>{p}</b> ou <b>{todos}</b> para mostrar todos os nomes.</div>
 <input id="scName" style="margin-top:12px" placeholder="Nome da história: Invasão alienígena"/>
 <div class="scenario-create-grid"><select id="scPhase"><option value="bloodbath">Cornucópia</option><option value="day">Dia</option><option value="night">Noite</option><option value="feast">Banquete</option><option value="arena" selected>Evento da arena</option></select><select id="scType"><option value="neutral">Neutro</option><option value="death">Morte</option><option value="item">Item</option><option value="alliance">Aliança</option><option value="adult">Adulto</option></select><input id="scPlayers" class="player-count-input" type="text" value="Todos" placeholder="Número ou Todos" title="Digite qualquer número inteiro ou Todos" autocomplete="off"/><input id="scKills" placeholder="Mortes: p2"/><select id="scAdult"><option value="0">Normal</option><option value="1">+18</option></select></div>
@@ -2283,7 +2326,7 @@ const params=new URLSearchParams(location.search),channel=params.get("channel")|
 const statusLabels={lobby:"AGUARDANDO",running:"EM ANDAMENTO",ended:"ENCERRADA",archived:"ARQUIVADA"};
 const phaseLabels={any:"Qualquer fase",bloodbath:"Cornucópia",day:"Dia",night:"Noite",feast:"Banquete",arena:"Evento da arena",story:"Modo História",reaping:"Início da arena",winner:"Vencedor"};
 const typeLabels={neutral:"Neutro",death:"Morte",item:"Item",alliance:"Aliança",adult:"Adulto"};
-const DEFAULT_WINNER_PRIZE_TEXT="🏆 {winner}, você ganhou! O seu prêmio é: {premio}";
+const DEFAULT_WINNER_PRIZE_TEXT="🏆 {vencedor}, você ganhou! O seu prêmio é: {premio}";
 function phaseLabel(phase,day){const p=phaseLabels[phase]||phase||"Arena";if(["day","night","feast"].includes(phase))return p+" "+(day||1);return p}
 function typeLabel(type){return typeLabels[type]||type||"Neutro"}
 function playerInput(id,value){const n=Number(value);const shown=n===0?"Todos":String(Number.isFinite(n)&&n>=1?Math.round(n):1);return '<input id="'+id+'" class="player-count-input" type="text" value="'+esc(shown)+'" placeholder="Número ou Todos" title="Digite qualquer número inteiro ou Todos" autocomplete="off">'}
@@ -2309,7 +2352,8 @@ async function unlockPublicAudio(){if(admin)return;const button=document.getElem
 function scheduleNarrationSave(){if(!admin)return;clearTimeout(narrationSaveTimer);const status=document.getElementById("narrationSaveStatus");if(status)status.textContent="Salvando narração e tempo dos eventos...";narrationSaveTimer=setTimeout(saveNarrationSettings,250)}
 async function saveNarrationSettings(){if(!admin)return;const status=document.getElementById("narrationSaveStatus");try{const body={action:"set_narration",enabled:narrationEnabled?"1":"0",voice:savedNarrationVoice(),rate:narrationRate(),event_delay_ms:eventDisplayDelayMs()};const result=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});if(status)status.textContent=String(result);broadcastNarrationSettings()}catch(e){if(status)status.textContent="Erro ao salvar a narração."}}
 function applyServerNarrationSettings(settings={}){const enabled=typeof settings.enabled==="boolean"?settings.enabled:true;const voice=String(settings.voice||"google-online");const rate=Math.max(.70,Math.min(2,Number(settings.rate||1.15)));const delay=Math.max(4000,Math.min(60000,Number(settings.eventDelayMs||9000)));const signature=[enabled,voice,rate,delay].join("|");if(signature===narrationServerSignature)return;const wasEnabled=narrationEnabled;narrationServerSignature=signature;narrationEnabled=enabled;narrationEventDelayMs=delay;localStorage.setItem(NARRATION_ENABLED_KEY,enabled?"1":"0");localStorage.setItem(NARRATION_VOICE_KEY,voice);localStorage.setItem(NARRATION_RATE_KEY,String(rate));localStorage.setItem(NARRATION_DELAY_KEY,String(delay));if(wasEnabled&&!enabled)stopNarrationSpeech();const slider=document.getElementById("narrationRate");if(slider){slider.value=String(rate);slider.dataset.ready="1"}const delaySlider=document.getElementById("eventDelay");if(delaySlider){delaySlider.value=String(delay/1000);delaySlider.dataset.ready="1"}updateNarrationRate(false);updateEventDelay(false);populateNarrationVoices();updateNarrationButton()}
-function populateNarrationVoices(){narrationVoices=availableNarrationVoices();narrationVoices.sort((a,b)=>narrationVoiceScore(b)-narrationVoiceScore(a)||a.name.localeCompare(b.name));const select=document.getElementById("narrationVoice");if(!select)return;const saved=savedNarrationVoice();select.innerHTML='<option value="google-online">Google online — português do Brasil</option>'+narrationVoices.map((v,i)=>'<option value="voice-'+i+'">'+esc(v.name+' — '+v.lang)+'</option>').join("");if(saved==="google-online")select.value="google-online";else{const chosen=narrationVoices.findIndex(v=>v.name===saved);select.value=chosen>=0?"voice-"+chosen:"google-online"}select.onchange=()=>{const value=String(select.value||"google-online");if(value==="google-online")localStorage.setItem(NARRATION_VOICE_KEY,"google-online");else{const v=narrationVoices[Number(value.replace("voice-",""))];localStorage.setItem(NARRATION_VOICE_KEY,v?.name||"google-online")}broadcastNarrationSettings();scheduleNarrationSave()}}
+function friendlyVoiceName(name){return String(name||"").replace(/\bonline\b/gi,"pela internet").replace(/\bdesktop\b/gi,"do computador").replace(/\bmobile\b/gi,"do celular")}
+function populateNarrationVoices(){narrationVoices=availableNarrationVoices();narrationVoices.sort((a,b)=>narrationVoiceScore(b)-narrationVoiceScore(a)||a.name.localeCompare(b.name));const select=document.getElementById("narrationVoice");if(!select)return;const saved=savedNarrationVoice();select.innerHTML='<option value="google-online">Google pela internet — português do Brasil</option>'+narrationVoices.map((v,i)=>'<option value="voice-'+i+'">'+esc(friendlyVoiceName(v.name)+' — '+v.lang)+'</option>').join("");if(saved==="google-online")select.value="google-online";else{const chosen=narrationVoices.findIndex(v=>v.name===saved);select.value=chosen>=0?"voice-"+chosen:"google-online"}select.onchange=()=>{const value=String(select.value||"google-online");if(value==="google-online")localStorage.setItem(NARRATION_VOICE_KEY,"google-online");else{const v=narrationVoices[Number(value.replace("voice-",""))];localStorage.setItem(NARRATION_VOICE_KEY,v?.name||"google-online")}broadcastNarrationSettings();scheduleNarrationSave()}}
 function selectedNarrationMode(){const select=document.getElementById("narrationVoice");if(select)return String(select.value||"google-online")==="google-online"?"google":"browser";return savedNarrationVoice()==="google-online"?"google":"browser"}
 function selectedNarrationVoice(){const select=document.getElementById("narrationVoice");if(select&&String(select.value).startsWith("voice-"))return narrationVoices[Number(String(select.value).replace("voice-",""))]||null;const saved=savedNarrationVoice();if(saved==="google-online")return narrationVoices.find(v=>narrationVoiceScore(v)>=1000)||narrationVoices.find(v=>/^pt/i.test(v.lang))||null;return narrationVoices.find(v=>v.name===saved)||narrationVoices.find(v=>narrationVoiceScore(v)>=1000)||narrationVoices.find(v=>/^pt/i.test(v.lang))||null}
 function narrationRate(){const slider=document.getElementById("narrationRate");const n=Number(slider?.value||localStorage.getItem(NARRATION_RATE_KEY)||1.15);return Math.max(.70,Math.min(2,Number.isFinite(n)?n:1.15))}
@@ -2350,10 +2394,10 @@ async function load(){
   if(loadInProgress){loadAgain=true;return}
   loadInProgress=true;
   try{
-    const st=await api("/hg/state"),g=st.game||{};applyServerNarrationSettings(st.narration||{});document.body.classList.toggle("hg-running",!admin&&(g.status==="running"||g.status==="ended"));document.getElementById("statusPill").textContent=(statusLabels[g.status]||"AGUARDANDO")+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=phaseLabel(g.phase||"bloodbath",g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida rolando":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Aguardando participantes";const alive=st.players.filter(p=>p.alive).length;document.getElementById("counts").textContent=st.players.length+" participantes • "+alive+" vivos • "+st.eventCount+(Number(g.normal_events_enabled??1)===1?" eventos ativos":" eventos de história")+(st.activeScenario?" • História: "+st.activeScenario.name:"")+(st.autoRunning?" • automático ligado":"");renderWinnerPrize(st.winnerPrize||{},g.winner||"",g.status||"");setWinnerPrizeControls(st.winnerPrize||{});normalEventsCurrentlyEnabled=Number(g.normal_events_enabled??1)===1;if(admin){const toggle=document.getElementById("normalEventsToggle"),label=document.getElementById("normalEventsStatus");if(toggle){toggle.textContent=normalEventsCurrentlyEnabled?"Desativar eventos antigos":"Ativar eventos antigos";toggle.className=normalEventsCurrentlyEnabled?"danger":"ok"}if(label){label.textContent=normalEventsCurrentlyEnabled?"⚠️ Eventos normais/antigos: ATIVADOS":"✅ Modo História exclusivo: eventos normais/antigos DESATIVADOS";label.style.color=normalEventsCurrentlyEnabled?"#fca5a5":"#86efac"}}
-const box=document.getElementById("participantsBox");if(box)box.classList.toggle("hidden",g.status==="running");
-document.getElementById("players").innerHTML=st.players.map(p=>{const av=avatarHtml(p);return '<div class="player '+(p.alive?'':'dead')+'">'+av+'<div><div class="district">Distrito '+p.district+'</div><div class="name">'+esc(p.display_name)+'</div><div class="kills">'+(p.kills||0)+' abate(s) '+(p.alive?'🟢':'💀')+'</div></div></div>'}).join("")||"<div class='small'>Ninguém entrou ainda.</div>";
-syncEventTimeline(g.id||0,st.logs,st.players,g.status)  }finally{
+    const st=await api("/hg/state");if(!st||st.error){const status=document.getElementById("status");if(status)status.textContent="Não foi possível carregar a partida.";return}const g=st.game||{},players=Array.isArray(st.players)?st.players:[],logs=Array.isArray(st.logs)?st.logs:[];applyServerNarrationSettings(st.narration||{});document.body.classList.toggle("hg-running",!admin&&(g.status==="running"||g.status==="ended"));document.getElementById("statusPill").textContent=(statusLabels[g.status]||"AGUARDANDO")+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=phaseLabel(g.phase||"bloodbath",g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida em andamento":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Aguardando participantes";const alive=players.filter(p=>Number(p.alive)===1).length;document.getElementById("counts").textContent=players.length+" participantes • "+alive+" vivos • "+Number(st.eventCount||0)+(Number(g.normal_events_enabled??1)===1?" eventos ativos":" eventos de história")+(st.activeScenario?" • História: "+st.activeScenario.name:"")+(st.autoRunning?" • automático ligado":"");renderWinnerPrize(st.winnerPrize||{},g.winner||"",g.status||"");setWinnerPrizeControls(st.winnerPrize||{});normalEventsCurrentlyEnabled=Number(g.normal_events_enabled??1)===1;if(admin){const toggle=document.getElementById("normalEventsToggle"),label=document.getElementById("normalEventsStatus");if(toggle){toggle.textContent=normalEventsCurrentlyEnabled?"Desativar eventos antigos":"Ativar eventos antigos";toggle.className=normalEventsCurrentlyEnabled?"danger":"ok"}if(label){label.textContent=normalEventsCurrentlyEnabled?"⚠️ Eventos normais/antigos: ATIVADOS":"✅ Modo História exclusivo: eventos normais/antigos DESATIVADOS";label.style.color=normalEventsCurrentlyEnabled?"#fca5a5":"#86efac"}}
+const box=document.getElementById("participantsBox");if(box)box.classList.toggle("hidden",!admin&&g.status==="running");
+const playersElement=document.getElementById("players");if(playersElement)playersElement.innerHTML=players.map(p=>{const av=avatarHtml(p);return '<div class="player '+(Number(p.alive)===1?'':'dead')+'">'+av+'<div><div class="district">Distrito '+p.district+'</div><div class="name">'+esc(p.display_name||p.username||"Participante")+'</div><div class="kills">'+(p.kills||0)+' abate(s) '+(Number(p.alive)===1?'🟢':'💀')+'</div></div></div>'}).join("")||"<div class='small'>Nenhum participante foi adicionado nesta partida.</div>";
+syncEventTimeline(g.id||0,logs,players,g.status)  }finally{
     loadInProgress=false;
     if(loadAgain){loadAgain=false;queueMicrotask(load)}
   }
@@ -2361,13 +2405,14 @@ syncEventTimeline(g.id||0,st.logs,st.players,g.status)  }finally{
 
 function openWinnerPrizePanel(){const box=document.getElementById("winnerPrizeAdminCard");if(!box)return;box.scrollIntoView({behavior:"smooth",block:"start"});box.animate([{outline:"4px solid #c084fc"},{outline:"0 solid transparent"}],{duration:1200,easing:"ease-out"})}
 function safePrizeImageSrc(src){src=String(src||"").trim();return /^data:image\//i.test(src)?src:""}
-function winnerPrizeMessage(prize,winner){const template=String(prize?.text||DEFAULT_WINNER_PRIZE_TEXT);const reward=String(prize?.trophyTitle||"prêmio surpresa");return template.replace(/\{winner\}/gi,winner||"vencedor").replace(/\{premio\}/gi,reward)}
+function winnerPrizeMessage(prize,winner){const template=String(prize?.text||DEFAULT_WINNER_PRIZE_TEXT);const reward=String(prize?.trophyTitle||"prêmio surpresa");return template.replace(/\{winner\}/gi,winner||"vencedor").replace(/\{vencedor\}/gi,winner||"vencedor").replace(/\{premio\}/gi,reward)}
 function renderWinnerPrize(prize,winner,status){const box=document.getElementById("winnerPrizeBox");if(!box)return;const img=safePrizeImageSrc(prize?.trophyImage);const show=status==="ended"&&String(winner||"")&&img&&Number(prize?.enabled??1)===1;box.classList.toggle("hidden",!show);if(!show){box.innerHTML="";return}const reward=String(prize?.trophyTitle||"Prêmio surpresa");box.innerHTML='<div class="winner-prize-text">'+esc(winnerPrizeMessage(prize,winner))+'</div><div class="winner-prize-title">🎁 '+esc(reward)+'</div><img src="'+img+'" alt="Prêmio do vencedor"><div class="winner-prize-sub">O prêmio foi escolhido aleatoriamente entre as imagens ativas.</div>'}
-function setWinnerPrizeControls(prize){if(!admin)return;const enabled=document.getElementById("winnerPrizeEnabled"),text=document.getElementById("winnerPrizeText");if(enabled)enabled.checked=Number(prize?.enabled??1)===1;if(text&&document.activeElement!==text)text.value=String(prize?.text||DEFAULT_WINNER_PRIZE_TEXT)}
-async function saveWinnerPrizeSettings(){if(!token)return alert("Abra com ?token=SEU_TOKEN");const enabled=document.getElementById("winnerPrizeEnabled")?.checked?"1":"0";const text=document.getElementById("winnerPrizeText")?.value||DEFAULT_WINNER_PRIZE_TEXT;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"set_winner_prize_settings",enabled,text})});alert(t);await load()}
+let winnerPrizeControlsInitialized=false,winnerPrizeSettingsSaving=false;
+function setWinnerPrizeControls(prize){if(!admin||winnerPrizeControlsInitialized)return;const enabled=document.getElementById("winnerPrizeEnabled"),text=document.getElementById("winnerPrizeText");if(enabled)enabled.checked=Number(prize?.enabled??1)===1;if(text)text.value=String(prize?.text||DEFAULT_WINNER_PRIZE_TEXT).replace(/\{winner\}/gi,"{vencedor}");winnerPrizeControlsInitialized=true}
+async function saveWinnerPrizeSettings(silent=false){if(!token)return alert("Abra com ?token=SEU_TOKEN");if(winnerPrizeSettingsSaving)return;winnerPrizeSettingsSaving=true;const status=document.getElementById("winnerPrizeSaveStatus"),enabled=document.getElementById("winnerPrizeEnabled")?.checked?"1":"0",text=(document.getElementById("winnerPrizeText")?.value||DEFAULT_WINNER_PRIZE_TEXT).replace(/\{winner\}/gi,"{vencedor}");if(status)status.textContent="Salvando...";try{const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"set_winner_prize_settings",enabled,text})});if(status)status.textContent=String(t);if(!silent)alert(t)}catch(e){if(status)status.textContent="Não foi possível salvar. Tente novamente.";if(!silent)alert("Não foi possível salvar a configuração do prêmio.")}finally{winnerPrizeSettingsSaving=false}}
 function trophyRow(t){const img=safePrizeImageSrc(t.image_data);return '<div class="trophy-row"><div class="preview">'+(img?'<img src="'+img+'" alt="Prêmio">':'<div class="small">Sem imagem</div>')+'</div><div><input id="tr_title_'+t.id+'" value="'+esc(t.title||"")+'" placeholder="Nome do prêmio"><div class="wide-actions" style="margin-top:8px"><label class="switch-row"><input id="tr_active_'+t.id+'" type="checkbox" '+(t.active?"checked":"")+'><span>Prêmio ativo</span></label><input id="tr_file_'+t.id+'" type="file" accept="image/png,image/jpeg,image/webp,image/gif" onchange="readTrophyImage(this,&quot;tr_data_'+t.id+'&quot;,&quot;tr_preview_'+t.id+'&quot;)"><input id="tr_data_'+t.id+'" type="hidden"></div><div id="tr_preview_'+t.id+'" class="trophy-preview" style="margin-top:10px;min-height:90px">Selecione outra imagem apenas se quiser trocar a atual.</div><div class="actions"><button onclick="saveTrophy('+t.id+')">Salvar prêmio</button><button class="danger" onclick="deleteTrophy('+t.id+')">Excluir</button></div></div></div>'}
 async function loadTrophies(){if(!admin)return;const box=document.getElementById("trophiesEditor");if(!box)return;box.innerHTML="<div class='small'>Carregando prêmios...</div>";const rows=await api("/hg/trophies");if(!Array.isArray(rows)){box.innerHTML="<div class='small'>Erro ao carregar prêmios.</div>";return}box.innerHTML=rows.map(trophyRow).join("")||"<div class='small'>Nenhum prêmio cadastrado ainda.</div>"}
-function readTrophyImage(input,hiddenId,previewId){const file=input?.files?.[0];const hidden=document.getElementById(hiddenId),preview=document.getElementById(previewId);if(!file){if(hidden)hidden.value="";if(preview)preview.innerHTML="Prévia da imagem";return}if(file.size>5*1024*1024){alert("A imagem está grande demais. Tente uma imagem com até 5 MB.");input.value="";if(hidden)hidden.value="";return}const reader=new FileReader();reader.onload=()=>{const data=String(reader.result||"");if(hidden)hidden.value=data;if(preview)preview.innerHTML=data?'<img src="'+data+'" alt="Prévia do prêmio">':'Prévia da imagem'};reader.readAsDataURL(file)}
+function readTrophyImage(input,hiddenId,previewId){const file=input?.files?.[0],hidden=document.getElementById(hiddenId),preview=document.getElementById(previewId);if(!file){if(hidden)hidden.value="";if(preview)preview.innerHTML="Prévia da imagem";return}if(file.size>8*1024*1024){alert("A imagem é grande demais. Escolha uma imagem de até 8 MB.");input.value="";if(hidden)hidden.value="";return}const reader=new FileReader();reader.onload=()=>{const original=String(reader.result||"");const img=new Image();img.onload=()=>{try{const limite=1400,escala=Math.min(1,limite/Math.max(img.width||1,img.height||1)),canvas=document.createElement("canvas");canvas.width=Math.max(1,Math.round((img.width||1)*escala));canvas.height=Math.max(1,Math.round((img.height||1)*escala));canvas.getContext("2d").drawImage(img,0,0,canvas.width,canvas.height);let data=canvas.toDataURL("image/webp",.86);if(!data.startsWith("data:image/webp"))data=canvas.toDataURL("image/jpeg",.88);if(hidden)hidden.value=data;if(preview)preview.innerHTML='<img src="'+data+'" alt="Prévia do prêmio">'}catch{if(hidden)hidden.value=original;if(preview)preview.innerHTML='<img src="'+original+'" alt="Prévia do prêmio">'}};img.onerror=()=>{alert("Não foi possível abrir essa imagem.");input.value="";if(hidden)hidden.value=""};img.src=original};reader.onerror=()=>alert("Não foi possível ler essa imagem.");reader.readAsDataURL(file)}
 async function addTrophy(){const title=document.getElementById("trophyTitle")?.value?.trim()||"";const image_data=document.getElementById("trophyImageData")?.value||"";if(!title)return alert("Digite o nome do prêmio.");if(!image_data)return alert("Escolha a imagem do prêmio.");const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"add_trophy",title,image_data,active:"1"})});alert(t);document.getElementById("trophyTitle").value="";document.getElementById("trophyImageFile").value="";document.getElementById("trophyImageData").value="";document.getElementById("trophyImagePreview").innerHTML="Prévia da imagem";await loadTrophies()}
 async function saveTrophy(id){const title=document.getElementById("tr_title_"+id)?.value?.trim()||"";if(!title)return alert("Digite o nome do prêmio.");const image_data=document.getElementById("tr_data_"+id)?.value||"";const active=document.getElementById("tr_active_"+id)?.checked?"1":"0";const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"update_trophy",id,title,image_data,active})});alert(t);await loadTrophies();await load()}
 async function deleteTrophy(id){if(!confirm("Excluir este prêmio?"))return;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"delete_trophy",id})});alert(t);await loadTrophies();await load()}
