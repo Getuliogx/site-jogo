@@ -1,6 +1,6 @@
 {
   "name": "site-ca-hunger-games-live",
-  "version": "5.6.0",
+  "version": "5.8.0",
   "type": "module",
   "main": "server.js",
   "scripts": {

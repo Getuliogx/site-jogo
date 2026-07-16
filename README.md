@@ -1,4 +1,4 @@
-# Hunger Games da Live — v5.6.0
+# Hunger Games da Live — v5.7.0
 
 Versão corrigida para gerar **somente um evento por vez** e narrar na **página pública**.
 
@@ -18,6 +18,6 @@ Versão corrigida para gerar **somente um evento por vez** e narrar na **página
 
 1. Substitua os arquivos na raiz do repositório.
 2. No Render, use **Manual Deploy → Clear build cache & deploy**.
-3. Confira `/version`. Deve mostrar `5.6.0`.
+3. Confira `/version`. Deve mostrar `5.7.0`.
 4. Abra a página pública antes de iniciar a partida.
 5. Se aparecer **Clique uma vez para liberar a narração**, clique uma vez. Isso é uma exigência do navegador para áudio automático.
