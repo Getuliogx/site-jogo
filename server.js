@@ -6,7 +6,7 @@ import tls from "node:tls";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = "6.0.0";
+const APP_VERSION = "7.0.0";
 const DEFAULT_WINNER_PRIZE_TEXT = "🏆 {vencedor}, você ganhou! O seu prêmio é: {premio}";
 
 app.use(cors());
@@ -430,6 +430,246 @@ const HEAVY_ADULT_EVENTS = [
   ["night","adult",2,"{p1} e {p2} ficam tão grudados que ninguém sabe onde termina a estratégia e começa a safadeza.","",1],
   ["day","adult",2,"{p1} promete recompensa adulta para {p2} se os dois chegarem vivos até a noite.","",1]
 ];
+
+
+const AUTOMATIC_STORY_PACKS = {
+  vampiro: {
+    title: "Vampiros",
+    intro: "Uma lua de sangue cobre a arena. Um castelo surge ao redor de {p}, e uma voz anuncia que somente um sobrevivente verá o amanhecer.",
+    calm: [
+      "{p1} encontra marcas de presas nas paredes e percebe que alguma coisa está seguindo seus passos.",
+      "{p1} atravessa uma galeria cheia de retratos cujos olhos parecem acompanhar cada movimento.",
+      "{p1} encontra um frasco de água benta escondido dentro de um altar quebrado.",
+      "{p1} ouve asas batendo sobre a torre e se esconde antes que a criatura desça.",
+      "{p1} descobre uma passagem secreta que liga a biblioteca à cripta.",
+      "{p1} percebe que o amanhecer está cada vez mais distante, como se a noite não tivesse fim."
+    ],
+    conflict: [
+      "{p1} e {p2} atravessam juntos o salão dos espelhos, mas nenhum dos dois confia no reflexo do outro.",
+      "{p1} impede {p2} de abrir um caixão selado, evitando que algo antigo desperte cedo demais.",
+      "{p1} divide uma tocha com {p2} enquanto sombras famintas cercam o corredor.",
+      "{p1} encontra {p2} perto da saída, mas os portões se fecham antes que consigam escapar."
+    ],
+    deaths: [
+      "{p1} alcança a ponte levadiça, mas corta a corrente antes de {p2} atravessar. Vampiros cercam {p2}, que não sobrevive.",
+      "{p1} usa o último raio de luz contra a criatura. {p2} fica preso na sombra e é levado para a cripta.",
+      "{p1} encontra uma estaca escondida, mas {p2} é atacado antes que ela possa ser usada. {p2} morre no corredor.",
+      "{p1} fecha a porta de ferro para conter o lorde vampiro. {p2} fica do lado errado e não consegue escapar.",
+      "{p1} quebra o vitral e a luz invade o salão. {p2}, já transformado, é consumido pelo amanhecer.",
+      "{p1} foge pela passagem secreta enquanto {p2} é arrastado para dentro de um caixão vazio."
+    ],
+    finales: [
+      "No coração do castelo, {p1} enfrenta {p2} diante do trono de sangue. {p1} resiste à maldição, mas {p2} não sobrevive.",
+      "O primeiro raio do amanhecer atravessa a torre. {p1} alcança a luz; {p2} é tomado pelas criaturas da noite.",
+      "A última porta se abre. {p1} atravessa antes do sino final, enquanto {p2} é deixado para trás no castelo dos vampiros."
+    ]
+  },
+  terror: {
+    title: "Terror",
+    intro: "As luzes da arena apagam. Quando voltam, {p} estão presos em um hospital abandonado, e uma mensagem avisa que o prédio escolherá apenas um sobrevivente.",
+    calm: [
+      "{p1} encontra uma lanterna quase sem bateria e decide economizar cada segundo de luz.",
+      "{p1} escuta passos no andar de cima, embora a escada tenha desabado há anos.",
+      "{p1} encontra fotografias antigas dos participantes tiradas antes mesmo de entrarem na arena.",
+      "{p1} abre uma sala vazia e encontra o próprio nome escrito na parede.",
+      "{p1} percebe que todos os relógios do prédio estão parados exatamente no mesmo minuto.",
+      "{p1} encontra uma chave enferrujada presa dentro de uma caixa de música."
+    ],
+    conflict: [
+      "{p1} e {p2} tentam religar o gerador enquanto alguma coisa bate do outro lado da porta.",
+      "{p1} acredita ter encontrado a saída, mas {p2} percebe que o corredor leva de volta ao mesmo lugar.",
+      "{p1} e {p2} se escondem no necrotério e precisam ficar em silêncio absoluto.",
+      "{p1} segura a porta enquanto {p2} procura uma passagem entre as paredes."
+    ],
+    deaths: [
+      "{p1} consegue entrar no elevador, mas as portas se fecham antes de {p2}. A criatura encontra {p2} no corredor.",
+      "{p1} percebe a armadilha a tempo. {p2} pisa no lugar errado e desaparece sob o piso do hospital.",
+      "{p1} apaga a lanterna e permanece imóvel. {p2} corre, chama atenção da entidade e não sobrevive.",
+      "{p1} atravessa a porta marcada como saída. Ela se fecha atrás de si, deixando {p2} preso com o assassino.",
+      "{p1} encontra a chave correta. {p2} tenta outra porta e é puxado para dentro da escuridão.",
+      "{p1} escapa pelo duto de ventilação. {p2} fica para trás quando mãos surgem das paredes."
+    ],
+    finales: [
+      "A sirene final toca. {p1} descobre a verdadeira saída, enquanto {p2} é alcançado pela entidade que controlava o prédio.",
+      "Na última sala, {p1} enfrenta o medo e quebra o ciclo. {p2} hesita por um instante e não sobrevive.",
+      "O hospital começa a desabar. {p1} atravessa o portão; {p2} fica preso dentro do pesadelo."
+    ]
+  },
+  apocalipse: {
+    title: "Apocalipse",
+    intro: "Sirenas ecoam por toda a arena. As cidades caíram, a comunicação parou e {p} recebem a última mensagem: existe lugar para apenas um no abrigo final.",
+    calm: [
+      "{p1} vasculha um mercado destruído e encontra água suficiente para continuar.",
+      "{p1} sobe em um prédio abandonado para procurar sinais de sobreviventes.",
+      "{p1} encontra um rádio funcionando, mas a transmissão repete apenas coordenadas incompletas.",
+      "{p1} atravessa uma avenida tomada por carros vazios e alarmes disparados.",
+      "{p1} improvisa uma máscara para passar por uma área contaminada.",
+      "{p1} encontra o mapa de um abrigo subterrâneo escondido em uma estação."
+    ],
+    conflict: [
+      "{p1} e {p2} dividem combustível para atravessar uma região tomada por infectados.",
+      "{p1} protege {p2} durante uma tempestade tóxica, mas os suprimentos ficam quase no fim.",
+      "{p1} e {p2} encontram um comboio abandonado e discutem qual rota ainda pode estar segura.",
+      "{p1} ajuda {p2} a cruzar uma ponte instável antes que a horda se aproxime."
+    ],
+    deaths: [
+      "{p1} consegue ligar o veículo e parte. {p2} é cercado pelos infectados antes de alcançar a porta.",
+      "{p1} fecha a comporta para impedir a contaminação. {p2} fica do lado de fora e não sobrevive.",
+      "{p1} encontra um filtro ainda utilizável. O equipamento de {p2} falha dentro da nuvem tóxica.",
+      "{p1} atravessa a ponte antes que ela desabe. {p2} cai junto com a estrutura.",
+      "{p1} percebe a emboscada e muda de rota. {p2} segue em frente e é alcançado pela horda.",
+      "{p1} entra no trem de evacuação. As portas se fecham e {p2} fica preso na plataforma destruída."
+    ],
+    finales: [
+      "O abrigo final inicia o fechamento. {p1} entra com o último código válido; {p2} não consegue atravessar a comporta.",
+      "A última aeronave de resgate pousa por poucos segundos. {p1} embarca, enquanto {p2} é alcançado pela onda de destruição.",
+      "O sinal de evacuação termina. {p1} alcança a zona segura, mas {p2} fica para trás no fim do mundo."
+    ]
+  },
+  zumbi: {
+    title: "Zumbis",
+    intro: "Uma infecção toma a arena em minutos. {p} correm para um centro de evacuação enquanto uma horda cresce a cada rua atravessada.",
+    calm: [
+      "{p1} encontra remédios dentro de uma farmácia saqueada.",
+      "{p1} bloqueia uma porta com móveis antes que a horda chegue.",
+      "{p1} encontra munição, mas decide guardar para o pior momento.",
+      "{p1} escuta um pedido de socorro vindo de um rádio quebrado.",
+      "{p1} atravessa uma escola abandonada sem fazer barulho.",
+      "{p1} encontra uma rota marcada até o ponto de evacuação."
+    ],
+    conflict: [
+      "{p1} e {p2} empurram um carro para bloquear a rua.",
+      "{p1} ajuda {p2} a passar por uma janela antes que os infectados entrem.",
+      "{p1} e {p2} dividem os últimos suprimentos dentro de uma loja fechada.",
+      "{p1} cobre a fuga de {p2} enquanto a horda se aproxima."
+    ],
+    deaths: [
+      "{p1} atravessa o portão e o tranca. {p2} é cercado pela horda e não sobrevive.",
+      "{p1} percebe que o corredor está tomado e recua. {p2} continua e é atacado pelos infectados.",
+      "{p1} sobe no caminhão de fuga. {p2} perde o equilíbrio e cai no meio da horda.",
+      "{p1} usa o último sinalizador para abrir caminho. {p2} fica preso no prédio e não consegue sair.",
+      "{p1} alcança o telhado. A escada cede sob {p2}, que é alcançado pelos zumbis.",
+      "{p1} fecha a porta do abrigo. {p2}, já ferido, fica do lado de fora."
+    ],
+    finales: [
+      "O helicóptero chega ao último ponto de resgate. {p1} embarca; {p2} é alcançado pela horda.",
+      "A evacuação termina. {p1} atravessa o portão final, enquanto {p2} não consegue escapar dos infectados.",
+      "A última vaga do abrigo é ocupada por {p1}. {p2} fica do lado de fora quando a cidade é tomada."
+    ]
+  }
+};
+
+function normalizeStoryCategory(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function storyCategoryKey(category) {
+  const key = normalizeStoryCategory(category);
+  if (/vampir/.test(key)) return "vampiro";
+  if (/terror|horror|assombr|fantasma/.test(key)) return "terror";
+  if (/zumbi|zombie|infectad/.test(key)) return "zumbi";
+  if (/apocalip|fim do mundo|nuclear|catastrof/.test(key)) return "apocalipse";
+  return "generic";
+}
+
+function storyTitle(category) {
+  return String(category || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .split(" ")
+    .map(word => word ? word[0].toUpperCase() + word.slice(1).toLowerCase() : "")
+    .join(" ");
+}
+
+function genericStoryPack(category) {
+  const label = storyTitle(category);
+  return {
+    title: label,
+    intro: `A arena é transformada por uma ameaça ligada a “${label}”. {p} descobrem que a história só terminará quando restar um sobrevivente.`,
+    calm: [
+      `{p1} encontra uma pista sobre “${label}” e percebe que a ameaça está mais perto do que parecia.`,
+      `{p1} atravessa uma área destruída tentando entender as regras desta história de ${label}.`,
+      `{p1} encontra um objeto que pode ser útil contra a ameaça de ${label}.`,
+      `{p1} escuta um aviso misterioso e muda de caminho antes que seja tarde.`,
+      `{p1} descobre uma passagem escondida que pode levar ao centro da história.`,
+      `{p1} percebe que o cenário está mudando e que não existe mais um lugar realmente seguro.`
+    ],
+    conflict: [
+      `{p1} e {p2} seguem juntos uma pista sobre ${label}, mas a confiança entre eles começa a desaparecer.`,
+      `{p1} ajuda {p2} a escapar de uma armadilha ligada à ameaça de ${label}.`,
+      `{p1} e {p2} encontram uma rota segura, mas ela só ficará aberta por poucos segundos.`,
+      `{p1} e {p2} chegam ao mesmo esconderijo enquanto a ameaça se aproxima.`
+    ],
+    deaths: [
+      `{p1} percebe a armadilha de ${label} a tempo. {p2} continua avançando e não sobrevive.`,
+      `{p1} consegue atravessar a passagem antes que ela se feche. {p2} fica preso com a ameaça de ${label}.`,
+      `{p1} encontra proteção, mas {p2} é alcançado pelo perigo que domina esta história.`,
+      `{p1} muda de rota no último instante. {p2} segue pelo caminho errado e morre.`,
+      `{p1} escapa do ataque relacionado a ${label}. {p2} fica para trás e não sobrevive.`,
+      `{p1} usa a última chance de fuga. A passagem se fecha e {p2} é eliminado pela ameaça.`
+    ],
+    finales: [
+      `No capítulo final de ${label}, {p1} encontra a saída. {p2} é alcançado pela ameaça e não sobrevive.`,
+      `A arena começa a desabar. {p1} vence o último desafio de ${label}, enquanto {p2} fica para trás.`,
+      `A história de ${label} chega ao confronto final. {p1} resiste, mas {p2} é eliminado.`
+    ]
+  };
+}
+
+function buildAutomaticStory(category, aliveCountRaw = 0) {
+  const key = storyCategoryKey(category);
+  const pack = key === "generic" ? genericStoryPack(category) : AUTOMATIC_STORY_PACKS[key];
+  const aliveCount = Math.max(0, Math.round(Number(aliveCountRaw || 0)));
+  const expectedPlayers = aliveCount > 1 ? aliveCount : 24;
+  const deathCount = Math.max(1, Math.min(120, expectedPlayers - 1));
+  const events = [];
+  let step = 1;
+
+  const add = (type, players, text, kills = "") => {
+    events.push({
+      phase: "any",
+      type,
+      players,
+      text: `Capítulo ${step++} — ${text}`,
+      kills,
+      adult: 0,
+      active: 1
+    });
+  };
+
+  // Abertura antes das mortes para a história não começar de forma seca.
+  add("neutral", 1, pack.calm[0]);
+  add("alliance", 2, pack.conflict[0]);
+  add("item", 1, pack.calm[1]);
+
+  for (let i = 0; i < deathCount; i += 1) {
+    const progress = deathCount <= 1 ? 1 : i / (deathCount - 1);
+    if (i > 0 && i % 2 === 0) {
+      const calm = pack.calm[(Math.floor(i / 2) + 1) % pack.calm.length];
+      add(i % 4 === 0 ? "item" : "neutral", 1, calm);
+    }
+    if (i > 0 && i % 5 === 0) {
+      const conflict = pack.conflict[(Math.floor(i / 5) + 1) % pack.conflict.length];
+      add("alliance", 2, conflict);
+    }
+    const source = progress >= 0.85 ? pack.finales : pack.deaths;
+    const deathText = source[i % source.length];
+    add("death", 2, deathText, "p2");
+  }
+
+  return {
+    name: `História automática: ${pack.title}`,
+    intro: pack.intro,
+    events,
+    deathCount
+  };
+}
 
 async function ensureTables() {
   if (ready) return;
@@ -1944,6 +2184,75 @@ async function adminAction(req, res) {
       return send(res, activeFlag ? "✅ Evento ativado." : "⛔ Evento desativado.");
     }
 
+
+    if (action === "generate_story") {
+      await ensureTables();
+      const db = await getPool();
+      const category = String(req.body?.category || req.query.category || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 60);
+      if (category.length < 2) return send(res, "Digite uma categoria para criar a história.");
+
+      const [games] = await db.query(
+        "SELECT id,status FROM hg_games WHERE channel=? AND status IN ('lobby','running') ORDER BY id DESC LIMIT 1",
+        [ch]
+      );
+      const current = games[0] || null;
+      let aliveCount = 0;
+      if (current) {
+        const [countRows] = await db.query(
+          "SELECT COUNT(*) AS total FROM hg_players WHERE game_id=? AND alive=1",
+          [current.id]
+        );
+        aliveCount = Number(countRows?.[0]?.total || 0);
+      }
+
+      const generated = buildAutomaticStory(category, aliveCount);
+      const conn = await db.getConnection();
+      try {
+        await conn.beginTransaction();
+        const [scenarioResult] = await conn.query(
+          "INSERT INTO hg_scenarios (name,phase,type,players,text,kills,adult,mix_with_normal,active) VALUES (?, 'arena', 'neutral', 0, ?, '', 0, 0, 1)",
+          [generated.name, generated.intro]
+        );
+        const scenarioId = Number(scenarioResult.insertId);
+        const rows = generated.events.map((event, index) => [
+          scenarioId,
+          event.phase,
+          event.type,
+          event.players,
+          event.text,
+          event.kills,
+          event.adult,
+          event.active,
+          index + 1
+        ]);
+        if (rows.length) {
+          await conn.query(
+            "INSERT INTO hg_scenario_events (scenario_id,phase,type,players,text,kills,adult,active,sort_order) VALUES ?",
+            [rows]
+          );
+        }
+        if (current) {
+          await conn.query(
+            "UPDATE hg_games SET active_scenario_id=NULL,normal_events_enabled=0,narration_enabled=0 WHERE id=?",
+            [current.id]
+          );
+        }
+        await conn.commit();
+        return send(
+          res,
+          `✅ ${generated.name} criada com ${generated.events.length + 1} capítulos e ${generated.deathCount} mortes possíveis. Ela foi preparada em modo exclusivo e continuará usando a proteção que impede mortos de voltar e preserva um vencedor.`
+        );
+      } catch (error) {
+        try { await conn.rollback(); } catch {}
+        throw error;
+      } finally {
+        conn.release();
+      }
+    }
+
     if (action === "add_scenario") {
       await ensureTables();
       const db = await getPool();
@@ -2269,14 +2578,15 @@ body.hg-running .event-person .event-name,
 .event-person{font-size:0!important;line-height:0!important}
 .event-person img,.event-person .avatar,.event-person .fake{font-size:16px!important;line-height:normal!important}
 
+.automatic-story-generator{border:1px solid #7e22ce;background:linear-gradient(180deg,#22102f,#100b18);border-radius:20px;padding:16px;margin:12px 0 20px}.automatic-story-form{display:grid;grid-template-columns:minmax(220px,1fr) auto;gap:10px;margin-top:12px}.automatic-story-status{margin-top:10px;color:#d8b4fe;font-weight:850;line-height:1.4}.automatic-story-generator h3{margin:4px 0 0}.automatic-story-generator button[disabled]{opacity:.55;cursor:wait}
 .scenario-create-grid,.scenario-edit-grid,.child-edit-grid{display:grid;grid-template-columns:1.25fr 1fr .7fr 1.4fr .8fr;gap:8px;margin-top:12px}.scenario-card{border:1px solid var(--b);background:#10101a;border-radius:20px;overflow:hidden}.scenario-head{display:flex;align-items:center;gap:10px;padding:14px;cursor:pointer;background:#171726}.scenario-arrow{width:42px;min-width:42px;padding:9px;background:#303044}.scenario-title{flex:1}.scenario-body{padding:14px;border-top:1px solid var(--b)}.scenario-body.collapsed{display:none}.scenario-flags{display:flex;gap:8px;flex-wrap:wrap}.flag{font-size:11px;font-weight:950;border:1px solid var(--b);border-radius:999px;padding:5px 8px;color:#ddd6fe}.switch-row{display:flex;align-items:center;gap:10px;border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:10px 12px}.switch-row input{width:20px;height:20px;accent-color:var(--p)}.child-list{display:flex;flex-direction:column;gap:10px;margin-top:12px}.child-card{border:1px solid var(--b);border-radius:16px;padding:12px;background:#0d0d16}.scenario-help{border-left:4px solid var(--p);padding:10px 12px;background:#1b1026;border-radius:10px;margin:10px 0}.wide-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.auto-time-bar{display:grid;grid-template-columns:minmax(230px,1fr) auto;gap:10px;margin:0 0 14px;align-items:end;border:1px solid var(--b);background:#0d0d16;border-radius:16px;padding:12px}.auto-time-field label{display:block;font-size:12px;font-weight:950;color:#ddd6fe;margin-bottom:7px}.auto-time-input{display:grid;grid-template-columns:minmax(90px,140px) auto;gap:8px;align-items:center}.auto-time-input input{font-weight:950}.auto-time-status{grid-column:1/-1;color:#c4b5fd}.story-card{border-color:#6b21a8;box-shadow:0 18px 60px #581c8730}.player-count-note{display:block;margin-top:6px;color:#c4b5fd}.player-count-input{font-weight:900}.log.event-sync-enter{animation:eventSyncEnter .22s ease-out}@keyframes eventSyncEnter{from{opacity:.15;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}.winner-prize{margin-top:16px;padding:16px;border:1px solid #6b21a8;background:linear-gradient(180deg,#241032,#120a1b);border-radius:22px;text-align:center}.winner-prize img{max-width:100%;max-height:360px;object-fit:contain;border-radius:18px;border:1px solid var(--b);background:#09090f;padding:8px}.winner-prize-title{font-size:20px;font-weight:950;margin:10px 0 6px}.winner-prize-text{font-size:18px;font-weight:900;line-height:1.4;color:#f5d0fe;margin-bottom:12px}.winner-prize-sub{font-size:13px;color:#c4b5fd}.trophy-admin-grid{display:grid;grid-template-columns:1.1fr .9fr auto;gap:8px;margin-top:12px;align-items:start}.trophy-preview{border:1px dashed var(--b);background:#0d0d16;border-radius:18px;min-height:150px;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:10px;color:var(--muted)}.trophy-preview img{max-width:100%;max-height:210px;object-fit:contain;border-radius:14px}.trophy-row{display:grid;grid-template-columns:170px 1fr;gap:14px;padding:12px;border:1px solid var(--b);background:#10101a;border-radius:18px}.trophy-row .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.trophy-row .preview{display:flex;align-items:center;justify-content:center;min-height:120px;border:1px solid var(--b);border-radius:16px;background:#0d0d16;overflow:hidden;padding:8px}.trophy-row .preview img{max-width:100%;max-height:150px;object-fit:contain;border-radius:12px}.winner-prize.hidden{display:none!important}.public-winner-prize:not(.hidden){position:static;width:100%;max-width:820px;margin:18px auto 0;box-shadow:0 18px 45px #0008;border:2px solid #a855f7;padding:20px}.public-winner-prize .winner-prize-text:first-child{font-size:clamp(22px,4vw,34px);color:#fff}.public-winner-prize img{max-height:420px}.winner-player-photo{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;margin:8px auto 16px}.winner-player-photo img,.winner-player-photo .fake{width:132px;height:132px;border-radius:28px;object-fit:cover;border:3px solid #f0abfc;background:#18111f;box-shadow:0 12px 32px #0009;display:flex;align-items:center;justify-content:center;font-size:44px;font-weight:950}.winner-player-photo-label{font-size:13px;font-weight:950;color:#f5d0fe;text-transform:uppercase;letter-spacing:.12em}.admin-participants-visible{display:block!important}.prize-save-status{margin-top:8px;font-weight:900;color:#c4b5fd}
-@media(max-width:900px){.trophy-admin-grid,.trophy-row{grid-template-columns:1fr}.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{grid-template-columns:1fr 1fr}.scenario-create-grid textarea,.scenario-edit-grid textarea,.child-edit-grid textarea,.span-all{grid-column:1/-1}.auto-time-bar{grid-template-columns:1fr}.auto-time-status{grid-column:1}.admin-event-grid{grid-template-columns:1fr 1fr!important}}
+@media(max-width:900px){.automatic-story-form{grid-template-columns:1fr}.trophy-admin-grid,.trophy-row{grid-template-columns:1fr}.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{grid-template-columns:1fr 1fr}.scenario-create-grid textarea,.scenario-edit-grid textarea,.child-edit-grid textarea,.span-all{grid-column:1/-1}.auto-time-bar{grid-template-columns:1fr}.auto-time-status{grid-column:1}.admin-event-grid{grid-template-columns:1fr 1fr!important}}
 </style></head><body><div class="wrap"><div class="top"><div><h1>Hunger Games da Live</h1><div class="sub">Participantes do chat, distritos, eventos, mortes e vencedor final.</div></div><div class="pill" id="statusPill">Carregando...</div></div>
 <div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div>${admin ? `<div id="normalEventsStatus" class="small" style="margin-top:7px;font-weight:950"></div>` : ``}</div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar automático</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar automático</button><button class="danger" onclick="act('reset')">Resetar</button><button id="normalEventsToggle" class="danger" onclick="toggleNormalEvents()">Desativar eventos antigos</button><button class="secondary" onclick="act('adult_on')">Ligar +18</button><button class="secondary" onclick="act('adult_off')">Desligar +18</button><button class="secondary" onclick="act('add_all_chat')">Adicionar todos do chat</button><button class="secondary" onclick="openWinnerPrizePanel()">🏆 Prêmios</button><button class="secondary" onclick="seedAdultHeavy()">Adicionar +18 pesado</button></div>` : ``}</div>
 ${admin ? `<div class="two" style="margin:16px 0"><input id="manualName" placeholder="Adicionar participante manual"/><input id="manualDistrict" placeholder="Distrito" type="number" min="1" max="12"/><button style="grid-column:1/-1" onclick="addPlayer()">Adicionar participante</button></div>` : ``}
 <div id="participantsBox" class="lobby-only admin-participants-visible"><h2>Participantes da partida</h2><div class="players" id="players"></div></div></section><aside class="card events-card"><h2 class="events-title">Eventos</h2>${admin ? `<div class="auto-time-bar"><div class="auto-time-field"><label for="autoInterval">Tempo entre os eventos automáticos</label><div class="auto-time-input"><input id="autoInterval" type="number" min="1" max="60" step="1" value="9" aria-label="Tempo entre eventos automáticos"><span>segundo(s)</span></div></div><button onclick="saveAutoInterval()">Salvar tempo</button><div id="autoIntervalStatus" class="small auto-time-status">Ao clicar em Iniciar, os eventos começam a rodar sozinhos. A página não acompanha nem rola até o evento novo.</div></div>` : ``}<div class="logs" id="logs"></div><div id="winnerPrizeBox" class="winner-prize ${admin ? `` : `public-winner-prize`} hidden"></div></aside></div>
 ${admin ? `<section id="winnerPrizeAdminCard" class="card" style="margin-top:18px;border-color:#7e22ce;box-shadow:0 18px 60px #581c8730"><div class="phase">NOVA CONFIGURAÇÃO</div><h2 style="margin-top:6px">🏆 Prêmio do vencedor</h2><div class="small">Envie suas imagens de prêmio. Quando a partida terminar, o jogo escolhe uma delas aleatoriamente e mostra abaixo do vencedor, no final dos eventos da página pública.</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px"><label class="switch-row"><input id="winnerPrizeEnabled" type="checkbox" onchange="saveWinnerPrizeSettings(true)"><span><b>Ativar prêmio do vencedor</b><br><span class="small">Desative se não quiser usar imagens de prêmio nesta arena.</span></span></label><div class="small" style="display:flex;align-items:center;justify-content:center;border:1px solid var(--b);border-radius:14px;padding:10px;background:#0d0d16">Use <b style="margin:0 4px">{vencedor}</b> para o nome do vencedor e <b style="margin:0 4px">{premio}</b> para o nome do prêmio.</div></div><textarea id="winnerPrizeText" placeholder="🏆 {vencedor}, você ganhou! O seu prêmio é: {premio}" style="margin-top:10px"></textarea><div class="wide-actions"><button onclick="saveWinnerPrizeSettings(false)">Salvar texto e ativação</button></div><div id="winnerPrizeSaveStatus" class="prize-save-status">Configuração salva no canal e mantida nas próximas partidas.</div><hr style="border-color:var(--b);margin:24px 0"><h3>Adicionar novo prêmio</h3><div class="trophy-admin-grid"><input id="trophyTitle" placeholder="Nome do prêmio, ex: Nave alienígena dourada"><div><input id="trophyImageFile" type="file" accept="image/png,image/jpeg,image/webp,image/gif" onchange="readTrophyImage(this,'trophyImageData','trophyImagePreview')"><input id="trophyImageData" type="hidden"></div><button onclick="addTrophy()">Adicionar prêmio</button></div><div id="trophyImagePreview" class="trophy-preview" style="margin-top:10px">Prévia da imagem</div><hr style="border-color:var(--b);margin:24px 0"><div class="top"><div><h2>Prêmios cadastrados</h2><div class="small">Você pode deixar vários ativos; o jogo sorteia um aleatoriamente quando houver vencedor.</div></div><button class="secondary" onclick="loadTrophies()">Recarregar prêmios</button></div><div id="trophiesEditor" style="display:flex;flex-direction:column;gap:12px;margin-top:14px"></div></section>` : ``}
-${admin ? `<section class="card story-card" style="margin-top:18px"><h2>Modo História</h2><div class="scenario-help"><b>Exemplo:</b> “Um ET invade a arena”. Crie a introdução e depois abra a seta para cadastrar os acontecimentos decorrentes.</div><div class="small">Na seleção de pessoas, escolha <b>Todos</b> para colocar todos os participantes vivos na mesma cena. No texto, use <b>{p}</b> ou <b>{todos}</b> para mostrar todos os nomes.</div>
+${admin ? `<section class="card story-card" style="margin-top:18px"><h2>Modo História</h2><div class="automatic-story-generator"><div class="phase">GERADOR AUTOMÁTICO</div><h3>Criar história somente pela categoria</h3><div class="small">Digite uma categoria como Vampiro, Terror, Apocalipse ou qualquer outro tema. O sistema cria a história completa, incluindo mortes, até chegar ao vencedor.</div><div class="automatic-story-form"><div><input id="storyCategory" list="storyCategorySuggestions" placeholder="Ex.: vampiro" maxlength="60" autocomplete="off"><datalist id="storyCategorySuggestions"><option value="Vampiro"></option><option value="Terror"></option><option value="Apocalipse"></option><option value="Zumbi"></option></datalist></div><button id="generateStoryButton" onclick="generateStory()">Gerar história completa</button></div><div id="storyGeneratorStatus" class="small automatic-story-status">A quantidade de mortes é calculada pelos participantes vivos da partida. Mortos não voltam e o último sobrevivente continua sendo o vencedor.</div></div><div class="scenario-help"><b>Criação manual:</b> continue usando os campos abaixo quando quiser escrever a introdução e os acontecimentos por conta própria.</div><div class="small">Na seleção de pessoas, escolha <b>Todos</b> para colocar todos os participantes vivos na mesma cena. No texto, use <b>{p}</b> ou <b>{todos}</b> para mostrar todos os nomes.</div>
 <input id="scName" style="margin-top:12px" placeholder="Nome da história: Invasão alienígena"/>
 <div class="scenario-create-grid"><select id="scPhase"><option value="bloodbath">Cornucópia</option><option value="day">Dia</option><option value="night">Noite</option><option value="feast">Banquete</option><option value="arena" selected>Evento da arena</option></select><select id="scType"><option value="neutral">Neutro</option><option value="death">Morte</option><option value="item">Item</option><option value="alliance">Aliança</option><option value="adult">Adulto</option></select><input id="scPlayers" class="player-count-input" type="text" value="Todos" placeholder="Número ou Todos" title="Digite qualquer número inteiro ou Todos" autocomplete="off"/><input id="scKills" placeholder="Mortes: p2"/><select id="scAdult"><option value="0">Normal</option><option value="1">+18</option></select></div>
 <textarea id="scText" placeholder="Um ET invade a arena diante de {p}."></textarea><span class="small player-count-note">Digite qualquer quantidade, como 8, 20 ou 100. Para usar todos os vivos, escreva Todos. Eventos para Todos não usam o campo Mortes.</span>
@@ -2368,6 +2678,7 @@ const openScenarios=new Set();
 function phaseOptions(value,allowAny=false){const items=[];if(allowAny)items.push(["any","Qualquer fase"]);items.push(["bloodbath","Cornucópia"],["day","Dia"],["night","Noite"],["feast","Banquete"],["arena","Evento da arena"]);return items.map(x=>'<option value="'+x[0]+'" '+(value===x[0]?"selected":"")+'>'+x[1]+'</option>').join("")}
 function typeOptions(value){return [["neutral","Neutro"],["death","Morte"],["item","Item"],["alliance","Aliança"],["adult","Adulto"]].map(x=>'<option value="'+x[0]+'" '+(value===x[0]?"selected":"")+'>'+x[1]+'</option>').join("")}
 function toggleScenario(id){const body=document.getElementById("scenario_body_"+id),arrow=document.getElementById("scenario_arrow_"+id);if(!body)return;const opening=body.classList.contains("collapsed");body.classList.toggle("collapsed",!opening);arrow.textContent=opening?"▼":"▶";if(opening)openScenarios.add(id);else openScenarios.delete(id)}
+async function generateStory(){const input=document.getElementById("storyCategory"),button=document.getElementById("generateStoryButton"),status=document.getElementById("storyGeneratorStatus");const category=String(input?.value||"").trim();if(!category){if(status)status.textContent="Digite uma categoria, por exemplo: Vampiro, Terror ou Apocalipse.";input?.focus();return}if(button){button.disabled=true;button.textContent="Criando história..."}if(status)status.textContent="Criando introdução, acontecimentos e mortes para a categoria “"+category+"”...";try{const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"generate_story",category})});if(status)status.textContent=String(t);if(String(t).startsWith("✅")){clearTimelinePlayback();timelineInitialized=false;await loadScenarios();await load()}}catch(e){if(status)status.textContent="Erro ao criar a história automática."}finally{if(button){button.disabled=false;button.textContent="Gerar história completa"}}}
 async function addScenario(){const g=id=>document.getElementById(id);const body={action:"add_scenario",name:g("scName").value,phase:g("scPhase").value,type:g("scType").value,players:g("scPlayers").value,kills:g("scKills").value,adult:g("scAdult").value,text:g("scText").value,mix_with_normal:g("scMix").checked?"1":"0",active:g("scActive").checked?"1":"0"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);if(String(t).startsWith("✅")){g("scName").value="";g("scText").value=""}await loadScenarios();load()}
 function scenarioChildRow(c,sid){return '<div class="child-card"><div class="phase">EVENTO DA HISTÓRIA ID '+c.id+' • '+esc(phaseLabels[c.phase]||c.phase)+' • '+esc(typeLabel(c.type))+' • '+esc(playerLabel(c.players))+' • '+(c.active?"Ativo":"Desativado")+'</div><div class="child-edit-grid"><select id="sce_phase_'+c.id+'">'+phaseOptions(c.phase,true)+'</select><select id="sce_type_'+c.id+'">'+typeOptions(c.type)+'</select>'+playerInput("sce_players_"+c.id,c.players)+'<input id="sce_kills_'+c.id+'" placeholder="Mortes: p2" value="'+esc(c.kills||"")+'"><select id="sce_adult_'+c.id+'"><option value="0" '+(!c.adult?"selected":"")+'>Normal</option><option value="1" '+(c.adult?"selected":"")+'>+18</option></select></div><textarea id="sce_text_'+c.id+'">'+esc(c.text)+'</textarea><div class="wide-actions"><label class="switch-row"><input id="sce_active_'+c.id+'" type="checkbox" '+(c.active?"checked":"")+'><span>Evento decorrente ativo</span></label><button onclick="saveScenarioEvent('+c.id+','+sid+')">Salvar evento interno</button><button class="danger" onclick="deleteScenarioEvent('+c.id+','+sid+')">Excluir</button></div></div>'}
 async function saveScenarioOptions(id){const mix=document.getElementById("sc_mix_"+id),active=document.getElementById("sc_active_"+id),status=document.getElementById("sc_options_status_"+id);if(!mix||!active)return;if(status)status.textContent="Salvando opções...";mix.disabled=true;active.disabled=true;try{const exclusive=!mix.checked&&active.checked;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"update_scenario_options",id,mix_with_normal:mix.checked?"1":"0",active:active.checked?"1":"0"})});if(exclusive){clearTimelinePlayback();timelineInitialized=false}if(status)status.textContent=String(t);openScenarios.add(Number(id));await load()}catch(e){if(status)status.textContent="Erro ao salvar as opções."}finally{mix.disabled=false;active.disabled=false}}
