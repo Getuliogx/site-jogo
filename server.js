@@ -6,7 +6,7 @@ import tls from "node:tls";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = "7.0.0";
+const APP_VERSION = "8.0.0";
 const DEFAULT_WINNER_PRIZE_TEXT = "🏆 {vencedor}, você ganhou! O seu prêmio é: {premio}";
 
 app.use(cors());
@@ -29,6 +29,7 @@ const autoTimers = new Map();
 const autoRunTokens = new Map();
 const chatTrackers = new Map();
 const channelQueues = new Map();
+const avatarRefreshTimes = new Map();
 
 const DEFAULT_IGNORED_CHATTERS = new Set([
   "streamelements", "nightbot", "moobot", "streamlabs", "soundalerts",
@@ -724,6 +725,7 @@ async function ensureTables() {
           day_number INT NOT NULL DEFAULT 1,
           text TEXT NOT NULL,
           deaths TEXT NULL,
+          participant_ids TEXT NULL,
           created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
           INDEX idx_game_log (game_id,id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -746,6 +748,11 @@ async function ensureTables() {
 
       // Migração segura: mantém todos os eventos e partidas já existentes.
       // A coluna só é criada na primeira execução desta versão.
+      try {
+        await db.query("ALTER TABLE hg_logs ADD COLUMN participant_ids TEXT NULL AFTER deaths");
+      } catch (e) {
+        if (e?.code !== "ER_DUP_FIELDNAME") throw e;
+      }
       try {
         await db.query("ALTER TABLE hg_games ADD COLUMN active_scenario_id INT NULL AFTER adult_mode");
       } catch (e) {
@@ -974,6 +981,43 @@ async function getTwitchProfiles(usernames) {
     console.error("Erro ao buscar perfis da Twitch:", e.message);
   }
   return result;
+}
+
+async function refreshMissingPlayerAvatars(gameId) {
+  const id = Number(gameId || 0);
+  if (!id) return 0;
+  const db = await getPool();
+  const [missing] = await db.query(
+    "SELECT id,username FROM hg_players WHERE game_id=? AND (avatar_url IS NULL OR avatar_url='')",
+    [id]
+  );
+  if (!missing.length) return 0;
+  const profiles = await getTwitchProfiles(missing.map(player => player.username));
+  let updated = 0;
+  for (const player of missing) {
+    const avatar = String(profiles.get(nick(player.username))?.avatar_url || "").trim();
+    if (!avatar) continue;
+    const [result] = await db.query(
+      "UPDATE hg_players SET avatar_url=? WHERE id=? AND game_id=? AND (avatar_url IS NULL OR avatar_url='')",
+      [avatar, player.id, id]
+    );
+    updated += Number(result.affectedRows || 0);
+  }
+  return updated;
+}
+
+async function refreshMissingPlayerAvatarsThrottled(gameId, intervalMs = 300000) {
+  const id = Number(gameId || 0);
+  if (!id) return 0;
+  const last = Number(avatarRefreshTimes.get(id) || 0);
+  if (Date.now() - last < intervalMs) return 0;
+  avatarRefreshTimes.set(id, Date.now());
+  try {
+    return await refreshMissingPlayerAvatars(id);
+  } catch (error) {
+    console.error("Erro ao atualizar fotos dos participantes:", error.message);
+    return 0;
+  }
 }
 
 async function officialChatters(channel) {
@@ -1206,6 +1250,7 @@ async function addAllChatters(channel) {
         (game_id,channel,username,display_name,district,avatar_url,alive)
       VALUES ?
     `, [values]);
+    await refreshMissingPlayerAvatars(game.id);
 
     return `✅ ${selected.length} participante(s) do chat adicionado(s). Total: ${existing.length + selected.length}.`;
   });
@@ -1218,13 +1263,17 @@ async function start(channel) {
     if (game.status === "ended") return "A partida já terminou. Use Resetar antes de iniciar outra.";
     if (game.status !== "lobby") return "Esta arena não está disponível para iniciar.";
     const db = await getPool();
+    await refreshMissingPlayerAvatars(game.id);
     const [players] = await db.query("SELECT * FROM hg_players WHERE game_id=?", [game.id]);
     if (players.length < 2) return "Precisa de pelo menos 2 participantes.";
     await db.query("UPDATE hg_players SET kills=0 WHERE game_id=?", [game.id]);
     await db.query("DELETE FROM hg_scenario_usage WHERE game_id=?", [game.id]);
     await db.query("DELETE FROM hg_game_scenario_runs WHERE game_id=?", [game.id]);
     await db.query("UPDATE hg_games SET status='running',phase='bloodbath',day_number=1,winner=NULL,active_scenario_id=NULL,winner_trophy_id=NULL,winner_trophy_title=NULL,winner_trophy_image=NULL,narration_enabled=0 WHERE id=? AND status='lobby'", [game.id]);
-    await db.query("INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,'reaping',0,?,'')", [game.id, channel, `🎲 A arena começou com ${players.length} participantes.`]);
+    await db.query(
+      "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths,participant_ids) VALUES (?,?,'reaping',0,?,'',?)",
+      [game.id, channel, `🎲 A arena começou com ${players.length} participantes.`, players.map(player => Number(player.id)).join(",")]
+    );
     return `🔥 Partida iniciada com ${players.length} participantes.`;
   });
   if (!String(result).startsWith("🔥")) return result;
@@ -1532,8 +1581,8 @@ async function runExclusiveStoryBeat(conn, game, alive, channel, adultAllowed, f
   const text = fill(event.text, group);
   const deathNames = confirmedDeaths.map(p => p.display_name || p.username);
   await conn.query(
-    "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,?,?,?,?)",
-    [game.id, channel, "story", day, text, deathNames.join(", ")]
+    "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths,participant_ids) VALUES (?,?,?,?,?,?,?)",
+    [game.id, channel, "story", day, text, deathNames.join(", "), group.map(player => Number(player.id)).join(",")]
   );
 
   if (isIntroduction) {
@@ -1852,8 +1901,8 @@ async function nextRound(channel) {
       const text = fill(selectedEvent.text, selectedGroup);
       const deathNames = confirmedDeaths.map(player => player.display_name || player.username);
       await conn.query(
-        "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,?,?,?,?)",
-        [game.id, channel, selectedPhase, selectedDay, text, deathNames.join(", ")]
+        "INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths,participant_ids) VALUES (?,?,?,?,?,?,?)",
+        [game.id, channel, selectedPhase, selectedDay, text, deathNames.join(", "), selectedGroup.map(player => Number(player.id)).join(",")]
       );
 
       await conn.query(
@@ -2471,7 +2520,8 @@ async function state(req, res) {
   let conn = null;
   try {
     const ch = channelFrom(req);
-    await currentGame(ch, true);
+    const current = await currentGame(ch, true);
+    await refreshMissingPlayerAvatarsThrottled(current?.id);
     const db = await getPool();
     conn = await db.getConnection();
 
@@ -2577,6 +2627,7 @@ body.hg-running .event-person .event-name,
 .event-avatars .event-name{display:none!important;font-size:0!important;width:0!important;height:0!important;overflow:hidden!important}
 .event-person{font-size:0!important;line-height:0!important}
 .event-person img,.event-person .avatar,.event-person .fake{font-size:16px!important;line-height:normal!important}
+.avatar-wrap{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto}.player>.avatar-wrap{width:46px;height:46px}.event-person>.avatar-wrap{width:72px;height:72px}body.hg-running .event-person>.avatar-wrap{width:96px;height:96px}
 
 .automatic-story-generator{border:1px solid #7e22ce;background:linear-gradient(180deg,#22102f,#100b18);border-radius:20px;padding:16px;margin:12px 0 20px}.automatic-story-form{display:grid;grid-template-columns:minmax(220px,1fr) auto;gap:10px;margin-top:12px}.automatic-story-status{margin-top:10px;color:#d8b4fe;font-weight:850;line-height:1.4}.automatic-story-generator h3{margin:4px 0 0}.automatic-story-generator button[disabled]{opacity:.55;cursor:wait}
 .scenario-create-grid,.scenario-edit-grid,.child-edit-grid{display:grid;grid-template-columns:1.25fr 1fr .7fr 1.4fr .8fr;gap:8px;margin-top:12px}.scenario-card{border:1px solid var(--b);background:#10101a;border-radius:20px;overflow:hidden}.scenario-head{display:flex;align-items:center;gap:10px;padding:14px;cursor:pointer;background:#171726}.scenario-arrow{width:42px;min-width:42px;padding:9px;background:#303044}.scenario-title{flex:1}.scenario-body{padding:14px;border-top:1px solid var(--b)}.scenario-body.collapsed{display:none}.scenario-flags{display:flex;gap:8px;flex-wrap:wrap}.flag{font-size:11px;font-weight:950;border:1px solid var(--b);border-radius:999px;padding:5px 8px;color:#ddd6fe}.switch-row{display:flex;align-items:center;gap:10px;border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:10px 12px}.switch-row input{width:20px;height:20px;accent-color:var(--p)}.child-list{display:flex;flex-direction:column;gap:10px;margin-top:12px}.child-card{border:1px solid var(--b);border-radius:16px;padding:12px;background:#0d0d16}.scenario-help{border-left:4px solid var(--p);padding:10px 12px;background:#1b1026;border-radius:10px;margin:10px 0}.wide-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.auto-time-bar{display:grid;grid-template-columns:minmax(230px,1fr) auto;gap:10px;margin:0 0 14px;align-items:end;border:1px solid var(--b);background:#0d0d16;border-radius:16px;padding:12px}.auto-time-field label{display:block;font-size:12px;font-weight:950;color:#ddd6fe;margin-bottom:7px}.auto-time-input{display:grid;grid-template-columns:minmax(90px,140px) auto;gap:8px;align-items:center}.auto-time-input input{font-weight:950}.auto-time-status{grid-column:1/-1;color:#c4b5fd}.story-card{border-color:#6b21a8;box-shadow:0 18px 60px #581c8730}.player-count-note{display:block;margin-top:6px;color:#c4b5fd}.player-count-input{font-weight:900}.log.event-sync-enter{animation:eventSyncEnter .22s ease-out}@keyframes eventSyncEnter{from{opacity:.15;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}.winner-prize{margin-top:16px;padding:16px;border:1px solid #6b21a8;background:linear-gradient(180deg,#241032,#120a1b);border-radius:22px;text-align:center}.winner-prize img{max-width:100%;max-height:360px;object-fit:contain;border-radius:18px;border:1px solid var(--b);background:#09090f;padding:8px}.winner-prize-title{font-size:20px;font-weight:950;margin:10px 0 6px}.winner-prize-text{font-size:18px;font-weight:900;line-height:1.4;color:#f5d0fe;margin-bottom:12px}.winner-prize-sub{font-size:13px;color:#c4b5fd}.trophy-admin-grid{display:grid;grid-template-columns:1.1fr .9fr auto;gap:8px;margin-top:12px;align-items:start}.trophy-preview{border:1px dashed var(--b);background:#0d0d16;border-radius:18px;min-height:150px;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:10px;color:var(--muted)}.trophy-preview img{max-width:100%;max-height:210px;object-fit:contain;border-radius:14px}.trophy-row{display:grid;grid-template-columns:170px 1fr;gap:14px;padding:12px;border:1px solid var(--b);background:#10101a;border-radius:18px}.trophy-row .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.trophy-row .preview{display:flex;align-items:center;justify-content:center;min-height:120px;border:1px solid var(--b);border-radius:16px;background:#0d0d16;overflow:hidden;padding:8px}.trophy-row .preview img{max-width:100%;max-height:150px;object-fit:contain;border-radius:12px}.winner-prize.hidden{display:none!important}.public-winner-prize:not(.hidden){position:static;width:100%;max-width:820px;margin:18px auto 0;box-shadow:0 18px 45px #0008;border:2px solid #a855f7;padding:20px}.public-winner-prize .winner-prize-text:first-child{font-size:clamp(22px,4vw,34px);color:#fff}.public-winner-prize img{max-height:420px}.winner-player-photo{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;margin:8px auto 16px}.winner-player-photo img,.winner-player-photo .fake{width:132px;height:132px;border-radius:28px;object-fit:cover;border:3px solid #f0abfc;background:#18111f;box-shadow:0 12px 32px #0009;display:flex;align-items:center;justify-content:center;font-size:44px;font-weight:950}.winner-player-photo-label{font-size:13px;font-weight:950;color:#f5d0fe;text-transform:uppercase;letter-spacing:.12em}.admin-participants-visible{display:block!important}.prize-save-status{margin-top:8px;font-weight:900;color:#c4b5fd}
@@ -2605,8 +2656,9 @@ function playerInput(id,value){const n=Number(value);const shown=n===0?"Todos":S
 function playerLabel(value){const n=Number(value);if(n===0)return "Todos";const amount=Number.isFinite(n)&&n>=1?Math.round(n):1;return amount===1?"1 pessoa":String(amount)+" pessoas"}
 function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}[m]))}
 async function api(path,opt={}){const sep=path.includes("?")?"&":"?";const url=path+sep+"channel="+encodeURIComponent(channel)+(token?"&token="+encodeURIComponent(token):"");const r=await fetch(url,{cache:"no-store",...opt}),ct=r.headers.get("content-type")||"";return ct.includes("json")?r.json():r.text()}
-function avatarHtml(p,cls="avatar"){return p&&p.avatar_url?'<img class="'+cls+'" src="'+esc(p.avatar_url)+'">':'<div class="'+cls+' fake">'+esc(((p&&p.display_name)||"?").slice(0,1).toUpperCase())+'</div>'}
-function mentionedPlayers(text,players){const found=[];const lower=String(text||"").toLowerCase();players.forEach(p=>{const nm=String(p.display_name||p.username||"").toLowerCase();if(nm&&lower.includes(nm)&&!found.some(x=>x.id===p.id))found.push(p)});return found}
+function avatarHtml(p,cls="avatar"){const initial=esc(((p&&p.display_name)||"?").slice(0,1).toUpperCase());const name=esc((p&&p.display_name)||"Participante");return p&&p.avatar_url?'<span class="avatar-wrap"><img class="'+cls+'" src="'+esc(p.avatar_url)+'" alt="Foto de '+name+'" loading="eager" referrerpolicy="no-referrer" onerror="this.hidden=true;this.nextElementSibling.hidden=false"><span class="'+cls+' fake" hidden>'+initial+'</span></span>':'<span class="avatar-wrap"><span class="'+cls+' fake">'+initial+'</span></span>'}
+function mentionedPlayers(text,players){const found=[];const lower=String(text||"").toLowerCase();players.forEach(p=>{const names=[p.display_name,p.username].map(v=>String(v||"").trim().toLowerCase()).filter(Boolean);if(names.some(nm=>lower.includes(nm))&&!found.some(x=>Number(x.id)===Number(p.id)))found.push(p)});return found}
+function logParticipants(log,players){const ids=String(log?.participant_ids||"").split(",").map(v=>Number(v.trim())).filter(id=>Number.isFinite(id)&&id>0);if(ids.length){const byId=new Map((players||[]).map(p=>[Number(p.id),p]));const exact=ids.map(id=>byId.get(id)).filter(Boolean);if(exact.length)return exact}return mentionedPlayers(log?.text,players||[])}
 const AUTO_INTERVAL_KEY="hgAutoIntervalV60";
 let autoIntervalServerSignature="",autoIntervalSaving=false;
 function normalizedAutoIntervalMs(value){const seconds=Math.max(1,Math.min(60,Number(value)||9));return Math.round(seconds*1000)}
@@ -2614,7 +2666,7 @@ function applyServerAutoInterval(value){const ms=Math.max(1000,Math.min(60000,Nu
 async function saveAutoInterval(){if(!admin)return;if(!token)return alert("Abra com ?token=SEU_TOKEN");if(autoIntervalSaving)return;const input=document.getElementById("autoInterval"),status=document.getElementById("autoIntervalStatus");const ms=normalizedAutoIntervalMs(input?.value);if(input)input.value=String(ms/1000);if(status)status.textContent="Salvando o tempo do automático...";autoIntervalSaving=true;try{const result=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"set_auto_interval",event_delay_ms:ms})});if(status)status.textContent=String(result)+" A tela continuará parada onde você deixou.";try{localStorage.setItem(AUTO_INTERVAL_KEY,String(ms))}catch{}await load()}catch(e){if(status)status.textContent="Não foi possível salvar o tempo."}finally{autoIntervalSaving=false}}
 let timelineGameId=null,timelineInitialized=false,timelinePlayers=[];
 const timelineKnownIds=new Set();
-function eventCardHtml(l,players,extra=""){const ps=mentionedPlayers(l.text,players);const avs=ps.length?'<div class="event-avatars">'+ps.map(p=>'<div class="event-person">'+avatarHtml(p,"avatar")+'</div>').join("")+'</div>':'';return '<div class="log '+(l.deaths?'death ':'')+extra+'" data-log-id="'+Number(l.id||0)+'"><div class="phase">'+esc(phaseLabel(l.phase,l.day_number))+'</div>'+avs+'<div class="event-text">'+esc(l.text)+'</div>'+(l.deaths?'<div class="small">Mortes: '+esc(l.deaths)+'</div>':'')+'</div>'}
+function eventCardHtml(l,players,extra=""){const ps=logParticipants(l,players);const avs=ps.length?'<div class="event-avatars">'+ps.map(p=>'<div class="event-person">'+avatarHtml(p,"avatar")+'</div>').join("")+'</div>':'';return '<div class="log '+(l.deaths?'death ':'')+extra+'" data-log-id="'+Number(l.id||0)+'"><div class="phase">'+esc(phaseLabel(l.phase,l.day_number))+'</div>'+avs+'<div class="event-text">'+esc(l.text)+'</div>'+(l.deaths?'<div class="small">Mortes: '+esc(l.deaths)+'</div>':'')+'</div>'}
 function preserveViewport(action){const x=window.scrollX||0,y=window.scrollY||0;action();requestAnimationFrame(()=>{const nowX=window.scrollX||0,nowY=window.scrollY||0;if(Math.abs(nowX-x)>1||Math.abs(nowY-y)>1)window.scrollTo({left:x,top:y,behavior:"auto"})})}
 function clearTimelinePlayback(){timelineKnownIds.clear()}
 function renderTimelineHistory(logs,players,status){const box=document.getElementById("logs");const list=(Array.isArray(logs)?logs:[]).slice().sort((a,b)=>Number(a.id)-Number(b.id));preserveViewport(()=>{box.innerHTML=list.map(l=>eventCardHtml(l,players)).join("")||"<div class='small' id='timelineEmpty'>Sem eventos ainda.</div>";document.querySelectorAll(".event-name").forEach(e=>e.remove())});timelineKnownIds.clear();for(const l of list)timelineKnownIds.add(Number(l.id))}

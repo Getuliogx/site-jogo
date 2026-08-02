@@ -1,4 +1,4 @@
-# Hunger Games da Live — versão 7.0.0
+# Hunger Games da Live — versão 8.0.0
 
 Sistema com modo história, eventos personalizados, execução automática e prêmio aleatório para o vencedor.
 
@@ -16,6 +16,12 @@ O sistema cria automaticamente:
 Categorias diferentes das sugestões também funcionam por meio do gerador genérico. A história criada fica em modo exclusivo, sem misturar os eventos antigos.
 
 As mortes continuam usando a lógica original do jogo: jogadores mortos não voltam, uma morte só é confirmada uma vez e o último sobrevivente nunca é eliminado.
+
+## Fotos nos eventos
+
+Cada evento agora salva os IDs exatos dos participantes usados na cena. A página pública usa esses IDs para mostrar as fotos corretas, inclusive nas histórias criadas automaticamente.
+
+Ao abrir a página, o sistema também tenta preencher novamente avatares que ficaram vazios no banco. Se uma imagem externa falhar, aparece a inicial da pessoa no lugar, sem quebrar o evento.
 
 ## Automático sem voz
 
