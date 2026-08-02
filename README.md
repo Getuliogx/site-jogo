@@ -1,19 +1,27 @@
-# Hunger Games da Live — versão 10.0.0
+# Hunger Games da Live — versão 11.0.0
 
 Sistema com modo história, eventos personalizados, execução automática e prêmio aleatório para o vencedor.
 
-## Gerador automático de histórias
+## Gerador automático de histórias com várias categorias
 
-No painel administrativo, basta digitar uma categoria, por exemplo **Vampiro**, **Terror**, **Apocalipse** ou **Zumbi**, e clicar em **Gerar história completa**.
+No painel administrativo, digite duas ou mais categorias na mesma caixa, separadas por `+`, vírgula, ponto e vírgula, barra ou pela palavra `e`.
 
-O sistema cria automaticamente:
+Exemplos:
+
+- `Vampiro + Terror + Apocalipse`
+- `Terror, Zumbi`
+- `Piratas espaciais + Dinossauros + Demônios`
+
+O sistema cria **uma única história misturada**. Todas as categorias aparecem na introdução, alternam nos capítulos e também se cruzam nos eventos de morte e no confronto final.
+
+O sistema continua criando automaticamente:
 
 - introdução da história;
 - acontecimentos de tensão, itens e alianças;
 - eventos de morte suficientes para a quantidade atual de participantes vivos;
 - capítulos finais até restar um vencedor.
 
-Categorias diferentes das sugestões também funcionam por meio do gerador genérico. A história criada fica em modo exclusivo, sem misturar os eventos antigos.
+Categorias diferentes das sugestões também funcionam pelo gerador genérico. A história criada fica em modo exclusivo, sem misturar os eventos antigos.
 
 As mortes continuam usando a lógica original do jogo: jogadores mortos não voltam, uma morte só é confirmada uma vez e o último sobrevivente nunca é eliminado.
 

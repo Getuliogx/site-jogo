@@ -6,7 +6,7 @@ import tls from "node:tls";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = "10.0.0";
+const APP_VERSION = "11.0.0";
 const DEFAULT_WINNER_PRIZE_TEXT = "🏆 {vencedor}, você ganhou! O seu prêmio é: {premio}";
 
 app.use(cors());
@@ -589,6 +589,48 @@ function storyTitle(category) {
     .join(" ");
 }
 
+function splitStoryCategories(value) {
+  const raw = String(value || "")
+    .replace(/[\r\n]+/g, " + ")
+    .trim();
+
+  const parts = raw
+    .split(/\s*(?:\+|,|;|\||\/|\s+e\s+)\s*/i)
+    .map(item => item.trim().replace(/\s+/g, " "))
+    .filter(Boolean);
+
+  const seen = new Set();
+  const categories = [];
+  for (const part of parts) {
+    const key = storyCategoryKey(part);
+    const dedupeKey = key === "generic" ? `generic:${normalizeStoryCategory(part)}` : `pack:${key}`;
+    if (!seen.has(dedupeKey)) {
+      seen.add(dedupeKey);
+      categories.push(part);
+    }
+    if (categories.length >= 10) break;
+  }
+
+  if (!categories.length && normalizeStoryCategory(raw)) categories.push(raw);
+  return categories;
+}
+
+function joinStoryTitles(titles) {
+  const clean = titles.filter(Boolean);
+  if (clean.length <= 1) return clean[0] || "";
+  if (clean.length === 2) return `${clean[0]} e ${clean[1]}`;
+  return `${clean.slice(0, -1).join(", ")} e ${clean[clean.length - 1]}`;
+}
+
+function storyPackFromCategory(category) {
+  const key = storyCategoryKey(category);
+  return {
+    key,
+    input: category,
+    pack: key === "generic" ? genericStoryPack(category) : AUTOMATIC_STORY_PACKS[key]
+  };
+}
+
 function genericStoryPack(category) {
   const label = storyTitle(category);
   return {
@@ -624,9 +666,14 @@ function genericStoryPack(category) {
   };
 }
 
-function buildAutomaticStory(category, aliveCountRaw = 0) {
-  const key = storyCategoryKey(category);
-  const pack = key === "generic" ? genericStoryPack(category) : AUTOMATIC_STORY_PACKS[key];
+function buildAutomaticStory(categoryInput, aliveCountRaw = 0) {
+  const categoryInputs = splitStoryCategories(categoryInput);
+  const categoryPacks = categoryInputs.map(storyPackFromCategory);
+  const packs = categoryPacks.map(item => item.pack);
+  const titles = packs.map(pack => pack.title);
+  const categoryLabel = joinStoryTitles(titles);
+  const isMixed = packs.length > 1;
+
   const aliveCount = Math.max(0, Math.round(Number(aliveCountRaw || 0)));
   const expectedPlayers = aliveCount > 1 ? aliveCount : 24;
   const deathCount = Math.max(1, Math.min(120, expectedPlayers - 1));
@@ -645,31 +692,77 @@ function buildAutomaticStory(category, aliveCountRaw = 0) {
     });
   };
 
-  // Abertura antes das mortes para a história não começar de forma seca.
-  add("neutral", 1, pack.calm[0]);
-  add("alliance", 2, pack.conflict[0]);
-  add("item", 1, pack.calm[1]);
+  const packAt = index => packs[index % packs.length];
+  const mixedPrefix = (primary, secondary) => {
+    if (!isMixed || !secondary || secondary === primary) return "";
+    return `Ao mesmo tempo, a ameaça de ${secondary.title} invade o cenário. `;
+  };
+
+  const intro = isMixed
+    ? `A arena se transforma em uma única história que mistura ${categoryLabel}. {p} descobrem que todos esses perigos estão ligados e que a história só terminará quando restar um sobrevivente.`
+    : packs[0].intro;
+
+  // Cada categoria ganha espaço logo no começo para a mistura ficar visível.
+  packs.forEach((pack, index) => {
+    add(
+      index % 3 === 0 ? "neutral" : index % 3 === 1 ? "item" : "alliance",
+      index % 3 === 2 ? 2 : 1,
+      pack.calm[index % pack.calm.length]
+    );
+  });
+
+  if (isMixed) {
+    const first = packAt(0);
+    const second = packAt(1);
+    add(
+      "alliance",
+      2,
+      `Os perigos de ${first.title} e ${second.title} se encontram no mesmo lugar. ${first.conflict[0]}`
+    );
+  } else {
+    add("alliance", 2, packs[0].conflict[0]);
+    add("item", 1, packs[0].calm[1]);
+  }
 
   for (let i = 0; i < deathCount; i += 1) {
     const progress = deathCount <= 1 ? 1 : i / (deathCount - 1);
+    const primary = packAt(i);
+    const secondary = isMixed ? packAt(i + 1) : null;
+
     if (i > 0 && i % 2 === 0) {
-      const calm = pack.calm[(Math.floor(i / 2) + 1) % pack.calm.length];
-      add(i % 4 === 0 ? "item" : "neutral", 1, calm);
+      const calmPack = packAt(i + 1);
+      const calm = calmPack.calm[(Math.floor(i / 2) + 1) % calmPack.calm.length];
+      const calmPrefix = isMixed
+        ? `Enquanto a história alterna para ${calmPack.title}, `
+        : "";
+      add(i % 4 === 0 ? "item" : "neutral", 1, calmPrefix + calm);
     }
+
     if (i > 0 && i % 5 === 0) {
-      const conflict = pack.conflict[(Math.floor(i / 5) + 1) % pack.conflict.length];
-      add("alliance", 2, conflict);
+      const conflictPack = packAt(i + 2);
+      const conflict = conflictPack.conflict[(Math.floor(i / 5) + 1) % conflictPack.conflict.length];
+      const conflictPrefix = isMixed
+        ? `As ameaças de ${primary.title} e ${conflictPack.title} se cruzam. `
+        : "";
+      add("alliance", 2, conflictPrefix + conflict);
     }
-    const source = progress >= 0.85 ? pack.finales : pack.deaths;
+
+    const source = progress >= 0.85 ? primary.finales : primary.deaths;
     const deathText = source[i % source.length];
-    add("death", 2, deathText, "p2");
+    const prefix = progress >= 0.85 && isMixed
+      ? `No confronto final entre ${primary.title} e ${secondary.title}, `
+      : mixedPrefix(primary, secondary);
+    add("death", 2, prefix + deathText, "p2");
   }
 
   return {
-    name: `História automática: ${pack.title}`,
-    intro: pack.intro,
+    name: `História automática: ${titles.join(" + ")}`,
+    intro,
     events,
-    deathCount
+    deathCount,
+    categoryCount: packs.length,
+    categories: titles,
+    mixed: isMixed
   };
 }
 
@@ -2367,8 +2460,8 @@ async function adminAction(req, res) {
       const category = String(req.body?.category || req.query.category || "")
         .replace(/\s+/g, " ")
         .trim()
-        .slice(0, 60);
-      if (category.length < 2) return send(res, "Digite uma categoria para criar a história.");
+        .slice(0, 180);
+      if (category.length < 2 || !splitStoryCategories(category).length) return send(res, "Digite uma ou mais categorias válidas para criar a história.");
 
       const [games] = await db.query(
         "SELECT id,status FROM hg_games WHERE channel=? AND status IN ('lobby','running') ORDER BY id DESC LIMIT 1",
@@ -2419,7 +2512,7 @@ async function adminAction(req, res) {
         await conn.commit();
         return send(
           res,
-          `✅ ${generated.name} criada com ${generated.events.length + 1} capítulos e ${generated.deathCount} mortes possíveis. Ela foi preparada em modo exclusivo e continuará usando a proteção que impede mortos de voltar e preserva um vencedor.`
+          `✅ ${generated.name} criada ${generated.mixed ? `misturando ${generated.categoryCount} categorias (${generated.categories.join(" + ")})` : "com 1 categoria"} em ${generated.events.length + 1} capítulos e ${generated.deathCount} mortes possíveis. Ela foi preparada em modo exclusivo e continuará usando a proteção que impede mortos de voltar e preserva um vencedor.`
         );
       } catch (error) {
         try { await conn.rollback(); } catch {}
@@ -2764,7 +2857,7 @@ body.hg-running .event-person .event-name,
 ${admin ? `<div class="two" style="margin:16px 0"><input id="manualName" placeholder="Adicionar participante manual"/><input id="manualDistrict" placeholder="Distrito" type="number" min="1" max="12"/><button style="grid-column:1/-1" onclick="addPlayer()">Adicionar participante</button></div>` : ``}
 <div id="participantsBox" class="lobby-only admin-participants-visible"><h2>Participantes da partida</h2><div class="players" id="players"></div></div></section><aside class="card events-card"><h2 class="events-title">Eventos</h2>${admin ? `<div class="auto-time-bar"><div class="auto-time-field"><label for="autoInterval">Tempo entre os eventos automáticos</label><div class="auto-time-input"><input id="autoInterval" type="number" min="1" max="60" step="1" value="9" aria-label="Tempo entre eventos automáticos"><span>segundo(s)</span></div></div><button onclick="saveAutoInterval()">Salvar tempo</button><div id="autoIntervalStatus" class="small auto-time-status">Ao clicar em Iniciar, os eventos começam a rodar sozinhos. A página não acompanha nem rola até o evento novo.</div></div>` : ``}<div class="logs" id="logs"></div><div id="winnerPrizeBox" class="winner-prize ${admin ? `` : `public-winner-prize`} hidden"></div></aside></div>
 ${admin ? `<section id="winnerPrizeAdminCard" class="card" style="margin-top:18px;border-color:#7e22ce;box-shadow:0 18px 60px #581c8730"><div class="phase">NOVA CONFIGURAÇÃO</div><h2 style="margin-top:6px">🏆 Prêmio do vencedor</h2><div class="small">Envie suas imagens de prêmio. Quando a partida terminar, o jogo escolhe uma delas aleatoriamente e mostra abaixo do vencedor, no final dos eventos da página pública.</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px"><label class="switch-row"><input id="winnerPrizeEnabled" type="checkbox" onchange="saveWinnerPrizeSettings(true)"><span><b>Ativar prêmio do vencedor</b><br><span class="small">Desative se não quiser usar imagens de prêmio nesta arena.</span></span></label><div class="small" style="display:flex;align-items:center;justify-content:center;border:1px solid var(--b);border-radius:14px;padding:10px;background:#0d0d16">Use <b style="margin:0 4px">{vencedor}</b> para o nome do vencedor e <b style="margin:0 4px">{premio}</b> para o nome do prêmio.</div></div><textarea id="winnerPrizeText" placeholder="🏆 {vencedor}, você ganhou! O seu prêmio é: {premio}" style="margin-top:10px"></textarea><div class="wide-actions"><button onclick="saveWinnerPrizeSettings(false)">Salvar texto e ativação</button></div><div id="winnerPrizeSaveStatus" class="prize-save-status">Configuração salva no canal e mantida nas próximas partidas.</div><hr style="border-color:var(--b);margin:24px 0"><h3>Adicionar novo prêmio</h3><div class="trophy-admin-grid"><input id="trophyTitle" placeholder="Nome do prêmio, ex: Nave alienígena dourada"><div><input id="trophyImageFile" type="file" accept="image/png,image/jpeg,image/webp,image/gif" onchange="readTrophyImage(this,'trophyImageData','trophyImagePreview')"><input id="trophyImageData" type="hidden"></div><button onclick="addTrophy()">Adicionar prêmio</button></div><div id="trophyImagePreview" class="trophy-preview" style="margin-top:10px">Prévia da imagem</div><hr style="border-color:var(--b);margin:24px 0"><div class="top"><div><h2>Prêmios cadastrados</h2><div class="small">Você pode deixar vários ativos; o jogo sorteia um aleatoriamente quando houver vencedor.</div></div><button class="secondary" onclick="loadTrophies()">Recarregar prêmios</button></div><div id="trophiesEditor" style="display:flex;flex-direction:column;gap:12px;margin-top:14px"></div></section>` : ``}
-${admin ? `<section class="card story-card" style="margin-top:18px"><h2>Modo História</h2><div class="automatic-story-generator"><div class="phase">GERADOR AUTOMÁTICO</div><h3>Criar história somente pela categoria</h3><div class="small">Digite uma categoria como Vampiro, Terror, Apocalipse ou qualquer outro tema. O sistema cria a história completa, incluindo mortes, até chegar ao vencedor.</div><div class="automatic-story-form"><div><input id="storyCategory" list="storyCategorySuggestions" placeholder="Ex.: vampiro" maxlength="60" autocomplete="off"><datalist id="storyCategorySuggestions"><option value="Vampiro"></option><option value="Terror"></option><option value="Apocalipse"></option><option value="Zumbi"></option></datalist></div><button id="generateStoryButton" onclick="generateStory()">Gerar história completa</button></div><div id="storyGeneratorStatus" class="small automatic-story-status">A quantidade de mortes é calculada pelos participantes vivos da partida. Mortos não voltam e o último sobrevivente continua sendo o vencedor.</div></div><div class="scenario-help"><b>Criação manual:</b> continue usando os campos abaixo quando quiser escrever a introdução e os acontecimentos por conta própria.</div><div class="small">Na seleção de pessoas, escolha <b>Todos</b> para colocar todos os participantes vivos na mesma cena. No texto, use <b>{p}</b> ou <b>{todos}</b> para mostrar todos os nomes.</div>
+${admin ? `<section class="card story-card" style="margin-top:18px"><h2>Modo História</h2><div class="automatic-story-generator"><div class="phase">GERADOR AUTOMÁTICO</div><h3>Criar uma história misturando várias categorias</h3><div class="small">Digite duas ou mais categorias separadas por <b>+</b> ou vírgula. Exemplo: <b>Vampiro + Terror + Apocalipse</b>. Todas entram na mesma história e se alternam nos capítulos e nas mortes.</div><div class="automatic-story-form"><div><input id="storyCategory" list="storyCategorySuggestions" placeholder="Ex.: vampiro + terror + apocalipse" maxlength="180" autocomplete="off"><datalist id="storyCategorySuggestions"><option value="Vampiro + Terror"></option><option value="Vampiro + Terror + Apocalipse"></option><option value="Terror + Zumbi"></option><option value="Apocalipse + Zumbi"></option></datalist></div><button id="generateStoryButton" onclick="generateStory()">Gerar história misturada</button></div><div id="storyGeneratorStatus" class="small automatic-story-status">As categorias são combinadas na mesma sequência. A quantidade de mortes continua sendo calculada pelos participantes vivos; mortos não voltam e o último sobrevivente permanece vencedor.</div></div><div class="scenario-help"><b>Criação manual:</b> continue usando os campos abaixo quando quiser escrever a introdução e os acontecimentos por conta própria.</div><div class="small">Na seleção de pessoas, escolha <b>Todos</b> para colocar todos os participantes vivos na mesma cena. No texto, use <b>{p}</b> ou <b>{todos}</b> para mostrar todos os nomes.</div>
 <input id="scName" style="margin-top:12px" placeholder="Nome da história: Invasão alienígena"/>
 <div class="scenario-create-grid"><select id="scPhase"><option value="bloodbath">Cornucópia</option><option value="day">Dia</option><option value="night">Noite</option><option value="feast">Banquete</option><option value="arena" selected>Evento da arena</option></select><select id="scType"><option value="neutral">Neutro</option><option value="death">Morte</option><option value="item">Item</option><option value="alliance">Aliança</option><option value="adult">Adulto</option></select><input id="scPlayers" class="player-count-input" type="text" value="Todos" placeholder="Número ou Todos" title="Digite qualquer número inteiro ou Todos" autocomplete="off"/><input id="scKills" placeholder="Mortes: p2"/><select id="scAdult"><option value="0">Normal</option><option value="1">+18</option></select></div>
 <textarea id="scText" placeholder="Um ET invade a arena diante de {p}."></textarea><span class="small player-count-note">Digite qualquer quantidade, como 8, 20 ou 100. Para usar todos os vivos, escreva Todos. Eventos para Todos não usam o campo Mortes.</span>
@@ -2858,7 +2951,7 @@ const openScenarios=new Set();
 function phaseOptions(value,allowAny=false){const items=[];if(allowAny)items.push(["any","Qualquer fase"]);items.push(["bloodbath","Cornucópia"],["day","Dia"],["night","Noite"],["feast","Banquete"],["arena","Evento da arena"]);return items.map(x=>'<option value="'+x[0]+'" '+(value===x[0]?"selected":"")+'>'+x[1]+'</option>').join("")}
 function typeOptions(value){return [["neutral","Neutro"],["death","Morte"],["item","Item"],["alliance","Aliança"],["adult","Adulto"]].map(x=>'<option value="'+x[0]+'" '+(value===x[0]?"selected":"")+'>'+x[1]+'</option>').join("")}
 function toggleScenario(id){const body=document.getElementById("scenario_body_"+id),arrow=document.getElementById("scenario_arrow_"+id);if(!body)return;const opening=body.classList.contains("collapsed");body.classList.toggle("collapsed",!opening);arrow.textContent=opening?"▼":"▶";if(opening)openScenarios.add(id);else openScenarios.delete(id)}
-async function generateStory(){const input=document.getElementById("storyCategory"),button=document.getElementById("generateStoryButton"),status=document.getElementById("storyGeneratorStatus");const category=String(input?.value||"").trim();if(!category){if(status)status.textContent="Digite uma categoria, por exemplo: Vampiro, Terror ou Apocalipse.";input?.focus();return}if(button){button.disabled=true;button.textContent="Criando história..."}if(status)status.textContent="Criando introdução, acontecimentos e mortes para a categoria “"+category+"”...";try{const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"generate_story",category})});if(status)status.textContent=String(t);if(String(t).startsWith("✅")){clearTimelinePlayback();timelineInitialized=false;await loadScenarios();await load()}}catch(e){if(status)status.textContent="Erro ao criar a história automática."}finally{if(button){button.disabled=false;button.textContent="Gerar história completa"}}}
+async function generateStory(){const input=document.getElementById("storyCategory"),button=document.getElementById("generateStoryButton"),status=document.getElementById("storyGeneratorStatus");const category=String(input?.value||"").trim();if(!category){if(status)status.textContent="Digite as categorias, por exemplo: Vampiro + Terror + Apocalipse.";input?.focus();return}if(button){button.disabled=true;button.textContent="Misturando categorias..."}if(status)status.textContent="Criando uma única história com “"+category+"”, incluindo acontecimentos e mortes...";try{const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"generate_story",category})});if(status)status.textContent=String(t);if(String(t).startsWith("✅")){clearTimelinePlayback();timelineInitialized=false;await loadScenarios();await load()}}catch(e){if(status)status.textContent="Erro ao criar a história automática."}finally{if(button){button.disabled=false;button.textContent="Gerar história misturada"}}}
 async function addScenario(){const g=id=>document.getElementById(id);const body={action:"add_scenario",name:g("scName").value,phase:g("scPhase").value,type:g("scType").value,players:g("scPlayers").value,kills:g("scKills").value,adult:g("scAdult").value,text:g("scText").value,mix_with_normal:g("scMix").checked?"1":"0",active:g("scActive").checked?"1":"0"};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);if(String(t).startsWith("✅")){g("scName").value="";g("scText").value=""}await loadScenarios();load()}
 function scenarioChildRow(c,sid){return '<div class="child-card"><div class="phase">EVENTO DA HISTÓRIA ID '+c.id+' • '+esc(phaseLabels[c.phase]||c.phase)+' • '+esc(typeLabel(c.type))+' • '+esc(playerLabel(c.players))+' • '+(c.active?"Ativo":"Desativado")+'</div><div class="child-edit-grid"><select id="sce_phase_'+c.id+'">'+phaseOptions(c.phase,true)+'</select><select id="sce_type_'+c.id+'">'+typeOptions(c.type)+'</select>'+playerInput("sce_players_"+c.id,c.players)+'<input id="sce_kills_'+c.id+'" placeholder="Mortes: p2" value="'+esc(c.kills||"")+'"><select id="sce_adult_'+c.id+'"><option value="0" '+(!c.adult?"selected":"")+'>Normal</option><option value="1" '+(c.adult?"selected":"")+'>+18</option></select></div><textarea id="sce_text_'+c.id+'">'+esc(c.text)+'</textarea><div class="wide-actions"><label class="switch-row"><input id="sce_active_'+c.id+'" type="checkbox" '+(c.active?"checked":"")+'><span>Evento decorrente ativo</span></label><button onclick="saveScenarioEvent('+c.id+','+sid+')">Salvar evento interno</button><button class="danger" onclick="deleteScenarioEvent('+c.id+','+sid+')">Excluir</button></div></div>'}
 async function saveScenarioOptions(id){const mix=document.getElementById("sc_mix_"+id),active=document.getElementById("sc_active_"+id),status=document.getElementById("sc_options_status_"+id);if(!mix||!active)return;if(status)status.textContent="Salvando opções...";mix.disabled=true;active.disabled=true;try{const exclusive=!mix.checked&&active.checked;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"update_scenario_options",id,mix_with_normal:mix.checked?"1":"0",active:active.checked?"1":"0"})});if(exclusive){clearTimelinePlayback();timelineInitialized=false}if(status)status.textContent=String(t);openScenarios.add(Number(id));await load()}catch(e){if(status)status.textContent="Erro ao salvar as opções."}finally{mix.disabled=false;active.disabled=false}}
