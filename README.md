@@ -1,4 +1,4 @@
-# Hunger Games da Live — versão 8.0.0
+# Hunger Games da Live — versão 9.0.0
 
 Sistema com modo história, eventos personalizados, execução automática e prêmio aleatório para o vencedor.
 
@@ -17,11 +17,13 @@ Categorias diferentes das sugestões também funcionam por meio do gerador gené
 
 As mortes continuam usando a lógica original do jogo: jogadores mortos não voltam, uma morte só é confirmada uma vez e o último sobrevivente nunca é eliminado.
 
-## Fotos nos eventos
+## Fotos reais da Twitch
 
-Cada evento agora salva os IDs exatos dos participantes usados na cena. A página pública usa esses IDs para mostrar as fotos corretas, inclusive nas histórias criadas automaticamente.
+As fotos agora são carregadas por uma rota do próprio servidor (`/hg/avatar/NICK`). Isso corrige participantes que tinham somente o nick salvo e apareciam com uma letra no lugar da imagem.
 
-Ao abrir a página, o sistema também tenta preencher novamente avatares que ficaram vazios no banco. Se uma imagem externa falhar, aparece a inicial da pessoa no lugar, sem quebrar o evento.
+A busca tenta primeiro a API oficial da Twitch quando `TWITCH_CLIENT_ID` e `TWITCH_CLIENT_SECRET` estiverem configurados. Sem essas variáveis, o sistema usa fontes públicas alternativas automaticamente. O painel também ganhou o botão **Atualizar fotos da Twitch**, que força uma nova busca para todos os participantes da partida atual.
+
+Cada evento continua salvando os IDs exatos dos participantes usados na cena. Se todas as fontes estiverem temporariamente indisponíveis ou o nick não existir na Twitch, a inicial aparece sem quebrar o jogo.
 
 ## Automático sem voz
 

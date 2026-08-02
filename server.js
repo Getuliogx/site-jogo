@@ -6,7 +6,7 @@ import tls from "node:tls";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = "8.0.0";
+const APP_VERSION = "9.0.0";
 const DEFAULT_WINNER_PRIZE_TEXT = "🏆 {vencedor}, você ganhou! O seu prêmio é: {premio}";
 
 app.use(cors());
@@ -30,6 +30,7 @@ const autoRunTokens = new Map();
 const chatTrackers = new Map();
 const channelQueues = new Map();
 const avatarRefreshTimes = new Map();
+const avatarLookupCache = new Map();
 
 const DEFAULT_IGNORED_CHATTERS = new Set([
   "streamelements", "nightbot", "moobot", "streamlabs", "soundalerts",
@@ -916,10 +917,30 @@ async function seedHeavyAdultEvents() {
   return `✅ Pacote +18 pesado adicionado: ${HEAVY_ADULT_EVENTS.length} eventos.`;
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 7000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function validHttpUrl(value) {
+  try {
+    const url = new URL(String(value || "").trim());
+    return (url.protocol === "https:" || url.protocol === "http:") ? url.href : "";
+  } catch {
+    return "";
+  }
+}
+
 async function getTwitchAppToken() {
   if (twitchTokenCache.token && twitchTokenCache.expiresAt > Date.now() + 60000) return twitchTokenCache.token;
-  const clientId = process.env.TWITCH_CLIENT_ID;
-  const clientSecret = process.env.TWITCH_CLIENT_SECRET;
+  const clientId = String(process.env.TWITCH_CLIENT_ID || "").trim();
+  const clientSecret = String(process.env.TWITCH_CLIENT_SECRET || "").trim();
   if (!clientId || !clientSecret) return null;
 
   const body = new URLSearchParams({
@@ -928,79 +949,163 @@ async function getTwitchAppToken() {
     grant_type: "client_credentials"
   });
 
-  const r = await fetch("https://id.twitch.tv/oauth2/token", { method: "POST", body });
-  if (!r.ok) return null;
-  const j = await r.json();
-  twitchTokenCache = {
-    token: j.access_token,
-    expiresAt: Date.now() + Math.max(60, Number(j.expires_in || 3600) - 60) * 1000
-  };
-  return twitchTokenCache.token;
+  try {
+    const r = await fetchWithTimeout("https://id.twitch.tv/oauth2/token", { method: "POST", body }, 8000);
+    if (!r.ok) return null;
+    const j = await r.json();
+    const token = String(j?.access_token || "").trim();
+    if (!token) return null;
+    twitchTokenCache = {
+      token,
+      expiresAt: Date.now() + Math.max(60, Number(j.expires_in || 3600) - 60) * 1000
+    };
+    return twitchTokenCache.token;
+  } catch (error) {
+    console.error("Token da Twitch indisponível:", error.message);
+    return null;
+  }
 }
 
-async function getTwitchAvatar(username) {
+async function getAvatarFromHelix(username) {
+  const login = nick(username);
+  const clientId = String(process.env.TWITCH_CLIENT_ID || "").trim();
+  const token = await getTwitchAppToken();
+  if (!clientId || !token || !login) return "";
   try {
-    const clientId = process.env.TWITCH_CLIENT_ID;
-    const token = await getTwitchAppToken();
-    if (!clientId || !token || !username) return "";
-    const r = await fetch(`https://api.twitch.tv/helix/users?login=${encodeURIComponent(username)}`, {
+    const r = await fetchWithTimeout(`https://api.twitch.tv/helix/users?login=${encodeURIComponent(login)}`, {
       headers: { "Client-ID": clientId, Authorization: `Bearer ${token}` }
-    });
+    }, 8000);
     if (!r.ok) return "";
     const j = await r.json();
-    return j?.data?.[0]?.profile_image_url || "";
+    return validHttpUrl(j?.data?.[0]?.profile_image_url);
   } catch {
     return "";
   }
 }
 
+async function getAvatarFromIvr(username) {
+  const login = nick(username);
+  if (!login) return "";
+  const base = String(process.env.TWITCH_IVR_API_BASE || "https://api.ivr.fi/v2/twitch/user").trim();
+  try {
+    const separator = base.includes("?") ? "&" : "?";
+    const r = await fetchWithTimeout(`${base}${separator}login=${encodeURIComponent(login)}`, {
+      headers: { "User-Agent": "HG-Live/9.0" }
+    }, 7000);
+    if (!r.ok) return "";
+    const j = await r.json();
+    const item = Array.isArray(j) ? j[0] : (Array.isArray(j?.data) ? j.data[0] : j);
+    return validHttpUrl(item?.logo || item?.profileImageUrl || item?.profile_image_url || item?.avatar);
+  } catch {
+    return "";
+  }
+}
+
+async function getAvatarFromDecapi(username) {
+  const login = nick(username);
+  if (!login) return "";
+  const base = String(process.env.TWITCH_DECAPI_BASE || "https://decapi.me/twitch/avatar").replace(/\/+$/, "");
+  try {
+    const r = await fetchWithTimeout(`${base}/${encodeURIComponent(login)}`, {
+      headers: { "User-Agent": "HG-Live/9.0" }
+    }, 7000);
+    if (!r.ok) return "";
+    return validHttpUrl(await r.text());
+  } catch {
+    return "";
+  }
+}
+
+async function resolveTwitchAvatar(username, force = false) {
+  const login = nick(username);
+  if (!login) return "";
+  const cached = avatarLookupCache.get(login);
+  if (!force && cached && cached.expiresAt > Date.now()) return cached.url;
+
+  let url = await getAvatarFromHelix(login);
+  if (!url) url = await getAvatarFromIvr(login);
+  if (!url) url = await getAvatarFromDecapi(login);
+
+  avatarLookupCache.set(login, {
+    url,
+    expiresAt: Date.now() + (url ? 12 * 60 * 60 * 1000 : 2 * 60 * 1000)
+  });
+  return url;
+}
+
+async function getTwitchAvatar(username) {
+  return resolveTwitchAvatar(username, false);
+}
+
 async function getTwitchProfiles(usernames) {
   const logins = [...new Set((usernames || []).map(nick).filter(Boolean))];
   const result = new Map();
-  try {
-    const clientId = process.env.TWITCH_CLIENT_ID;
-    const token = await getTwitchAppToken();
-    if (!clientId || !token || !logins.length) return result;
-    for (let i = 0; i < logins.length; i += 100) {
-      const params = new URLSearchParams();
-      for (const login of logins.slice(i, i + 100)) params.append("login", login);
-      const r = await fetch(`https://api.twitch.tv/helix/users?${params}`, {
-        headers: { "Client-ID": clientId, Authorization: `Bearer ${token}` }
-      });
-      if (!r.ok) continue;
-      const j = await r.json();
-      for (const u of j?.data || []) {
-        result.set(nick(u.login), {
-          username: nick(u.login),
-          display_name: u.display_name || u.login,
-          avatar_url: u.profile_image_url || ""
-        });
+  if (!logins.length) return result;
+
+  const clientId = String(process.env.TWITCH_CLIENT_ID || "").trim();
+  const token = await getTwitchAppToken();
+  if (clientId && token) {
+    try {
+      for (let i = 0; i < logins.length; i += 100) {
+        const params = new URLSearchParams();
+        for (const login of logins.slice(i, i + 100)) params.append("login", login);
+        const r = await fetchWithTimeout(`https://api.twitch.tv/helix/users?${params}`, {
+          headers: { "Client-ID": clientId, Authorization: `Bearer ${token}` }
+        }, 9000);
+        if (!r.ok) continue;
+        const j = await r.json();
+        for (const u of j?.data || []) {
+          const username = nick(u.login);
+          const avatarUrl = validHttpUrl(u.profile_image_url);
+          result.set(username, {
+            username,
+            display_name: u.display_name || u.login,
+            avatar_url: avatarUrl
+          });
+          if (avatarUrl) avatarLookupCache.set(username, { url: avatarUrl, expiresAt: Date.now() + 12 * 60 * 60 * 1000 });
+        }
       }
+    } catch (e) {
+      console.error("Busca oficial de perfis da Twitch falhou:", e.message);
     }
-  } catch (e) {
-    console.error("Erro ao buscar perfis da Twitch:", e.message);
+  }
+
+  const missing = logins.filter(login => !result.get(login)?.avatar_url);
+  for (let i = 0; i < missing.length; i += 6) {
+    const batch = missing.slice(i, i + 6);
+    const rows = await Promise.all(batch.map(async login => ({ login, avatar: await resolveTwitchAvatar(login, false) })));
+    for (const row of rows) {
+      const previous = result.get(row.login);
+      result.set(row.login, {
+        username: row.login,
+        display_name: previous?.display_name || row.login,
+        avatar_url: row.avatar || previous?.avatar_url || ""
+      });
+    }
   }
   return result;
 }
 
-async function refreshMissingPlayerAvatars(gameId) {
+async function refreshMissingPlayerAvatars(gameId, force = false) {
   const id = Number(gameId || 0);
   if (!id) return 0;
   const db = await getPool();
-  const [missing] = await db.query(
-    "SELECT id,username FROM hg_players WHERE game_id=? AND (avatar_url IS NULL OR avatar_url='')",
-    [id]
-  );
-  if (!missing.length) return 0;
-  const profiles = await getTwitchProfiles(missing.map(player => player.username));
+  const [players] = force
+    ? await db.query("SELECT id,username FROM hg_players WHERE game_id=?", [id])
+    : await db.query("SELECT id,username FROM hg_players WHERE game_id=? AND (avatar_url IS NULL OR avatar_url='')", [id]);
+  if (!players.length) return 0;
+
+  if (force) {
+    for (const player of players) avatarLookupCache.delete(nick(player.username));
+  }
+  const profiles = await getTwitchProfiles(players.map(player => player.username));
   let updated = 0;
-  for (const player of missing) {
+  for (const player of players) {
     const avatar = String(profiles.get(nick(player.username))?.avatar_url || "").trim();
     if (!avatar) continue;
-    const [result] = await db.query(
-      "UPDATE hg_players SET avatar_url=? WHERE id=? AND game_id=? AND (avatar_url IS NULL OR avatar_url='')",
-      [avatar, player.id, id]
-    );
+    const [result] = force
+      ? await db.query("UPDATE hg_players SET avatar_url=? WHERE id=? AND game_id=?", [avatar, player.id, id])
+      : await db.query("UPDATE hg_players SET avatar_url=? WHERE id=? AND game_id=? AND (avatar_url IS NULL OR avatar_url='')", [avatar, player.id, id]);
     updated += Number(result.affectedRows || 0);
   }
   return updated;
@@ -1013,10 +1118,25 @@ async function refreshMissingPlayerAvatarsThrottled(gameId, intervalMs = 300000)
   if (Date.now() - last < intervalMs) return 0;
   avatarRefreshTimes.set(id, Date.now());
   try {
-    return await refreshMissingPlayerAvatars(id);
+    return await refreshMissingPlayerAvatars(id, false);
   } catch (error) {
     console.error("Erro ao atualizar fotos dos participantes:", error.message);
     return 0;
+  }
+}
+
+async function avatarRoute(req, res) {
+  const login = nick(req.params.username || req.query.login || "");
+  if (!login) return res.status(404).end();
+  try {
+    const avatar = await resolveTwitchAvatar(login, false);
+    const fallbackBase = String(process.env.TWITCH_UNAVATAR_BASE || "https://unavatar.io/twitch").replace(/\/+$/, "");
+    const destination = avatar || `${fallbackBase}/${encodeURIComponent(login)}?fallback=false`;
+    res.set("Cache-Control", avatar ? "public, max-age=43200, stale-while-revalidate=86400" : "public, max-age=120");
+    return res.redirect(302, destination);
+  } catch (error) {
+    console.error(`Avatar da Twitch (${login}):`, error.message);
+    return res.status(404).end();
   }
 }
 
@@ -2108,6 +2228,13 @@ async function adminAction(req, res) {
     if (action === "adult_off") return send(res, await adult(ch, false));
     if (action === "normal_events_on") return send(res, await setNormalEvents(ch, true));
     if (action === "normal_events_off") return send(res, await setNormalEvents(ch, false));
+    if (action === "refresh_avatars") {
+      await ensureTables();
+      const game = await currentGame(ch, true);
+      avatarRefreshTimes.delete(Number(game.id));
+      const updated = await refreshMissingPlayerAvatars(game.id, true);
+      return send(res, `✅ Fotos da Twitch atualizadas. ${updated} participante(s) recebeu/atualizou a imagem.`);
+    }
     if (action === "set_auto_interval") {
       await ensureTables();
       const game = await currentGame(ch, true);
@@ -2633,7 +2760,7 @@ body.hg-running .event-person .event-name,
 .scenario-create-grid,.scenario-edit-grid,.child-edit-grid{display:grid;grid-template-columns:1.25fr 1fr .7fr 1.4fr .8fr;gap:8px;margin-top:12px}.scenario-card{border:1px solid var(--b);background:#10101a;border-radius:20px;overflow:hidden}.scenario-head{display:flex;align-items:center;gap:10px;padding:14px;cursor:pointer;background:#171726}.scenario-arrow{width:42px;min-width:42px;padding:9px;background:#303044}.scenario-title{flex:1}.scenario-body{padding:14px;border-top:1px solid var(--b)}.scenario-body.collapsed{display:none}.scenario-flags{display:flex;gap:8px;flex-wrap:wrap}.flag{font-size:11px;font-weight:950;border:1px solid var(--b);border-radius:999px;padding:5px 8px;color:#ddd6fe}.switch-row{display:flex;align-items:center;gap:10px;border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:10px 12px}.switch-row input{width:20px;height:20px;accent-color:var(--p)}.child-list{display:flex;flex-direction:column;gap:10px;margin-top:12px}.child-card{border:1px solid var(--b);border-radius:16px;padding:12px;background:#0d0d16}.scenario-help{border-left:4px solid var(--p);padding:10px 12px;background:#1b1026;border-radius:10px;margin:10px 0}.wide-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.auto-time-bar{display:grid;grid-template-columns:minmax(230px,1fr) auto;gap:10px;margin:0 0 14px;align-items:end;border:1px solid var(--b);background:#0d0d16;border-radius:16px;padding:12px}.auto-time-field label{display:block;font-size:12px;font-weight:950;color:#ddd6fe;margin-bottom:7px}.auto-time-input{display:grid;grid-template-columns:minmax(90px,140px) auto;gap:8px;align-items:center}.auto-time-input input{font-weight:950}.auto-time-status{grid-column:1/-1;color:#c4b5fd}.story-card{border-color:#6b21a8;box-shadow:0 18px 60px #581c8730}.player-count-note{display:block;margin-top:6px;color:#c4b5fd}.player-count-input{font-weight:900}.log.event-sync-enter{animation:eventSyncEnter .22s ease-out}@keyframes eventSyncEnter{from{opacity:.15;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}.winner-prize{margin-top:16px;padding:16px;border:1px solid #6b21a8;background:linear-gradient(180deg,#241032,#120a1b);border-radius:22px;text-align:center}.winner-prize img{max-width:100%;max-height:360px;object-fit:contain;border-radius:18px;border:1px solid var(--b);background:#09090f;padding:8px}.winner-prize-title{font-size:20px;font-weight:950;margin:10px 0 6px}.winner-prize-text{font-size:18px;font-weight:900;line-height:1.4;color:#f5d0fe;margin-bottom:12px}.winner-prize-sub{font-size:13px;color:#c4b5fd}.trophy-admin-grid{display:grid;grid-template-columns:1.1fr .9fr auto;gap:8px;margin-top:12px;align-items:start}.trophy-preview{border:1px dashed var(--b);background:#0d0d16;border-radius:18px;min-height:150px;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:10px;color:var(--muted)}.trophy-preview img{max-width:100%;max-height:210px;object-fit:contain;border-radius:14px}.trophy-row{display:grid;grid-template-columns:170px 1fr;gap:14px;padding:12px;border:1px solid var(--b);background:#10101a;border-radius:18px}.trophy-row .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.trophy-row .preview{display:flex;align-items:center;justify-content:center;min-height:120px;border:1px solid var(--b);border-radius:16px;background:#0d0d16;overflow:hidden;padding:8px}.trophy-row .preview img{max-width:100%;max-height:150px;object-fit:contain;border-radius:12px}.winner-prize.hidden{display:none!important}.public-winner-prize:not(.hidden){position:static;width:100%;max-width:820px;margin:18px auto 0;box-shadow:0 18px 45px #0008;border:2px solid #a855f7;padding:20px}.public-winner-prize .winner-prize-text:first-child{font-size:clamp(22px,4vw,34px);color:#fff}.public-winner-prize img{max-height:420px}.winner-player-photo{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;margin:8px auto 16px}.winner-player-photo img,.winner-player-photo .fake{width:132px;height:132px;border-radius:28px;object-fit:cover;border:3px solid #f0abfc;background:#18111f;box-shadow:0 12px 32px #0009;display:flex;align-items:center;justify-content:center;font-size:44px;font-weight:950}.winner-player-photo-label{font-size:13px;font-weight:950;color:#f5d0fe;text-transform:uppercase;letter-spacing:.12em}.admin-participants-visible{display:block!important}.prize-save-status{margin-top:8px;font-weight:900;color:#c4b5fd}
 @media(max-width:900px){.automatic-story-form{grid-template-columns:1fr}.trophy-admin-grid,.trophy-row{grid-template-columns:1fr}.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{grid-template-columns:1fr 1fr}.scenario-create-grid textarea,.scenario-edit-grid textarea,.child-edit-grid textarea,.span-all{grid-column:1/-1}.auto-time-bar{grid-template-columns:1fr}.auto-time-status{grid-column:1}.admin-event-grid{grid-template-columns:1fr 1fr!important}}
 </style></head><body><div class="wrap"><div class="top"><div><h1>Hunger Games da Live</h1><div class="sub">Participantes do chat, distritos, eventos, mortes e vencedor final.</div></div><div class="pill" id="statusPill">Carregando...</div></div>
-<div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div>${admin ? `<div id="normalEventsStatus" class="small" style="margin-top:7px;font-weight:950"></div>` : ``}</div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar automático</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar automático</button><button class="danger" onclick="act('reset')">Resetar</button><button id="normalEventsToggle" class="danger" onclick="toggleNormalEvents()">Desativar eventos antigos</button><button class="secondary" onclick="act('adult_on')">Ligar +18</button><button class="secondary" onclick="act('adult_off')">Desligar +18</button><button class="secondary" onclick="act('add_all_chat')">Adicionar todos do chat</button><button class="secondary" onclick="openWinnerPrizePanel()">🏆 Prêmios</button><button class="secondary" onclick="seedAdultHeavy()">Adicionar +18 pesado</button></div>` : ``}</div>
+<div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div>${admin ? `<div id="normalEventsStatus" class="small" style="margin-top:7px;font-weight:950"></div>` : ``}</div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar automático</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar automático</button><button class="danger" onclick="act('reset')">Resetar</button><button id="normalEventsToggle" class="danger" onclick="toggleNormalEvents()">Desativar eventos antigos</button><button class="secondary" onclick="act('adult_on')">Ligar +18</button><button class="secondary" onclick="act('adult_off')">Desligar +18</button><button class="secondary" onclick="act('add_all_chat')">Adicionar todos do chat</button><button class="secondary" onclick="refreshAvatars()">Atualizar fotos da Twitch</button><button class="secondary" onclick="openWinnerPrizePanel()">🏆 Prêmios</button><button class="secondary" onclick="seedAdultHeavy()">Adicionar +18 pesado</button></div>` : ``}</div>
 ${admin ? `<div class="two" style="margin:16px 0"><input id="manualName" placeholder="Adicionar participante manual"/><input id="manualDistrict" placeholder="Distrito" type="number" min="1" max="12"/><button style="grid-column:1/-1" onclick="addPlayer()">Adicionar participante</button></div>` : ``}
 <div id="participantsBox" class="lobby-only admin-participants-visible"><h2>Participantes da partida</h2><div class="players" id="players"></div></div></section><aside class="card events-card"><h2 class="events-title">Eventos</h2>${admin ? `<div class="auto-time-bar"><div class="auto-time-field"><label for="autoInterval">Tempo entre os eventos automáticos</label><div class="auto-time-input"><input id="autoInterval" type="number" min="1" max="60" step="1" value="9" aria-label="Tempo entre eventos automáticos"><span>segundo(s)</span></div></div><button onclick="saveAutoInterval()">Salvar tempo</button><div id="autoIntervalStatus" class="small auto-time-status">Ao clicar em Iniciar, os eventos começam a rodar sozinhos. A página não acompanha nem rola até o evento novo.</div></div>` : ``}<div class="logs" id="logs"></div><div id="winnerPrizeBox" class="winner-prize ${admin ? `` : `public-winner-prize`} hidden"></div></aside></div>
 ${admin ? `<section id="winnerPrizeAdminCard" class="card" style="margin-top:18px;border-color:#7e22ce;box-shadow:0 18px 60px #581c8730"><div class="phase">NOVA CONFIGURAÇÃO</div><h2 style="margin-top:6px">🏆 Prêmio do vencedor</h2><div class="small">Envie suas imagens de prêmio. Quando a partida terminar, o jogo escolhe uma delas aleatoriamente e mostra abaixo do vencedor, no final dos eventos da página pública.</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px"><label class="switch-row"><input id="winnerPrizeEnabled" type="checkbox" onchange="saveWinnerPrizeSettings(true)"><span><b>Ativar prêmio do vencedor</b><br><span class="small">Desative se não quiser usar imagens de prêmio nesta arena.</span></span></label><div class="small" style="display:flex;align-items:center;justify-content:center;border:1px solid var(--b);border-radius:14px;padding:10px;background:#0d0d16">Use <b style="margin:0 4px">{vencedor}</b> para o nome do vencedor e <b style="margin:0 4px">{premio}</b> para o nome do prêmio.</div></div><textarea id="winnerPrizeText" placeholder="🏆 {vencedor}, você ganhou! O seu prêmio é: {premio}" style="margin-top:10px"></textarea><div class="wide-actions"><button onclick="saveWinnerPrizeSettings(false)">Salvar texto e ativação</button></div><div id="winnerPrizeSaveStatus" class="prize-save-status">Configuração salva no canal e mantida nas próximas partidas.</div><hr style="border-color:var(--b);margin:24px 0"><h3>Adicionar novo prêmio</h3><div class="trophy-admin-grid"><input id="trophyTitle" placeholder="Nome do prêmio, ex: Nave alienígena dourada"><div><input id="trophyImageFile" type="file" accept="image/png,image/jpeg,image/webp,image/gif" onchange="readTrophyImage(this,'trophyImageData','trophyImagePreview')"><input id="trophyImageData" type="hidden"></div><button onclick="addTrophy()">Adicionar prêmio</button></div><div id="trophyImagePreview" class="trophy-preview" style="margin-top:10px">Prévia da imagem</div><hr style="border-color:var(--b);margin:24px 0"><div class="top"><div><h2>Prêmios cadastrados</h2><div class="small">Você pode deixar vários ativos; o jogo sorteia um aleatoriamente quando houver vencedor.</div></div><button class="secondary" onclick="loadTrophies()">Recarregar prêmios</button></div><div id="trophiesEditor" style="display:flex;flex-direction:column;gap:12px;margin-top:14px"></div></section>` : ``}
@@ -2656,7 +2783,7 @@ function playerInput(id,value){const n=Number(value);const shown=n===0?"Todos":S
 function playerLabel(value){const n=Number(value);if(n===0)return "Todos";const amount=Number.isFinite(n)&&n>=1?Math.round(n):1;return amount===1?"1 pessoa":String(amount)+" pessoas"}
 function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}[m]))}
 async function api(path,opt={}){const sep=path.includes("?")?"&":"?";const url=path+sep+"channel="+encodeURIComponent(channel)+(token?"&token="+encodeURIComponent(token):"");const r=await fetch(url,{cache:"no-store",...opt}),ct=r.headers.get("content-type")||"";return ct.includes("json")?r.json():r.text()}
-function avatarHtml(p,cls="avatar"){const initial=esc(((p&&p.display_name)||"?").slice(0,1).toUpperCase());const name=esc((p&&p.display_name)||"Participante");return p&&p.avatar_url?'<span class="avatar-wrap"><img class="'+cls+'" src="'+esc(p.avatar_url)+'" alt="Foto de '+name+'" loading="eager" referrerpolicy="no-referrer" onerror="this.hidden=true;this.nextElementSibling.hidden=false"><span class="'+cls+' fake" hidden>'+initial+'</span></span>':'<span class="avatar-wrap"><span class="'+cls+' fake">'+initial+'</span></span>'}
+function avatarHtml(p,cls="avatar"){const initial=esc(((p&&p.display_name)||"?").slice(0,1).toUpperCase());const name=esc((p&&p.display_name)||"Participante");const login=String((p&&p.username)||"").trim();const stored=String((p&&p.avatar_url)||"").trim();const src=login?("/hg/avatar/"+encodeURIComponent(login)+"?v=9"):stored;return src?'<span class="avatar-wrap"><img class="'+cls+'" src="'+esc(src)+'" alt="Foto de '+name+'" loading="eager" referrerpolicy="no-referrer" onerror="this.hidden=true;this.nextElementSibling.hidden=false"><span class="'+cls+' fake" hidden>'+initial+'</span></span>':'<span class="avatar-wrap"><span class="'+cls+' fake">'+initial+'</span></span>'}
 function mentionedPlayers(text,players){const found=[];const lower=String(text||"").toLowerCase();players.forEach(p=>{const names=[p.display_name,p.username].map(v=>String(v||"").trim().toLowerCase()).filter(Boolean);if(names.some(nm=>lower.includes(nm))&&!found.some(x=>Number(x.id)===Number(p.id)))found.push(p)});return found}
 function logParticipants(log,players){const ids=String(log?.participant_ids||"").split(",").map(v=>Number(v.trim())).filter(id=>Number.isFinite(id)&&id>0);if(ids.length){const byId=new Map((players||[]).map(p=>[Number(p.id),p]));const exact=ids.map(id=>byId.get(id)).filter(Boolean);if(exact.length)return exact}return mentionedPlayers(log?.text,players||[])}
 const AUTO_INTERVAL_KEY="hgAutoIntervalV60";
@@ -2721,6 +2848,7 @@ async function toggleNormalEvents(){
 async function act(a){if(!token)return alert("Abra com ?token=SEU_TOKEN");if(actionBusy)return;actionBusy=true;try{const t=await api("/hg/admin?action="+encodeURIComponent(a));alert(t);await load()}finally{actionBusy=false}}
 async function seedAdultHeavy(){if(!confirm("Adicionar pacote de eventos +18 pesado ao banco?"))return;const t=await api("/hg/admin?action=seed_adult_heavy");alert(t);load();if(admin)loadEvents()}
 async function addPlayer(){const name=document.getElementById("manualName").value.trim(),d=document.getElementById("manualDistrict").value.trim();if(!name)return alert("Digite o nome do participante.");const t=await api("/hg/admin?action=add_player&name="+encodeURIComponent(name)+"&district="+encodeURIComponent(d));alert(t);document.getElementById("manualName").value="";await load()}
+async function refreshAvatars(){if(!admin)return;const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"refresh_avatars"})});alert(t);await load()}
 async function addEvent(){const body={action:"add_event",phase:evPhase.value,type:evType.value,players:evPlayers.value,kills:evKills.value,adult:evAdult.value,text:evText.value};const t=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});alert(t);evText.value="";load();if(admin)loadEvents()}
 function eventRow(e){return '<div class="log" style="max-width:none;margin:0"><div class="phase">ID '+e.id+' • '+esc(phaseLabels[e.phase]||e.phase)+' • '+esc(typeLabel(e.type))+' • '+esc(playerLabel(e.players))+' • '+(e.adult?"+18":"Normal")+' • '+(e.active?"Ativo":"Desativado")+'</div><div style="display:grid;grid-template-columns:120px 120px 80px 1fr 100px 100px;gap:8px;margin:8px 0"><select id="phase_'+e.id+'"><option value="bloodbath" '+(e.phase==="bloodbath"?"selected":"")+'>Cornucópia</option><option value="day" '+(e.phase==="day"?"selected":"")+'>Dia</option><option value="night" '+(e.phase==="night"?"selected":"")+'>Noite</option><option value="feast" '+(e.phase==="feast"?"selected":"")+'>Banquete</option><option value="arena" '+(e.phase==="arena"?"selected":"")+'>Evento da arena</option></select><select id="type_'+e.id+'"><option value="neutral" '+(e.type==="neutral"?"selected":"")+'>Neutro</option><option value="death" '+(e.type==="death"?"selected":"")+'>Morte</option><option value="item" '+(e.type==="item"?"selected":"")+'>Item</option><option value="alliance" '+(e.type==="alliance"?"selected":"")+'>Aliança</option><option value="adult" '+(e.type==="adult"?"selected":"")+'>Adulto</option></select>'+playerInput("players_"+e.id,e.players)+'<input id="kills_'+e.id+'" placeholder="Mortes" value="'+esc(e.kills||"")+'"><select id="adult_'+e.id+'"><option value="0" '+(!e.adult?"selected":"")+'>Normal</option><option value="1" '+(e.adult?"selected":"")+'>+18</option></select><select id="active_'+e.id+'"><option value="1" '+(e.active?"selected":"")+'>Ativo</option><option value="0" '+(!e.active?"selected":"")+'>Desativado</option></select></div><textarea id="text_'+e.id+'">'+esc(e.text)+'</textarea><div class="controls" style="margin-top:8px"><button onclick="saveEvent('+e.id+')">Salvar edição</button><button class="danger" onclick="deleteEvent('+e.id+')">Excluir</button></div></div>'}
 async function loadEvents(){if(!admin)return;const box=document.getElementById("eventsEditor");if(!box)return;box.innerHTML="<div class='small'>Carregando eventos...</div>";const evs=await api("/hg/events");if(!Array.isArray(evs)){box.innerHTML="<div class='small'>Erro ao carregar eventos.</div>";return}box.innerHTML=evs.map(eventRow).join("")||"<div class='small'>Sem eventos cadastrados.</div>"}
@@ -2755,6 +2883,7 @@ app.post("/hg", command);
 app.get("/hg/admin", adminAction);
 app.post("/hg/admin", adminAction);
 app.get("/hg/state", state);
+app.get("/hg/avatar/:username", avatarRoute);
 
 app.get("/hg/events", async (req, res) => {
   try {
