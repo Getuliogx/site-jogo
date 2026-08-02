@@ -1,4 +1,4 @@
-# Hunger Games da Live — versão 9.0.0
+# Hunger Games da Live — versão 10.0.0
 
 Sistema com modo história, eventos personalizados, execução automática e prêmio aleatório para o vencedor.
 
@@ -16,6 +16,10 @@ O sistema cria automaticamente:
 Categorias diferentes das sugestões também funcionam por meio do gerador genérico. A história criada fica em modo exclusivo, sem misturar os eventos antigos.
 
 As mortes continuam usando a lógica original do jogo: jogadores mortos não voltam, uma morte só é confirmada uma vez e o último sobrevivente nunca é eliminado.
+
+## Correção de imagens duplicadas
+
+A foto real e a inicial de reserva não aparecem mais ao mesmo tempo. A inicial fica totalmente oculta e só é exibida se a imagem da Twitch falhar. IDs repetidos em um evento também são eliminados antes da renderização, evitando que a mesma pessoa apareça duas vezes.
 
 ## Fotos reais da Twitch
 
