@@ -6,7 +6,7 @@ import tls from "node:tls";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const APP_VERSION = "5.9.7";
+const APP_VERSION = "6.0.0";
 const DEFAULT_WINNER_PRIZE_TEXT = "🏆 {vencedor}, você ganhou! O seu prêmio é: {premio}";
 
 app.use(cors());
@@ -26,11 +26,9 @@ app.use((req, res, next) => {
 });
 
 const autoTimers = new Map();
+const autoRunTokens = new Map();
 const chatTrackers = new Map();
 const channelQueues = new Map();
-const ttsCache = new Map();
-const playbackAcked = new Map();
-const playbackWaiters = new Map();
 
 const DEFAULT_IGNORED_CHATTERS = new Set([
   "streamelements", "nightbot", "moobot", "streamlabs", "soundalerts",
@@ -39,7 +37,7 @@ const DEFAULT_IGNORED_CHATTERS = new Set([
 
 function getAutoIntervalMs(game = null) {
   const ms = Number(game?.event_delay_ms ?? process.env.HG_AUTO_INTERVAL_MS ?? 9000);
-  return Math.max(4000, Math.min(60000, Number.isFinite(ms) ? ms : 9000));
+  return Math.max(1000, Math.min(60000, Number.isFinite(ms) ? ms : 9000));
 }
 
 function stopAuto(channel) {
@@ -50,6 +48,7 @@ function stopAuto(channel) {
     clearInterval(timer);
   }
   autoTimers.delete(key);
+  autoRunTokens.delete(key);
 }
 
 function isAutoRunning(channel) {
@@ -58,53 +57,6 @@ function isAutoRunning(channel) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function playbackKey(channel, gameId, logId) {
-  return `${nick(channel || "")}:${Number(gameId || 0)}:${Number(logId || 0)}`;
-}
-
-function acknowledgePlayback(channel, gameId, logId) {
-  const key = playbackKey(channel, gameId, logId);
-  playbackAcked.set(key, Date.now());
-  const waiters = playbackWaiters.get(key) || [];
-  playbackWaiters.delete(key);
-  for (const resolve of waiters) {
-    try { resolve(true); } catch {}
-  }
-  const cutoff = Date.now() - 10 * 60 * 1000;
-  for (const [storedKey, at] of playbackAcked) {
-    if (at < cutoff) playbackAcked.delete(storedKey);
-  }
-}
-
-function waitForPlaybackAck(channel, gameId, logId, timeoutMs = 25000) {
-  const key = playbackKey(channel, gameId, logId);
-  if (playbackAcked.has(key)) return Promise.resolve(true);
-  return new Promise(resolve => {
-    const list = playbackWaiters.get(key) || [];
-    let done = false;
-    const finish = value => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      const current = playbackWaiters.get(key) || [];
-      const next = current.filter(fn => fn !== finish);
-      if (next.length) playbackWaiters.set(key, next);
-      else playbackWaiters.delete(key);
-      resolve(value);
-    };
-    list.push(finish);
-    playbackWaiters.set(key, list);
-    const timer = setTimeout(() => finish(false), Math.max(5000, timeoutMs));
-  });
-}
-
-async function latestLogId(gameId) {
-  if (!gameId) return 0;
-  const db = await getPool();
-  const [rows] = await db.query("SELECT COALESCE(MAX(id),0) AS id FROM hg_logs WHERE game_id=?", [gameId]);
-  return Number(rows?.[0]?.id || 0);
 }
 
 function ignoredChatters() {
@@ -494,9 +446,9 @@ async function ensureTables() {
           day_number INT NOT NULL DEFAULT 1,
           adult_mode TINYINT(1) NOT NULL DEFAULT 0,
           normal_events_enabled TINYINT(1) NOT NULL DEFAULT 1,
-          narration_enabled TINYINT(1) NOT NULL DEFAULT 1,
-          narration_voice VARCHAR(160) NOT NULL DEFAULT 'google-online',
-          narration_rate DECIMAL(4,2) NOT NULL DEFAULT 1.15,
+          narration_enabled TINYINT(1) NOT NULL DEFAULT 0,
+          narration_voice VARCHAR(160) NOT NULL DEFAULT 'disabled',
+          narration_rate DECIMAL(4,2) NOT NULL DEFAULT 1.00,
           event_delay_ms INT NOT NULL DEFAULT 9000,
           winner VARCHAR(120) NULL,
           created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -565,9 +517,9 @@ async function ensureTables() {
         if (e?.code !== "ER_DUP_FIELDNAME") throw e;
       }
       for (const migration of [
-        "ALTER TABLE hg_games ADD COLUMN narration_enabled TINYINT(1) NOT NULL DEFAULT 1 AFTER normal_events_enabled",
-        "ALTER TABLE hg_games ADD COLUMN narration_voice VARCHAR(160) NOT NULL DEFAULT 'google-online' AFTER narration_enabled",
-        "ALTER TABLE hg_games ADD COLUMN narration_rate DECIMAL(4,2) NOT NULL DEFAULT 1.15 AFTER narration_voice",
+        "ALTER TABLE hg_games ADD COLUMN narration_enabled TINYINT(1) NOT NULL DEFAULT 0 AFTER normal_events_enabled",
+        "ALTER TABLE hg_games ADD COLUMN narration_voice VARCHAR(160) NOT NULL DEFAULT 'disabled' AFTER narration_enabled",
+        "ALTER TABLE hg_games ADD COLUMN narration_rate DECIMAL(4,2) NOT NULL DEFAULT 1.00 AFTER narration_voice",
         "ALTER TABLE hg_games ADD COLUMN event_delay_ms INT NOT NULL DEFAULT 9000 AFTER narration_rate"
       ]) {
         try {
@@ -576,6 +528,8 @@ async function ensureTables() {
           if (e?.code !== "ER_DUP_FIELDNAME") throw e;
         }
       }
+      // A narração foi removida desta versão, inclusive para partidas antigas.
+      await db.query("UPDATE hg_games SET narration_enabled=0,narration_voice='disabled',narration_rate=1.00 WHERE narration_enabled<>0 OR narration_voice<>'disabled'");
 
       await db.query(`
         CREATE TABLE IF NOT EXISTS hg_scenarios (
@@ -874,20 +828,17 @@ async function currentGame(channel, create = true) {
   return created[0];
 }
 
-async function newLobby(channel, adult = 0, normalEventsEnabled = 1, narration = {}, winnerPrize = {}) {
+async function newLobby(channel, adult = 0, normalEventsEnabled = 1, eventDelayMsRaw = 9000) {
   await ensureTables();
   const db = await getPool();
   await db.query("UPDATE hg_games SET status='archived' WHERE channel=? AND status IN ('lobby','running','ended')", [channel]);
-  const narrationEnabled = Number(narration.enabled ?? 1) ? 1 : 0;
-  const narrationVoice = String(narration.voice || "google-online").slice(0, 160);
-  const narrationRate = Math.max(0.70, Math.min(2, Number(narration.rate || 1.15)));
-  const eventDelayMs = Math.max(4000, Math.min(60000, Number(narration.eventDelayMs || 9000)));
+  const eventDelayMs = Math.max(1000, Math.min(60000, Number(eventDelayMsRaw || 9000)));
   const globalPrizeSettings = await getWinnerPrizeSettings(db, channel);
   const winnerPrizeEnabled = globalPrizeSettings.enabled ? 1 : 0;
   const winnerPrizeText = globalPrizeSettings.text;
   const [r] = await db.query(
-    "INSERT INTO hg_games (channel,status,phase,day_number,adult_mode,normal_events_enabled,narration_enabled,narration_voice,narration_rate,event_delay_ms,winner_trophy_enabled,winner_trophy_text) VALUES (?, 'lobby', 'bloodbath', 1, ?, ?, ?, ?, ?, ?, ?, ?)",
-    [channel, adult ? 1 : 0, normalEventsEnabled ? 1 : 0, narrationEnabled, narrationVoice, narrationRate, eventDelayMs, winnerPrizeEnabled, winnerPrizeText]
+    "INSERT INTO hg_games (channel,status,phase,day_number,adult_mode,normal_events_enabled,narration_enabled,narration_voice,narration_rate,event_delay_ms,winner_trophy_enabled,winner_trophy_text) VALUES (?, 'lobby', 'bloodbath', 1, ?, ?, 0, 'disabled', 1.00, ?, ?, ?)",
+    [channel, adult ? 1 : 0, normalEventsEnabled ? 1 : 0, eventDelayMs, winnerPrizeEnabled, winnerPrizeText]
   );
   return r.insertId;
 }
@@ -1021,7 +972,7 @@ async function addAllChatters(channel) {
 }
 
 async function start(channel) {
-  return withChannelLock(channel, async () => {
+  const result = await withChannelLock(channel, async () => {
     const game = await currentGame(channel, true);
     if (game.status === "running") return "A partida já está rodando.";
     if (game.status === "ended") return "A partida já terminou. Use Resetar antes de iniciar outra.";
@@ -1032,10 +983,14 @@ async function start(channel) {
     await db.query("UPDATE hg_players SET kills=0 WHERE game_id=?", [game.id]);
     await db.query("DELETE FROM hg_scenario_usage WHERE game_id=?", [game.id]);
     await db.query("DELETE FROM hg_game_scenario_runs WHERE game_id=?", [game.id]);
-    await db.query("UPDATE hg_games SET status='running',phase='bloodbath',day_number=1,winner=NULL,active_scenario_id=NULL,winner_trophy_id=NULL,winner_trophy_title=NULL,winner_trophy_image=NULL WHERE id=? AND status='lobby'", [game.id]);
+    await db.query("UPDATE hg_games SET status='running',phase='bloodbath',day_number=1,winner=NULL,active_scenario_id=NULL,winner_trophy_id=NULL,winner_trophy_title=NULL,winner_trophy_image=NULL,narration_enabled=0 WHERE id=? AND status='lobby'", [game.id]);
     await db.query("INSERT INTO hg_logs (game_id,channel,phase,day_number,text,deaths) VALUES (?,?,'reaping',0,?,'')", [game.id, channel, `🎲 A arena começou com ${players.length} participantes.`]);
     return `🔥 Partida iniciada com ${players.length} participantes.`;
   });
+  if (!String(result).startsWith("🔥")) return result;
+  const automatic = await startAuto(channel);
+  return `${result}
+${automatic}`;
 }
 
 async function reset(channel) {
@@ -1046,12 +1001,7 @@ async function reset(channel) {
       channel,
       old?.adult_mode || (process.env.HG_ADULT_DEFAULT === "1" ? 1 : 0),
       Number(old?.normal_events_enabled ?? 1),
-      {
-        enabled: Number(old?.narration_enabled ?? 1),
-        voice: old?.narration_voice || "google-online",
-        rate: Number(old?.narration_rate || 1.15),
-        eventDelayMs: Number(old?.event_delay_ms || 9000)
-      }
+      Number(old?.event_delay_ms || 9000)
     );
     return "✅ Arena resetada. Use !hg entrar ou !hg todos.";
   });
@@ -1753,46 +1703,44 @@ async function nextRound(channel) {
   });
 }
 
-async function startAuto(channel) {
+async function startAuto(channel, firstDelayMs = null) {
   const ch = nick(channel || "icarolinaporto");
   stopAuto(ch);
   const game = await currentGame(ch, false);
   if (!game || game.status !== "running") return "A partida precisa estar rodando. Clique em Iniciar primeiro.";
+  const runToken = Symbol(ch);
+  autoRunTokens.set(ch, runToken);
 
-  const scheduleNext = (delayMs = 1200) => {
+  const scheduleNext = delayMs => {
     const timer = setTimeout(async () => {
-      if (!autoTimers.has(ch)) return;
+      if (autoRunTokens.get(ch) !== runToken) return;
       try {
-        const g = await currentGame(ch, false);
-        if (!g || g.status !== "running") {
+        const current = await currentGame(ch, false);
+        if (!current || current.status !== "running") {
           stopAuto(ch);
           return;
         }
-        const beforeLogId = await latestLogId(g.id);
         const result = await nextRound(ch);
         if (/venceu|acabou|já acabou|não há nenhuma história ativa pendente/i.test(String(result))) {
           stopAuto(ch);
           return;
         }
         const after = await currentGame(ch, false);
-        const afterLogId = await latestLogId(after?.id || g.id);
-        if (afterLogId > beforeLogId) {
-          const fallbackMs = 12 * 60 * 60 * 1000;
-          await waitForPlaybackAck(ch, after?.id || g.id, afterLogId, fallbackMs);
-        } else {
-          await sleep(getAutoIntervalMs(after));
+        if (!after || after.status !== "running") {
+          stopAuto(ch);
+          return;
         }
-        if (autoTimers.has(ch)) scheduleNext(1100);
+        if (autoRunTokens.get(ch) === runToken) scheduleNext(getAutoIntervalMs(after));
       } catch (e) {
-        console.error("Erro no auto HG:", e);
+        console.error("Erro no automático HG:", e);
         stopAuto(ch);
       }
-    }, Math.max(500, delayMs));
+    }, Math.max(500, Number(delayMs) || 800));
     autoTimers.set(ch, timer);
   };
 
-  scheduleNext(1000);
-  return `▶️ Automático ligado. O próximo evento só é criado depois que o evento atual entrar na tela pública e a narração terminar.`;
+  scheduleNext(firstDelayMs == null ? getAutoIntervalMs(game) : firstDelayMs);
+  return `▶️ Automático ligado. Um novo evento será criado a cada ${(getAutoIntervalMs(game) / 1000).toFixed(1).replace(".", ",")} segundo(s), sem voz e sem mover a tela.`;
 }
 
 function parseCommand(raw) {
@@ -1818,7 +1766,7 @@ function parseCommand(raw) {
 }
 
 function help() {
-  return "Comandos: !hg entrar | !hg entrar 5 | !hg distrito 5 | !hg sair | !hg todos | !hg iniciar | !hg proximo | !hg auto | !hg parar | !hg resetar | !hg +18 ligar/desligar";
+  return "Comandos: !hg entrar | !hg entrar 5 | !hg distrito 5 | !hg sair | !hg todos | !hg iniciar (começa o automático) | !hg proximo | !hg auto | !hg parar | !hg resetar | !hg +18 ligar/desligar";
 }
 
 async function command(req, res) {
@@ -1871,21 +1819,16 @@ async function adminAction(req, res) {
     if (action === "adult_off") return send(res, await adult(ch, false));
     if (action === "normal_events_on") return send(res, await setNormalEvents(ch, true));
     if (action === "normal_events_off") return send(res, await setNormalEvents(ch, false));
-    if (action === "set_narration") {
+    if (action === "set_auto_interval") {
       await ensureTables();
       const game = await currentGame(ch, true);
       const db = await getPool();
-      const enabled = String(req.body?.enabled ?? req.query.enabled ?? "1") === "1" ? 1 : 0;
-      const voice = String(req.body?.voice || req.query.voice || "google-online").trim().slice(0, 160) || "google-online";
-      const rateRaw = Number(req.body?.rate ?? req.query.rate ?? 1.15);
-      const rate = Math.max(0.70, Math.min(2, Number.isFinite(rateRaw) ? rateRaw : 1.15));
       const delayRaw = Number(req.body?.event_delay_ms ?? req.query.event_delay_ms ?? 9000);
-      const eventDelayMs = Math.max(4000, Math.min(60000, Number.isFinite(delayRaw) ? Math.round(delayRaw) : 9000));
-      await db.query(
-        "UPDATE hg_games SET narration_enabled=?,narration_voice=?,narration_rate=?,event_delay_ms=? WHERE id=?",
-        [enabled, voice, rate, eventDelayMs, game.id]
-      );
-      return send(res, `✅ Narração pública ${enabled ? "ativada" : "desativada"}. Cada evento ficará visível por no mínimo ${(eventDelayMs / 1000).toFixed(1).replace(".", ",")}s.`);
+      const eventDelayMs = Math.max(1000, Math.min(60000, Number.isFinite(delayRaw) ? Math.round(delayRaw) : 9000));
+      const wasRunning = isAutoRunning(ch);
+      await db.query("UPDATE hg_games SET narration_enabled=0,event_delay_ms=? WHERE id=?", [eventDelayMs, game.id]);
+      if (wasRunning && game.status === "running") await startAuto(ch, eventDelayMs);
+      return send(res, `✅ Tempo do automático salvo: ${(eventDelayMs / 1000).toFixed(1).replace(".", ",")} segundo(s) entre os eventos.`);
     }
     if (action === "set_winner_prize_settings") {
       await ensureTables();
@@ -2272,12 +2215,6 @@ async function state(req, res) {
       activeScenario: activeScenarioRows?.[0] || null,
       autoRunning: isAutoRunning(ch),
       autoIntervalMs: getAutoIntervalMs(game),
-      narration: {
-        enabled: Number(game?.narration_enabled ?? 1) === 1,
-        voice: String(game?.narration_voice || "google-online"),
-        rate: Number(game?.narration_rate || 1.15),
-        eventDelayMs: getAutoIntervalMs(game)
-      },
       winnerPrize: {
         enabled: prizeSettings.enabled,
         text: prizeSettings.text,
@@ -2305,7 +2242,7 @@ function page(admin = false) {
 <!-- HG_VERSION ${APP_VERSION} -->
 <style>
 :root{--bg:#07070c;--card:#141421;--card2:#1c1c2d;--text:#f8f7ff;--muted:#aaa6c8;--p:#a855f7;--d:#ef4444;--ok:#22c55e;--b:#303044}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#2a1247,#080810 46%,#050509);color:var(--text);font-family:Inter,system-ui,Arial,sans-serif}.wrap{max-width:1280px;margin:auto;padding:22px}
+*{box-sizing:border-box}html,body,.logs{overflow-anchor:none}body{margin:0;background:radial-gradient(circle at top,#2a1247,#080810 46%,#050509);color:var(--text);font-family:Inter,system-ui,Arial,sans-serif}.wrap{max-width:1280px;margin:auto;padding:22px}
 .top{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start}h1{margin:0;font-size:clamp(30px,4vw,54px);letter-spacing:-.05em}.sub,.small{color:var(--muted)}.pill{border:1px solid var(--b);background:#141421d9;border-radius:999px;padding:9px 13px;font-weight:900}
 .grid{display:grid;grid-template-columns:1.2fr .8fr;gap:18px;margin-top:20px}@media(max-width:900px){.grid{grid-template-columns:1fr}}.card{background:#141421dd;border:1px solid var(--b);border-radius:26px;padding:18px;box-shadow:0 16px 50px #0008}.controls{display:flex;gap:8px;flex-wrap:wrap}
 button,.btn{border:0;border-radius:14px;padding:11px 14px;font-weight:950;color:white;background:var(--p);cursor:pointer}.danger{background:var(--d)}.ok{background:var(--ok);color:#061208}.secondary{background:#303044}
@@ -2332,12 +2269,12 @@ body.hg-running .event-person .event-name,
 .event-person{font-size:0!important;line-height:0!important}
 .event-person img,.event-person .avatar,.event-person .fake{font-size:16px!important;line-height:normal!important}
 
-.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{display:grid;grid-template-columns:1.25fr 1fr .7fr 1.4fr .8fr;gap:8px;margin-top:12px}.scenario-card{border:1px solid var(--b);background:#10101a;border-radius:20px;overflow:hidden}.scenario-head{display:flex;align-items:center;gap:10px;padding:14px;cursor:pointer;background:#171726}.scenario-arrow{width:42px;min-width:42px;padding:9px;background:#303044}.scenario-title{flex:1}.scenario-body{padding:14px;border-top:1px solid var(--b)}.scenario-body.collapsed{display:none}.scenario-flags{display:flex;gap:8px;flex-wrap:wrap}.flag{font-size:11px;font-weight:950;border:1px solid var(--b);border-radius:999px;padding:5px 8px;color:#ddd6fe}.switch-row{display:flex;align-items:center;gap:10px;border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:10px 12px}.switch-row input{width:20px;height:20px;accent-color:var(--p)}.child-list{display:flex;flex-direction:column;gap:10px;margin-top:12px}.child-card{border:1px solid var(--b);border-radius:16px;padding:12px;background:#0d0d16}.scenario-help{border-left:4px solid var(--p);padding:10px 12px;background:#1b1026;border-radius:10px;margin:10px 0}.wide-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.narration-bar{display:grid;grid-template-columns:auto minmax(210px,1fr) minmax(180px,.75fr) minmax(180px,.75fr) auto;gap:8px;margin:0 0 8px;align-items:center}.narration-bar button{white-space:nowrap}.narration-speed{border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:7px 10px}.narration-speed label{display:flex;justify-content:space-between;gap:8px;font-size:12px;font-weight:900;color:#ddd6fe}.narration-speed input{padding:0;height:18px;accent-color:var(--p)}.narration-help{margin:0 0 14px}.story-card{border-color:#6b21a8;box-shadow:0 18px 60px #581c8730}.player-count-note{display:block;margin-top:6px;color:#c4b5fd}.player-count-input{font-weight:900}.log.event-sync-active{outline:3px solid #a855f7;box-shadow:0 0 0 6px #a855f720,0 18px 45px #0008;transform:scale(1.012);transition:outline-color .18s,box-shadow .18s,transform .18s}.log.event-sync-enter{animation:eventSyncEnter .22s ease-out}@keyframes eventSyncEnter{from{opacity:.15;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}.audio-unlock{position:fixed;right:18px;bottom:18px;z-index:9999;background:#22c55e;color:#061208;box-shadow:0 12px 35px #000a;border:2px solid #86efac;display:none}.audio-unlock.show{display:block}.winner-prize{margin-top:16px;padding:16px;border:1px solid #6b21a8;background:linear-gradient(180deg,#241032,#120a1b);border-radius:22px;text-align:center}.winner-prize img{max-width:100%;max-height:360px;object-fit:contain;border-radius:18px;border:1px solid var(--b);background:#09090f;padding:8px}.winner-prize-title{font-size:20px;font-weight:950;margin:10px 0 6px}.winner-prize-text{font-size:18px;font-weight:900;line-height:1.4;color:#f5d0fe;margin-bottom:12px}.winner-prize-sub{font-size:13px;color:#c4b5fd}.trophy-admin-grid{display:grid;grid-template-columns:1.1fr .9fr auto;gap:8px;margin-top:12px;align-items:start}.trophy-preview{border:1px dashed var(--b);background:#0d0d16;border-radius:18px;min-height:150px;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:10px;color:var(--muted)}.trophy-preview img{max-width:100%;max-height:210px;object-fit:contain;border-radius:14px}.trophy-row{display:grid;grid-template-columns:170px 1fr;gap:14px;padding:12px;border:1px solid var(--b);background:#10101a;border-radius:18px}.trophy-row .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.trophy-row .preview{display:flex;align-items:center;justify-content:center;min-height:120px;border:1px solid var(--b);border-radius:16px;background:#0d0d16;overflow:hidden;padding:8px}.trophy-row .preview img{max-width:100%;max-height:150px;object-fit:contain;border-radius:12px}.winner-prize.hidden{display:none!important}.public-winner-prize:not(.hidden){position:static;width:100%;max-width:820px;margin:18px auto 0;box-shadow:0 18px 45px #0008;border:2px solid #a855f7;padding:20px}.public-winner-prize .winner-prize-text:first-child{font-size:clamp(22px,4vw,34px);color:#fff}.public-winner-prize img{max-height:420px}.winner-player-photo{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;margin:8px auto 16px}.winner-player-photo img,.winner-player-photo .fake{width:132px;height:132px;border-radius:28px;object-fit:cover;border:3px solid #f0abfc;background:#18111f;box-shadow:0 12px 32px #0009;display:flex;align-items:center;justify-content:center;font-size:44px;font-weight:950}.winner-player-photo-label{font-size:13px;font-weight:950;color:#f5d0fe;text-transform:uppercase;letter-spacing:.12em}.admin-participants-visible{display:block!important}.prize-save-status{margin-top:8px;font-weight:900;color:#c4b5fd}
-@media(max-width:900px){.trophy-admin-grid,.trophy-row{grid-template-columns:1fr}.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{grid-template-columns:1fr 1fr}.scenario-create-grid textarea,.scenario-edit-grid textarea,.child-edit-grid textarea,.span-all{grid-column:1/-1}.narration-bar{grid-template-columns:1fr}.admin-event-grid{grid-template-columns:1fr 1fr!important}}
-</style></head><body>${admin ? `` : `<button id="audioUnlock" class="audio-unlock" onclick="unlockPublicAudio()">🔊 Clique uma vez para liberar a narração</button>`}<div class="wrap"><div class="top"><div><h1>Hunger Games da Live</h1><div class="sub">Participantes do chat, distritos, eventos, mortes e vencedor final.</div></div><div class="pill" id="statusPill">Carregando...</div></div>
-<div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div>${admin ? `<div id="normalEventsStatus" class="small" style="margin-top:7px;font-weight:950"></div>` : ``}</div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar automático</button><button class="danger" onclick="act('reset')">Resetar</button><button id="normalEventsToggle" class="danger" onclick="toggleNormalEvents()">Desativar eventos antigos</button><button class="secondary" onclick="act('adult_on')">Ligar +18</button><button class="secondary" onclick="act('adult_off')">Desligar +18</button><button class="secondary" onclick="act('add_all_chat')">Adicionar todos do chat</button><button class="secondary" onclick="openWinnerPrizePanel()">🏆 Prêmios</button><button class="secondary" onclick="seedAdultHeavy()">Adicionar +18 pesado</button></div>` : ``}</div>
+.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{display:grid;grid-template-columns:1.25fr 1fr .7fr 1.4fr .8fr;gap:8px;margin-top:12px}.scenario-card{border:1px solid var(--b);background:#10101a;border-radius:20px;overflow:hidden}.scenario-head{display:flex;align-items:center;gap:10px;padding:14px;cursor:pointer;background:#171726}.scenario-arrow{width:42px;min-width:42px;padding:9px;background:#303044}.scenario-title{flex:1}.scenario-body{padding:14px;border-top:1px solid var(--b)}.scenario-body.collapsed{display:none}.scenario-flags{display:flex;gap:8px;flex-wrap:wrap}.flag{font-size:11px;font-weight:950;border:1px solid var(--b);border-radius:999px;padding:5px 8px;color:#ddd6fe}.switch-row{display:flex;align-items:center;gap:10px;border:1px solid var(--b);background:#0d0d16;border-radius:14px;padding:10px 12px}.switch-row input{width:20px;height:20px;accent-color:var(--p)}.child-list{display:flex;flex-direction:column;gap:10px;margin-top:12px}.child-card{border:1px solid var(--b);border-radius:16px;padding:12px;background:#0d0d16}.scenario-help{border-left:4px solid var(--p);padding:10px 12px;background:#1b1026;border-radius:10px;margin:10px 0}.wide-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.auto-time-bar{display:grid;grid-template-columns:minmax(230px,1fr) auto;gap:10px;margin:0 0 14px;align-items:end;border:1px solid var(--b);background:#0d0d16;border-radius:16px;padding:12px}.auto-time-field label{display:block;font-size:12px;font-weight:950;color:#ddd6fe;margin-bottom:7px}.auto-time-input{display:grid;grid-template-columns:minmax(90px,140px) auto;gap:8px;align-items:center}.auto-time-input input{font-weight:950}.auto-time-status{grid-column:1/-1;color:#c4b5fd}.story-card{border-color:#6b21a8;box-shadow:0 18px 60px #581c8730}.player-count-note{display:block;margin-top:6px;color:#c4b5fd}.player-count-input{font-weight:900}.log.event-sync-enter{animation:eventSyncEnter .22s ease-out}@keyframes eventSyncEnter{from{opacity:.15;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}.winner-prize{margin-top:16px;padding:16px;border:1px solid #6b21a8;background:linear-gradient(180deg,#241032,#120a1b);border-radius:22px;text-align:center}.winner-prize img{max-width:100%;max-height:360px;object-fit:contain;border-radius:18px;border:1px solid var(--b);background:#09090f;padding:8px}.winner-prize-title{font-size:20px;font-weight:950;margin:10px 0 6px}.winner-prize-text{font-size:18px;font-weight:900;line-height:1.4;color:#f5d0fe;margin-bottom:12px}.winner-prize-sub{font-size:13px;color:#c4b5fd}.trophy-admin-grid{display:grid;grid-template-columns:1.1fr .9fr auto;gap:8px;margin-top:12px;align-items:start}.trophy-preview{border:1px dashed var(--b);background:#0d0d16;border-radius:18px;min-height:150px;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:10px;color:var(--muted)}.trophy-preview img{max-width:100%;max-height:210px;object-fit:contain;border-radius:14px}.trophy-row{display:grid;grid-template-columns:170px 1fr;gap:14px;padding:12px;border:1px solid var(--b);background:#10101a;border-radius:18px}.trophy-row .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.trophy-row .preview{display:flex;align-items:center;justify-content:center;min-height:120px;border:1px solid var(--b);border-radius:16px;background:#0d0d16;overflow:hidden;padding:8px}.trophy-row .preview img{max-width:100%;max-height:150px;object-fit:contain;border-radius:12px}.winner-prize.hidden{display:none!important}.public-winner-prize:not(.hidden){position:static;width:100%;max-width:820px;margin:18px auto 0;box-shadow:0 18px 45px #0008;border:2px solid #a855f7;padding:20px}.public-winner-prize .winner-prize-text:first-child{font-size:clamp(22px,4vw,34px);color:#fff}.public-winner-prize img{max-height:420px}.winner-player-photo{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;margin:8px auto 16px}.winner-player-photo img,.winner-player-photo .fake{width:132px;height:132px;border-radius:28px;object-fit:cover;border:3px solid #f0abfc;background:#18111f;box-shadow:0 12px 32px #0009;display:flex;align-items:center;justify-content:center;font-size:44px;font-weight:950}.winner-player-photo-label{font-size:13px;font-weight:950;color:#f5d0fe;text-transform:uppercase;letter-spacing:.12em}.admin-participants-visible{display:block!important}.prize-save-status{margin-top:8px;font-weight:900;color:#c4b5fd}
+@media(max-width:900px){.trophy-admin-grid,.trophy-row{grid-template-columns:1fr}.scenario-create-grid,.scenario-edit-grid,.child-edit-grid{grid-template-columns:1fr 1fr}.scenario-create-grid textarea,.scenario-edit-grid textarea,.child-edit-grid textarea,.span-all{grid-column:1/-1}.auto-time-bar{grid-template-columns:1fr}.auto-time-status{grid-column:1}.admin-event-grid{grid-template-columns:1fr 1fr!important}}
+</style></head><body><div class="wrap"><div class="top"><div><h1>Hunger Games da Live</h1><div class="sub">Participantes do chat, distritos, eventos, mortes e vencedor final.</div></div><div class="pill" id="statusPill">Carregando...</div></div>
+<div class="grid"><section class="card arena-card"><div class="top"><div><div class="phase" id="phase">Arena</div><div style="font-size:18px;font-weight:950" id="status">Carregando...</div><div class="small" id="counts"></div>${admin ? `<div id="normalEventsStatus" class="small" style="margin-top:7px;font-weight:950"></div>` : ``}</div>${admin ? `<div class="controls"><button class="ok" onclick="act('start')">Iniciar automático</button><button class="secondary" onclick="act('next')">Próximo</button><button class="ok" onclick="act('auto_start')">Rodar sozinho</button><button class="secondary" onclick="act('auto_stop')">Parar automático</button><button class="danger" onclick="act('reset')">Resetar</button><button id="normalEventsToggle" class="danger" onclick="toggleNormalEvents()">Desativar eventos antigos</button><button class="secondary" onclick="act('adult_on')">Ligar +18</button><button class="secondary" onclick="act('adult_off')">Desligar +18</button><button class="secondary" onclick="act('add_all_chat')">Adicionar todos do chat</button><button class="secondary" onclick="openWinnerPrizePanel()">🏆 Prêmios</button><button class="secondary" onclick="seedAdultHeavy()">Adicionar +18 pesado</button></div>` : ``}</div>
 ${admin ? `<div class="two" style="margin:16px 0"><input id="manualName" placeholder="Adicionar participante manual"/><input id="manualDistrict" placeholder="Distrito" type="number" min="1" max="12"/><button style="grid-column:1/-1" onclick="addPlayer()">Adicionar participante</button></div>` : ``}
-<div id="participantsBox" class="lobby-only admin-participants-visible"><h2>Participantes da partida</h2><div class="players" id="players"></div></div></section><aside class="card events-card"><h2 class="events-title">Eventos</h2>${admin ? `<div class="narration-bar"><button id="narrationToggle" class="secondary" onclick="toggleNarration()">🔊 Ativar narração pública</button><select id="narrationVoice" aria-label="Voz da narração"></select><div class="narration-speed"><label><span>Velocidade da voz</span><span id="narrationRateValue">1,15x</span></label><input id="narrationRate" type="range" min="0.70" max="2.00" step="0.05" value="1.15" aria-label="Velocidade da narração"></div><div class="narration-speed"><label><span>Tempo mínimo por evento</span><span id="eventDelayValue">9,0s</span></label><input id="eventDelay" type="range" min="4" max="30" step="1" value="9" aria-label="Tempo mínimo de exibição de cada evento"></div><button class="secondary" onclick="testNarration()">▶ Testar voz</button></div><div id="narrationSaveStatus" class="small narration-help">Esses controles aparecem somente no painel administrativo. O áudio toca na página pública somente quando o evento entrar na área visível da tela. A página nunca rola sozinha.</div>` : ``}<div class="logs" id="logs"></div><div id="winnerPrizeBox" class="winner-prize ${admin ? `` : `public-winner-prize`} hidden"></div></aside></div>
+<div id="participantsBox" class="lobby-only admin-participants-visible"><h2>Participantes da partida</h2><div class="players" id="players"></div></div></section><aside class="card events-card"><h2 class="events-title">Eventos</h2>${admin ? `<div class="auto-time-bar"><div class="auto-time-field"><label for="autoInterval">Tempo entre os eventos automáticos</label><div class="auto-time-input"><input id="autoInterval" type="number" min="1" max="60" step="1" value="9" aria-label="Tempo entre eventos automáticos"><span>segundo(s)</span></div></div><button onclick="saveAutoInterval()">Salvar tempo</button><div id="autoIntervalStatus" class="small auto-time-status">Ao clicar em Iniciar, os eventos começam a rodar sozinhos. A página não acompanha nem rola até o evento novo.</div></div>` : ``}<div class="logs" id="logs"></div><div id="winnerPrizeBox" class="winner-prize ${admin ? `` : `public-winner-prize`} hidden"></div></aside></div>
 ${admin ? `<section id="winnerPrizeAdminCard" class="card" style="margin-top:18px;border-color:#7e22ce;box-shadow:0 18px 60px #581c8730"><div class="phase">NOVA CONFIGURAÇÃO</div><h2 style="margin-top:6px">🏆 Prêmio do vencedor</h2><div class="small">Envie suas imagens de prêmio. Quando a partida terminar, o jogo escolhe uma delas aleatoriamente e mostra abaixo do vencedor, no final dos eventos da página pública.</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px"><label class="switch-row"><input id="winnerPrizeEnabled" type="checkbox" onchange="saveWinnerPrizeSettings(true)"><span><b>Ativar prêmio do vencedor</b><br><span class="small">Desative se não quiser usar imagens de prêmio nesta arena.</span></span></label><div class="small" style="display:flex;align-items:center;justify-content:center;border:1px solid var(--b);border-radius:14px;padding:10px;background:#0d0d16">Use <b style="margin:0 4px">{vencedor}</b> para o nome do vencedor e <b style="margin:0 4px">{premio}</b> para o nome do prêmio.</div></div><textarea id="winnerPrizeText" placeholder="🏆 {vencedor}, você ganhou! O seu prêmio é: {premio}" style="margin-top:10px"></textarea><div class="wide-actions"><button onclick="saveWinnerPrizeSettings(false)">Salvar texto e ativação</button></div><div id="winnerPrizeSaveStatus" class="prize-save-status">Configuração salva no canal e mantida nas próximas partidas.</div><hr style="border-color:var(--b);margin:24px 0"><h3>Adicionar novo prêmio</h3><div class="trophy-admin-grid"><input id="trophyTitle" placeholder="Nome do prêmio, ex: Nave alienígena dourada"><div><input id="trophyImageFile" type="file" accept="image/png,image/jpeg,image/webp,image/gif" onchange="readTrophyImage(this,'trophyImageData','trophyImagePreview')"><input id="trophyImageData" type="hidden"></div><button onclick="addTrophy()">Adicionar prêmio</button></div><div id="trophyImagePreview" class="trophy-preview" style="margin-top:10px">Prévia da imagem</div><hr style="border-color:var(--b);margin:24px 0"><div class="top"><div><h2>Prêmios cadastrados</h2><div class="small">Você pode deixar vários ativos; o jogo sorteia um aleatoriamente quando houver vencedor.</div></div><button class="secondary" onclick="loadTrophies()">Recarregar prêmios</button></div><div id="trophiesEditor" style="display:flex;flex-direction:column;gap:12px;margin-top:14px"></div></section>` : ``}
 ${admin ? `<section class="card story-card" style="margin-top:18px"><h2>Modo História</h2><div class="scenario-help"><b>Exemplo:</b> “Um ET invade a arena”. Crie a introdução e depois abra a seta para cadastrar os acontecimentos decorrentes.</div><div class="small">Na seleção de pessoas, escolha <b>Todos</b> para colocar todos os participantes vivos na mesma cena. No texto, use <b>{p}</b> ou <b>{todos}</b> para mostrar todos os nomes.</div>
 <input id="scName" style="margin-top:12px" placeholder="Nome da história: Invasão alienígena"/>
@@ -2360,66 +2297,25 @@ function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&l
 async function api(path,opt={}){const sep=path.includes("?")?"&":"?";const url=path+sep+"channel="+encodeURIComponent(channel)+(token?"&token="+encodeURIComponent(token):"");const r=await fetch(url,{cache:"no-store",...opt}),ct=r.headers.get("content-type")||"";return ct.includes("json")?r.json():r.text()}
 function avatarHtml(p,cls="avatar"){return p&&p.avatar_url?'<img class="'+cls+'" src="'+esc(p.avatar_url)+'">':'<div class="'+cls+' fake">'+esc(((p&&p.display_name)||"?").slice(0,1).toUpperCase())+'</div>'}
 function mentionedPlayers(text,players){const found=[];const lower=String(text||"").toLowerCase();players.forEach(p=>{const nm=String(p.display_name||p.username||"").toLowerCase();if(nm&&lower.includes(nm)&&!found.some(x=>x.id===p.id))found.push(p)});return found}
-const NARRATION_ENABLED_KEY="hgNarrationEnabledV56",NARRATION_VOICE_KEY="hgNarrationVoiceNaturalV56",NARRATION_RATE_KEY="hgNarrationRateV56",NARRATION_DELAY_KEY="hgNarrationDelayV56";
-let narrationEnabled=true,narrationVoices=[],narrationEventDelayMs=9000,narrationServerSignature="";
-let narrationChannel=null,currentNarrationAudio=null,currentNarrationUtterance=null,narrationStopToken=0,narrationSaveTimer=null,audioUnlockNeeded=false,pendingNarrationText="",audioUnlockWaiters=[];
-try{if("BroadcastChannel" in window){narrationChannel=new BroadcastChannel("hg-narration-sync-v56")}}catch{}
-function shouldNarrateHere(){return !admin}
-function availableNarrationVoices(){return (window.speechSynthesis?.getVoices?.()||[]).slice()}
-function narrationVoiceScore(v){const name=String(v?.name||"");const lang=String(v?.lang||"");let score=0;if(/^pt(-|_)?br/i.test(lang))score+=1000;else if(/^pt/i.test(lang))score+=700;if(/natural|neural|online|francisca|antonio|thalita/i.test(name))score+=350;if(/google/i.test(name))score+=120;if(v&&v.localService===false)score+=40;return score}
-function savedNarrationVoice(){return localStorage.getItem(NARRATION_VOICE_KEY)||"google-online"}
-function broadcastNarrationSettings(){try{narrationChannel?.postMessage({enabled:narrationEnabled,voice:savedNarrationVoice(),rate:narrationRate(),eventDelayMs:narrationEventDelayMs})}catch{}}
-function eventDisplayDelayMs(){return Math.max(4000,Math.min(60000,Number(narrationEventDelayMs||9000)))}
-function showAudioUnlock(){if(admin)return;audioUnlockNeeded=true;document.getElementById("audioUnlock")?.classList.add("show")}
-function waitForPublicAudioUnlock(timeoutMs=30000){if(admin||!audioUnlockNeeded)return Promise.resolve(true);return new Promise(resolve=>{let done=false;const finish=value=>{if(done)return;done=true;clearTimeout(timer);audioUnlockWaiters=audioUnlockWaiters.filter(fn=>fn!==finish);resolve(value)};audioUnlockWaiters.push(finish);const timer=setTimeout(()=>finish(false),Math.max(5000,timeoutMs))})}
-function resolvePublicAudioUnlock(value=true){const waiters=audioUnlockWaiters.slice();audioUnlockWaiters=[];for(const finish of waiters){try{finish(value)}catch{}}}
-async function unlockPublicAudio(){if(admin)return;const button=document.getElementById("audioUnlock");try{const audio=new Audio("/hg/tts?text="+encodeURIComponent("Som ativado."));audio.preload="auto";audio.volume=.08;await audio.play();await new Promise(resolve=>{let done=false;const finish=()=>{if(done)return;done=true;resolve()};audio.onended=finish;audio.onerror=finish;setTimeout(finish,1800)});audioUnlockNeeded=false;sessionStorage.setItem("hgPublicAudioUnlockedV56","1");button?.classList.remove("show");if("speechSynthesis" in window){try{window.speechSynthesis.resume()}catch{}}const pending=pendingNarrationText;pendingNarrationText="";let narrated=true;if(pending)narrated=await speakNarration(pending,true);resolvePublicAudioUnlock(narrated)}catch(e){resolvePublicAudioUnlock(false);if(button){button.textContent="🔊 Clique novamente para liberar a narração";button.classList.add("show")}}}
-function scheduleNarrationSave(){if(!admin)return;clearTimeout(narrationSaveTimer);const status=document.getElementById("narrationSaveStatus");if(status)status.textContent="Salvando narração e tempo dos eventos...";narrationSaveTimer=setTimeout(saveNarrationSettings,250)}
-async function saveNarrationSettings(){if(!admin)return;const status=document.getElementById("narrationSaveStatus");try{const body={action:"set_narration",enabled:narrationEnabled?"1":"0",voice:savedNarrationVoice(),rate:narrationRate(),event_delay_ms:eventDisplayDelayMs()};const result=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});if(status)status.textContent=String(result);broadcastNarrationSettings()}catch(e){if(status)status.textContent="Erro ao salvar a narração."}}
-function applyServerNarrationSettings(settings={}){const enabled=typeof settings.enabled==="boolean"?settings.enabled:true;const voice=String(settings.voice||"google-online");const rate=Math.max(.70,Math.min(2,Number(settings.rate||1.15)));const delay=Math.max(4000,Math.min(60000,Number(settings.eventDelayMs||9000)));const signature=[enabled,voice,rate,delay].join("|");if(signature===narrationServerSignature)return;const wasEnabled=narrationEnabled;narrationServerSignature=signature;narrationEnabled=enabled;narrationEventDelayMs=delay;localStorage.setItem(NARRATION_ENABLED_KEY,enabled?"1":"0");localStorage.setItem(NARRATION_VOICE_KEY,voice);localStorage.setItem(NARRATION_RATE_KEY,String(rate));localStorage.setItem(NARRATION_DELAY_KEY,String(delay));if(wasEnabled&&!enabled)stopNarrationSpeech();const slider=document.getElementById("narrationRate");if(slider){slider.value=String(rate);slider.dataset.ready="1"}const delaySlider=document.getElementById("eventDelay");if(delaySlider){delaySlider.value=String(delay/1000);delaySlider.dataset.ready="1"}updateNarrationRate(false);updateEventDelay(false);populateNarrationVoices();updateNarrationButton()}
-function friendlyVoiceName(name){return String(name||"").replace(/\bonline\b/gi,"pela internet").replace(/\bdesktop\b/gi,"do computador").replace(/\bmobile\b/gi,"do celular")}
-function populateNarrationVoices(){narrationVoices=availableNarrationVoices();narrationVoices.sort((a,b)=>narrationVoiceScore(b)-narrationVoiceScore(a)||a.name.localeCompare(b.name));const select=document.getElementById("narrationVoice");if(!select)return;const saved=savedNarrationVoice();select.innerHTML='<option value="google-online">Google pela internet — português do Brasil</option>'+narrationVoices.map((v,i)=>'<option value="voice-'+i+'">'+esc(friendlyVoiceName(v.name)+' — '+v.lang)+'</option>').join("");if(saved==="google-online")select.value="google-online";else{const chosen=narrationVoices.findIndex(v=>v.name===saved);select.value=chosen>=0?"voice-"+chosen:"google-online"}select.onchange=()=>{const value=String(select.value||"google-online");if(value==="google-online")localStorage.setItem(NARRATION_VOICE_KEY,"google-online");else{const v=narrationVoices[Number(value.replace("voice-",""))];localStorage.setItem(NARRATION_VOICE_KEY,v?.name||"google-online")}broadcastNarrationSettings();scheduleNarrationSave()}}
-function selectedNarrationMode(){const select=document.getElementById("narrationVoice");if(select)return String(select.value||"google-online")==="google-online"?"google":"browser";return savedNarrationVoice()==="google-online"?"google":"browser"}
-function selectedNarrationVoice(){const select=document.getElementById("narrationVoice");if(select&&String(select.value).startsWith("voice-"))return narrationVoices[Number(String(select.value).replace("voice-",""))]||null;const saved=savedNarrationVoice();if(saved==="google-online")return narrationVoices.find(v=>narrationVoiceScore(v)>=1000)||narrationVoices.find(v=>/^pt/i.test(v.lang))||null;return narrationVoices.find(v=>v.name===saved)||narrationVoices.find(v=>narrationVoiceScore(v)>=1000)||narrationVoices.find(v=>/^pt/i.test(v.lang))||null}
-function narrationRate(){const slider=document.getElementById("narrationRate");const n=Number(slider?.value||localStorage.getItem(NARRATION_RATE_KEY)||1.15);return Math.max(.70,Math.min(2,Number.isFinite(n)?n:1.15))}
-function updateNarrationRate(shouldBroadcast=true){const slider=document.getElementById("narrationRate"),label=document.getElementById("narrationRateValue");if(!slider)return;const saved=Number(localStorage.getItem(NARRATION_RATE_KEY)||1.15);if(!slider.dataset.ready){slider.value=String(Math.max(.70,Math.min(2,Number.isFinite(saved)?saved:1.15)));slider.dataset.ready="1"}const rate=narrationRate();localStorage.setItem(NARRATION_RATE_KEY,String(rate));if(label)label.textContent=rate.toFixed(2).replace(".",",")+"x";if(shouldBroadcast===true){broadcastNarrationSettings();scheduleNarrationSave()}}
-function updateEventDelay(shouldSave=true){const slider=document.getElementById("eventDelay"),label=document.getElementById("eventDelayValue");if(slider){const seconds=Math.max(4,Math.min(30,Number(slider.value||9)));narrationEventDelayMs=Math.round(seconds*1000);localStorage.setItem(NARRATION_DELAY_KEY,String(narrationEventDelayMs));if(label)label.textContent=seconds.toFixed(1).replace(".",",")+"s"}if(shouldSave){broadcastNarrationSettings();scheduleNarrationSave()}}
-function initNarrationControls(){const slider=document.getElementById("narrationRate");if(slider&&!slider.dataset.bound){slider.dataset.bound="1";slider.addEventListener("input",()=>updateNarrationRate(true));slider.addEventListener("change",()=>updateNarrationRate(true))}const delay=document.getElementById("eventDelay");if(delay&&!delay.dataset.bound){delay.dataset.bound="1";delay.addEventListener("input",()=>updateEventDelay(true));delay.addEventListener("change",()=>updateEventDelay(true))}if(slider)updateNarrationRate(false);if(delay)updateEventDelay(false);populateNarrationVoices();updateNarrationButton()}
-function updateNarrationButton(){const b=document.getElementById("narrationToggle");if(b)b.textContent=narrationEnabled?"🔇 Desativar narração pública":"🔊 Ativar narração pública"}
-function stopNarrationSpeech(){narrationStopToken++;if(currentNarrationAudio){try{currentNarrationAudio.pause();currentNarrationAudio.removeAttribute("src");currentNarrationAudio.load()}catch{}currentNarrationAudio=null}currentNarrationUtterance=null;if("speechSynthesis" in window){try{window.speechSynthesis.cancel();window.speechSynthesis.resume()}catch{}}}
-function applyNarrationSettings(data={}){if(typeof data.voice==="string"&&data.voice)localStorage.setItem(NARRATION_VOICE_KEY,data.voice);if(Number.isFinite(Number(data.rate)))localStorage.setItem(NARRATION_RATE_KEY,String(data.rate));if(Number.isFinite(Number(data.eventDelayMs)))narrationEventDelayMs=Math.max(4000,Math.min(60000,Number(data.eventDelayMs)));if(typeof data.enabled==="boolean"){narrationEnabled=data.enabled;localStorage.setItem(NARRATION_ENABLED_KEY,narrationEnabled?"1":"0")}if(!narrationEnabled)stopNarrationSpeech();const slider=document.getElementById("narrationRate");if(slider){slider.dataset.ready="";updateNarrationRate(false)}const delay=document.getElementById("eventDelay");if(delay){delay.value=String(narrationEventDelayMs/1000);updateEventDelay(false)}populateNarrationVoices();updateNarrationButton()}
-async function toggleNarration(){narrationEnabled=!narrationEnabled;localStorage.setItem(NARRATION_ENABLED_KEY,narrationEnabled?"1":"0");if(!narrationEnabled)stopNarrationSpeech();initNarrationControls();updateNarrationButton();broadcastNarrationSettings();await saveNarrationSettings();if(narrationEnabled)await speakNarration("Narração pública ativada.",true)}
-async function testNarration(){initNarrationControls();stopNarrationSpeech();await speakNarration("Teste de narração do modo história. A arena está pronta, e a aventura vai começar.",true)}
-function narrationText(text){return String(text||"").replace(/[📍🎲🔥💀🔞✅⛔🗑️]/g," ").replace(/\s*•\s*/g,", ").replace(/\s+/g," ").trim()}
-function narrationChunks(text,max=180){const clean=narrationText(text);if(!clean)return[];const parts=clean.match(/[^.!?;:]+[.!?;:]?|[^.!?;:]+$/g)||[clean];const chunks=[];let current="";for(const raw of parts){const part=raw.trim();if(!part)continue;if((current+" "+part).trim().length<=max){current=(current+" "+part).trim();continue}if(current)chunks.push(current);if(part.length<=max){current=part;continue}const words=part.split(/\s+/);current="";for(const word of words){if((current+" "+word).trim().length>max){if(current)chunks.push(current);current=word}else current=(current+" "+word).trim()}}if(current)chunks.push(current);return chunks}
-function playGoogleNarrationChunk(chunk,token){return new Promise(resolve=>{if(token!==narrationStopToken)return resolve(false);const audio=new Audio("/hg/tts?text="+encodeURIComponent(chunk));currentNarrationAudio=audio;audio.preload="auto";audio.playbackRate=narrationRate();audio.volume=1;let done=false;const finish=ok=>{if(done)return;done=true;clearTimeout(timer);audio.onended=null;audio.onerror=null;audio.onabort=null;if(currentNarrationAudio===audio)currentNarrationAudio=null;resolve(ok)};audio.onended=()=>finish(true);audio.onerror=()=>finish(false);audio.onabort=()=>finish(false);const timer=setTimeout(()=>{try{audio.pause()}catch{}finish(false)},Math.max(14000,Math.min(90000,chunk.length*210)));audio.play().catch(error=>{const name=String(error?.name||"").toLowerCase();if(name.includes("notallowed")||name.includes("security"))showAudioUnlock();finish(false)})})}
-function playBrowserNarrationChunk(chunk,token){return new Promise(resolve=>{if(token!==narrationStopToken||!("speechSynthesis" in window))return resolve(false);const synth=window.speechSynthesis;const u=new SpeechSynthesisUtterance(chunk);currentNarrationUtterance=u;u.lang="pt-BR";u.rate=narrationRate();u.pitch=1.03;u.volume=1;const v=selectedNarrationVoice();if(v){u.voice=v;u.lang=v.lang||"pt-BR"}let done=false,started=false;const finish=ok=>{if(done)return;done=true;clearTimeout(startTimer);clearTimeout(endTimer);clearInterval(keepAlive);if(currentNarrationUtterance===u)currentNarrationUtterance=null;resolve(ok)};u.onstart=()=>{started=true};u.onend=()=>finish(true);u.onerror=e=>{const reason=String(e?.error||"").toLowerCase();if(reason.includes("not-allowed")||reason.includes("notallowed"))showAudioUnlock();finish(false)};const startTimer=setTimeout(()=>{if(!started){try{synth.cancel()}catch{}finish(false)}},10000);const endTimer=setTimeout(()=>{try{synth.cancel()}catch{}finish(false)},Math.max(15000,Math.min(120000,chunk.length*240)));const keepAlive=setInterval(()=>{try{if(synth.paused)synth.resume()}catch{}},2000);try{synth.resume();synth.speak(u)}catch{finish(false)}})}
-async function speakNarration(text,force=false){const chunks=narrationChunks(text);if((!narrationEnabled&&!force)||!chunks.length)return false;stopNarrationSpeech();const token=narrationStopToken;for(const chunk of chunks){if(token!==narrationStopToken)return false;let ok=false;if(selectedNarrationMode()==="google"){ok=await playGoogleNarrationChunk(chunk,token);if(!ok&&token===narrationStopToken){await clientSleep(220);ok=await playGoogleNarrationChunk(chunk,token)}}if(!ok)ok=await playBrowserNarrationChunk(chunk,token);if(!ok){if(!admin){pendingNarrationText=chunk;showAudioUnlock()}return false}}pendingNarrationText="";return true}
-window.addEventListener("storage",e=>{if([NARRATION_ENABLED_KEY,NARRATION_VOICE_KEY,NARRATION_RATE_KEY,NARRATION_DELAY_KEY].includes(e.key))applyNarrationSettings()});
-if(narrationChannel)narrationChannel.onmessage=e=>applyNarrationSettings(e.data||{});
-initNarrationControls();if("speechSynthesis" in window){window.speechSynthesis.onvoiceschanged=populateNarrationVoices}
-if(!admin){document.addEventListener("pointerdown",()=>{if(audioUnlockNeeded)unlockPublicAudio()},{passive:true})}
-const clientSleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-let timelineGameId=null,timelineInitialized=false,timelinePlayers=[],timelineQueue=[],timelineQueueRunning=false,timelineGeneration=0;
-const timelineKnownIds=new Set(),timelineQueuedIds=new Set(),timelineVisibilityCancels=new Set();
+const AUTO_INTERVAL_KEY="hgAutoIntervalV60";
+let autoIntervalServerSignature="",autoIntervalSaving=false;
+function normalizedAutoIntervalMs(value){const seconds=Math.max(1,Math.min(60,Number(value)||9));return Math.round(seconds*1000)}
+function applyServerAutoInterval(value){const ms=Math.max(1000,Math.min(60000,Number(value)||9000));const signature=String(ms);if(signature===autoIntervalServerSignature)return;autoIntervalServerSignature=signature;try{localStorage.setItem(AUTO_INTERVAL_KEY,String(ms))}catch{}const input=document.getElementById("autoInterval");if(input&&document.activeElement!==input)input.value=String(ms/1000)}
+async function saveAutoInterval(){if(!admin)return;if(!token)return alert("Abra com ?token=SEU_TOKEN");if(autoIntervalSaving)return;const input=document.getElementById("autoInterval"),status=document.getElementById("autoIntervalStatus");const ms=normalizedAutoIntervalMs(input?.value);if(input)input.value=String(ms/1000);if(status)status.textContent="Salvando o tempo do automático...";autoIntervalSaving=true;try{const result=await api("/hg/admin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"set_auto_interval",event_delay_ms:ms})});if(status)status.textContent=String(result)+" A tela continuará parada onde você deixou.";try{localStorage.setItem(AUTO_INTERVAL_KEY,String(ms))}catch{}await load()}catch(e){if(status)status.textContent="Não foi possível salvar o tempo."}finally{autoIntervalSaving=false}}
+let timelineGameId=null,timelineInitialized=false,timelinePlayers=[];
+const timelineKnownIds=new Set();
 function eventCardHtml(l,players,extra=""){const ps=mentionedPlayers(l.text,players);const avs=ps.length?'<div class="event-avatars">'+ps.map(p=>'<div class="event-person">'+avatarHtml(p,"avatar")+'</div>').join("")+'</div>':'';return '<div class="log '+(l.deaths?'death ':'')+extra+'" data-log-id="'+Number(l.id||0)+'"><div class="phase">'+esc(phaseLabel(l.phase,l.day_number))+'</div>'+avs+'<div class="event-text">'+esc(l.text)+'</div>'+(l.deaths?'<div class="small">Mortes: '+esc(l.deaths)+'</div>':'')+'</div>'}
-function cancelTimelineVisibilityWaits(){for(const cancel of [...timelineVisibilityCancels]){try{cancel(false)}catch{}}timelineVisibilityCancels.clear()}
-function clearTimelinePlayback(){timelineGeneration++;timelineQueue=[];timelineQueuedIds.clear();timelineQueueRunning=false;cancelTimelineVisibilityWaits();stopNarrationSpeech()}
-function renderTimelineHistory(logs,players,status){const box=document.getElementById("logs");const list=(Array.isArray(logs)?logs:[]).slice().sort((a,b)=>Number(a.id)-Number(b.id));box.innerHTML=list.map(l=>eventCardHtml(l,players)).join("")||"<div class='small' id='timelineEmpty'>Sem eventos ainda.</div>";document.querySelectorAll(".event-name").forEach(e=>e.remove());timelineKnownIds.clear();for(const l of list)timelineKnownIds.add(Number(l.id))}
-// O evento é acrescentado sem mover a página. A narração só é liberada quando
-// o cartão entra de verdade na área visível da página pública.
-function appendTimelineEvent(log){const box=document.getElementById("logs");const selector='[data-log-id="'+Number(log.id||0)+'"]';const existing=box.querySelector(selector);if(existing)return existing;document.getElementById("timelineEmpty")?.remove();box.insertAdjacentHTML("beforeend",eventCardHtml(log,timelinePlayers,"event-sync-enter"));document.querySelectorAll(".event-name").forEach(e=>e.remove());return box.querySelector(selector)}
-function timelineElementIsVisible(el){if(!el||!el.isConnected||document.visibilityState==="hidden")return false;const r=el.getBoundingClientRect(),vh=window.innerHeight||document.documentElement.clientHeight||0,vw=window.innerWidth||document.documentElement.clientWidth||0;if(r.bottom<=0||r.top>=vh||r.right<=0||r.left>=vw)return false;const visibleHeight=Math.max(0,Math.min(r.bottom,vh)-Math.max(r.top,0));const required=Math.min(80,Math.max(24,r.height*.18));return visibleHeight>=required}
-function waitUntilTimelineEventIsVisible(el,generation){if(admin||!el)return Promise.resolve(true);if(timelineElementIsVisible(el))return Promise.resolve(true);return new Promise(resolve=>{let done=false,observer=null,raf=0,poll=0;const finish=value=>{if(done)return;done=true;if(observer)observer.disconnect();window.removeEventListener("scroll",scheduleCheck,true);window.removeEventListener("resize",scheduleCheck);document.removeEventListener("visibilitychange",scheduleCheck);if(raf)cancelAnimationFrame(raf);if(poll)clearInterval(poll);timelineVisibilityCancels.delete(finish);resolve(value)};const check=()=>{if(done)return;if(generation!==timelineGeneration||!el.isConnected)return finish(false);if(!narrationEnabled)return finish(true);if(timelineElementIsVisible(el))finish(true)};const scheduleCheck=()=>{if(raf)return;raf=requestAnimationFrame(()=>{raf=0;check()})};timelineVisibilityCancels.add(finish);window.addEventListener("scroll",scheduleCheck,true);window.addEventListener("resize",scheduleCheck);document.addEventListener("visibilitychange",scheduleCheck);if("IntersectionObserver" in window){observer=new IntersectionObserver(entries=>{for(const entry of entries){if(entry.target===el&&entry.isIntersecting){check();break}}},{root:null,threshold:[0,.05,.15,.3,.6]});observer.observe(el)}poll=setInterval(check,500);check()})}
-async function acknowledgeTimelineEvent(log){if(admin||!log?.id||!timelineGameId)return;try{localStorage.setItem("hgPublicPlayed:"+channel+":"+timelineGameId,String(log.id))}catch{}try{await fetch("/hg/playback/ack?channel="+encodeURIComponent(channel)+"&game_id="+encodeURIComponent(timelineGameId)+"&log_id="+encodeURIComponent(log.id),{method:"POST",cache:"no-store"})}catch{}}
-async function runTimelineQueue(){if(timelineQueueRunning)return;const generation=timelineGeneration;timelineQueueRunning=true;try{while(timelineQueue.length&&generation===timelineGeneration){const log=timelineQueue.shift();timelineQueuedIds.delete(Number(log.id));const startedAt=Date.now();const el=appendTimelineEvent(log);await clientSleep(120);if(generation!==timelineGeneration)break;const silent=String(log.text||"").startsWith("📍");if(narrationEnabled&&!silent&&shouldNarrateHere()){const becameVisible=await waitUntilTimelineEventIsVisible(el,generation);if(!becameVisible||generation!==timelineGeneration)break;if(el)el.classList.add("event-sync-active");await clientSleep(180);if(generation!==timelineGeneration)break;const narrated=await speakNarration(log.text);if(!narrated&&audioUnlockNeeded)await waitForPublicAudioUnlock(Math.max(30000,eventDisplayDelayMs()+15000))}else{if(el)el.classList.add("event-sync-active");await clientSleep(350)}const elapsed=Date.now()-startedAt;const minimum=silent?Math.min(3000,eventDisplayDelayMs()):eventDisplayDelayMs();if(elapsed<minimum)await clientSleep(minimum-elapsed);if(generation!==timelineGeneration)break;if(el)el.classList.remove("event-sync-active","event-sync-enter");await acknowledgeTimelineEvent(log);await clientSleep(900)}}finally{if(generation===timelineGeneration){timelineQueueRunning=false;if(timelineQueue.length)queueMicrotask(runTimelineQueue)}}}
-function syncEventTimeline(gameId,logs,players,status){const id=Number(gameId||0),list=(Array.isArray(logs)?logs:[]).slice().sort((a,b)=>Number(a.id)-Number(b.id));timelinePlayers=Array.isArray(players)?players:[];if(!timelineInitialized||timelineGameId!==id){clearTimelinePlayback();timelineGameId=id;timelineInitialized=true;renderTimelineHistory(list,timelinePlayers,status);if(!admin&&status==="running"&&list.length){const latest=list[list.length-1],logId=Number(latest.id||0),created=Date.parse(latest.created_at||"");let played=0;try{played=Number(localStorage.getItem("hgPublicPlayed:"+channel+":"+id)||0)}catch{}const recent=!Number.isFinite(created)||Date.now()-created<180000;if(logId>played&&recent&&!String(latest.text||"").startsWith("📍")){timelineQueuedIds.add(logId);timelineQueue.push(latest);runTimelineQueue()}}return}for(const log of list){const logId=Number(log.id||0);if(!logId||timelineKnownIds.has(logId)||timelineQueuedIds.has(logId))continue;timelineKnownIds.add(logId);timelineQueuedIds.add(logId);timelineQueue.push(log)}runTimelineQueue()}
+function preserveViewport(action){const x=window.scrollX||0,y=window.scrollY||0;action();requestAnimationFrame(()=>{const nowX=window.scrollX||0,nowY=window.scrollY||0;if(Math.abs(nowX-x)>1||Math.abs(nowY-y)>1)window.scrollTo({left:x,top:y,behavior:"auto"})})}
+function clearTimelinePlayback(){timelineKnownIds.clear()}
+function renderTimelineHistory(logs,players,status){const box=document.getElementById("logs");const list=(Array.isArray(logs)?logs:[]).slice().sort((a,b)=>Number(a.id)-Number(b.id));preserveViewport(()=>{box.innerHTML=list.map(l=>eventCardHtml(l,players)).join("")||"<div class='small' id='timelineEmpty'>Sem eventos ainda.</div>";document.querySelectorAll(".event-name").forEach(e=>e.remove())});timelineKnownIds.clear();for(const l of list)timelineKnownIds.add(Number(l.id))}
+function appendTimelineEvent(log){const box=document.getElementById("logs");const selector='[data-log-id="'+Number(log.id||0)+'"]';const existing=box.querySelector(selector);if(existing)return existing;let added=null;preserveViewport(()=>{document.getElementById("timelineEmpty")?.remove();box.insertAdjacentHTML("beforeend",eventCardHtml(log,timelinePlayers,"event-sync-enter"));document.querySelectorAll(".event-name").forEach(e=>e.remove());added=box.querySelector(selector)});if(added)setTimeout(()=>added.classList.remove("event-sync-enter"),450);return added}
+function syncEventTimeline(gameId,logs,players,status){const id=Number(gameId||0),list=(Array.isArray(logs)?logs:[]).slice().sort((a,b)=>Number(a.id)-Number(b.id));timelinePlayers=Array.isArray(players)?players:[];if(!timelineInitialized||timelineGameId!==id){clearTimelinePlayback();timelineGameId=id;timelineInitialized=true;renderTimelineHistory(list,timelinePlayers,status);return}for(const log of list){const logId=Number(log.id||0);if(!logId||timelineKnownIds.has(logId))continue;timelineKnownIds.add(logId);appendTimelineEvent(log)}}
 let loadInProgress=false,loadAgain=false;
 async function load(){
   if(loadInProgress){loadAgain=true;return}
   loadInProgress=true;
   try{
-    const st=await api("/hg/state");if(!st||st.error){const status=document.getElementById("status");if(status)status.textContent="Não foi possível carregar a partida.";return}const g=st.game||{},players=Array.isArray(st.players)?st.players:[],logs=Array.isArray(st.logs)?st.logs:[];applyServerNarrationSettings(st.narration||{});document.body.classList.toggle("hg-running",!admin&&(g.status==="running"||g.status==="ended"));document.getElementById("statusPill").textContent=(statusLabels[g.status]||"AGUARDANDO")+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=phaseLabel(g.phase||"bloodbath",g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida em andamento":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Aguardando participantes";const alive=players.filter(p=>Number(p.alive)===1).length;document.getElementById("counts").textContent=players.length+" participantes • "+alive+" vivos • "+Number(st.eventCount||0)+(Number(g.normal_events_enabled??1)===1?" eventos ativos":" eventos de história")+(st.activeScenario?" • História: "+st.activeScenario.name:"")+(st.autoRunning?" • automático ligado":"");try{renderWinnerPrize(st.winnerPrize||{},g.winner||"",g.status||"",players);setWinnerPrizeControls(st.winnerPrize||{})}catch(e){console.error("Falha ao exibir prêmio:",e)}normalEventsCurrentlyEnabled=Number(g.normal_events_enabled??1)===1;if(admin){const toggle=document.getElementById("normalEventsToggle"),label=document.getElementById("normalEventsStatus");if(toggle){toggle.textContent=normalEventsCurrentlyEnabled?"Desativar eventos antigos":"Ativar eventos antigos";toggle.className=normalEventsCurrentlyEnabled?"danger":"ok"}if(label){label.textContent=normalEventsCurrentlyEnabled?"⚠️ Eventos normais/antigos: ATIVADOS":"✅ Modo História exclusivo: eventos normais/antigos DESATIVADOS";label.style.color=normalEventsCurrentlyEnabled?"#fca5a5":"#86efac"}}
+    const st=await api("/hg/state");if(!st||st.error){const status=document.getElementById("status");if(status)status.textContent="Não foi possível carregar a partida.";return}const g=st.game||{},players=Array.isArray(st.players)?st.players:[],logs=Array.isArray(st.logs)?st.logs:[];applyServerAutoInterval(st.autoIntervalMs||9000);document.body.classList.toggle("hg-running",!admin&&(g.status==="running"||g.status==="ended"));document.getElementById("statusPill").textContent=(statusLabels[g.status]||"AGUARDANDO")+(g.adult_mode?" • +18":"");document.getElementById("phase").textContent=phaseLabel(g.phase||"bloodbath",g.day_number||1);document.getElementById("status").textContent=g.status==="running"?"Partida em andamento":g.status==="ended"?("Vencedor: "+(g.winner||"ninguém")):"Aguardando participantes";const alive=players.filter(p=>Number(p.alive)===1).length;document.getElementById("counts").textContent=players.length+" participantes • "+alive+" vivos • "+Number(st.eventCount||0)+(Number(g.normal_events_enabled??1)===1?" eventos ativos":" eventos de história")+(st.activeScenario?" • História: "+st.activeScenario.name:"")+(st.autoRunning?" • automático ligado":"");try{renderWinnerPrize(st.winnerPrize||{},g.winner||"",g.status||"",players);setWinnerPrizeControls(st.winnerPrize||{})}catch(e){console.error("Falha ao exibir prêmio:",e)}normalEventsCurrentlyEnabled=Number(g.normal_events_enabled??1)===1;if(admin){const toggle=document.getElementById("normalEventsToggle"),label=document.getElementById("normalEventsStatus");if(toggle){toggle.textContent=normalEventsCurrentlyEnabled?"Desativar eventos antigos":"Ativar eventos antigos";toggle.className=normalEventsCurrentlyEnabled?"danger":"ok"}if(label){label.textContent=normalEventsCurrentlyEnabled?"⚠️ Eventos normais/antigos: ATIVADOS":"✅ Modo História exclusivo: eventos normais/antigos DESATIVADOS";label.style.color=normalEventsCurrentlyEnabled?"#fca5a5":"#86efac"}}
 const box=document.getElementById("participantsBox");if(box)box.classList.toggle("hidden",!admin&&g.status==="running");
 const playersElement=document.getElementById("players");if(playersElement)playersElement.innerHTML=players.map(p=>{const av=avatarHtml(p);return '<div class="player '+(Number(p.alive)===1?'':'dead')+'">'+av+'<div><div class="district">Distrito '+p.district+'</div><div class="name">'+esc(p.display_name||p.username||"Participante")+'</div><div class="kills">'+(p.kills||0)+' abate(s) '+(Number(p.alive)===1?'🟢':'💀')+'</div></div></div>'}).join("")||"<div class='small'>Nenhum participante foi adicionado nesta partida.</div>";
 syncEventTimeline(g.id||0,logs,players,g.status)  }catch(e){console.error("Falha ao atualizar a página:",e);const status=document.getElementById("status");if(status)status.textContent="Não foi possível atualizar a partida. Atualize a página."}finally{
@@ -2453,7 +2349,6 @@ async function toggleNormalEvents(){
     const action=turningOff?"normal_events_off":"normal_events_on";
     const t=await api("/hg/admin?action="+encodeURIComponent(action));
     if(turningOff){
-      // Para imediatamente qualquer evento antigo que já estivesse na fila de voz.
       clearTimelinePlayback();
       timelineInitialized=false;
     }
@@ -2491,66 +2386,6 @@ load();if(admin){loadEvents();loadScenarios();loadTrophies()}setInterval(load,80
 app.get("/", (_req, res) => res.type("text/plain").send(`OK - Hunger Games da Live v${APP_VERSION}`));
 app.get("/health", (_req, res) => res.json({ ok: true, version: APP_VERSION }));
 app.get("/version", (_req, res) => res.json({ version: APP_VERSION }));
-
-// Voz Google online sem expor chave no navegador. O texto é curto, dividido
-// pelo cliente e armazenado em cache para evitar baixar a mesma fala várias vezes.
-app.get("/hg/tts", async (req, res) => {
-  const text = String(req.query.text || "").replace(/\s+/g, " ").trim().slice(0, 220);
-  if (!text) return res.status(400).type("text/plain").send("Texto vazio.");
-  const key = `pt-BR:${text}`;
-  const cached = ttsCache.get(key);
-  if (cached) {
-    res.set("Cache-Control", "public, max-age=86400");
-    return res.type("audio/mpeg").send(cached);
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
-  try {
-    const url = "https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=pt-BR&q=" + encodeURIComponent(text);
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36",
-        "Accept": "audio/mpeg,audio/*;q=0.9,*/*;q=0.8",
-        "Referer": "https://translate.google.com/"
-      }
-    });
-    if (!response.ok) throw new Error(`Google TTS respondeu ${response.status}`);
-    const audio = Buffer.from(await response.arrayBuffer());
-    if (audio.length < 256) throw new Error("Áudio vazio recebido do Google TTS.");
-    if (ttsCache.size >= 300) ttsCache.delete(ttsCache.keys().next().value);
-    ttsCache.set(key, audio);
-    res.set("Cache-Control", "public, max-age=86400");
-    return res.type("audio/mpeg").send(audio);
-  } catch (error) {
-    console.error("Erro no Google TTS:", error.message);
-    return res.status(502).type("text/plain").send("Voz Google indisponível temporariamente.");
-  } finally {
-    clearTimeout(timeout);
-  }
-});
-
-app.all("/hg/playback/ack", async (req, res) => {
-  try {
-    const ch = channelFrom(req);
-    const gameId = Number(req.query.game_id || req.body?.game_id || 0);
-    const logId = Number(req.query.log_id || req.body?.log_id || 0);
-    if (!gameId || !logId) return res.status(400).json({ ok: false });
-    const db = await getPool();
-    const [rows] = await db.query(
-      "SELECT l.id FROM hg_logs l JOIN hg_games g ON g.id=l.game_id WHERE l.id=? AND l.game_id=? AND g.channel=? LIMIT 1",
-      [logId, gameId, ch]
-    );
-    if (!rows.length) return res.status(404).json({ ok: false });
-    acknowledgePlayback(ch, gameId, logId);
-    res.set("Cache-Control", "no-store");
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("Erro ao confirmar reprodução pública:", e);
-    return res.status(500).json({ ok: false });
-  }
-});
 
 app.get("/hg", command);
 app.post("/hg", command);
